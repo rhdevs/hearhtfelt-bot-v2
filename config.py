@@ -54,6 +54,7 @@ MESSAGES = {
     "queue_added": "Thank you. You've been added to the queue. A support member will be with you shortly.",
     "conversation_started": "A support member has joined the conversation. You can now chat anonymously.",
     "conversation_ended": "The conversation has ended. Thank you for using our service. Take care! 💙",
+    "conversation_ended_heartfelt": "This conversation has ended. Thank you for helping someone today! 💙",
     "no_active_conversation": "You don't have an active conversation to end.",
     "already_in_queue": "You're already in the queue. Please wait for a support member to connect with you.",
     "already_in_conversation": "You're already in a conversation. Use /end to finish your current conversation first.",

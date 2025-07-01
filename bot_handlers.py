@@ -62,21 +62,25 @@ class BotHandlers:
         if heartfelt_id_session:
             user_states[heartfelt_id_session] = UserState.IDLE
         
-        # Notify both parties
+        # Notify both parties with appropriate messages
         if user_id_session:
             try:
+                # Send user message to user, heartfelt message to heartfelt member
+                message = MESSAGES["conversation_ended_heartfelt"] if user_id_session in HEARTFELT_MEMBERS else MESSAGES["conversation_ended"]
                 await context.bot.send_message(
                     chat_id=user_id_session,
-                    text=MESSAGES["conversation_ended"]
+                    text=message
                 )
             except:
                 pass
         
         if heartfelt_id_session and heartfelt_id_session != user_id:
             try:
+                # Send user message to user, heartfelt message to heartfelt member
+                message = MESSAGES["conversation_ended_heartfelt"] if heartfelt_id_session in HEARTFELT_MEMBERS else MESSAGES["conversation_ended"]
                 await context.bot.send_message(
                     chat_id=heartfelt_id_session,
-                    text=MESSAGES["conversation_ended"]
+                    text=message
                 )
             except:
                 pass
