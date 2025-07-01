@@ -6,7 +6,7 @@ Test script to verify MongoDB integration works correctly
 import os
 import sys
 import datetime
-from db_manager import db_mgr
+from src.database.manager import db_mgr
 
 def test_fallback_mode():
     """Test that the system works without MongoDB"""

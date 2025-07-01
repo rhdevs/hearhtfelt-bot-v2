@@ -6,8 +6,8 @@ Usage: python db_utils.py [command]
 
 import datetime
 import argparse
-from db_manager import db_mgr
-from session_manager import SessionManager
+from src.database.manager import db_mgr
+from src.bot.managers.session import SessionManager
 from telegram import Bot
 
 def get_anonymous_name(session_doc, for_user_type='user'):

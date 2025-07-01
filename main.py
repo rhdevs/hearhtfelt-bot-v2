@@ -2,10 +2,10 @@ import asyncio
 import logging
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from config import BOT_TOKEN, ADMIN_CHANNEL_ID, HEARTFELT_MEMBERS, validate_channel_access
-from session_manager import SessionManager
-from queue_manager import QueueManager
-from bot_handlers import BotHandlers
-from db_manager import db_mgr
+from src.bot.managers.session import SessionManager
+from src.bot.managers.queue import QueueManager
+from src.bot.handlers import BotHandlers
+from src.database.manager import db_mgr
 
 # Enable logging
 logging.basicConfig(

@@ -2,7 +2,7 @@ import datetime
 import uuid
 import logging
 from typing import Optional, List, Dict, Any
-from database import db_manager
+from src.database.connection import db_manager
 
 logger = logging.getLogger(__name__)
 

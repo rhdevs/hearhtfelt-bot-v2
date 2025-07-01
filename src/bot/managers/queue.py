@@ -5,7 +5,7 @@ import random
 from typing import Optional, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from config import queue_entries, ADMIN_CHANNEL_ID, QUEUE_EXPIRE_MINUTES, user_to_queue_map, queue_order
-from db_manager import db_mgr
+from src.database.manager import db_mgr
 
 class QueueManager:
     def __init__(self, bot: Bot):

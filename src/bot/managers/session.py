@@ -5,7 +5,7 @@ import logging
 from typing import Optional, Tuple
 from telegram import Bot
 from config import active_sessions, safety_logs, user_to_session_map
-from db_manager import db_mgr
+from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
 

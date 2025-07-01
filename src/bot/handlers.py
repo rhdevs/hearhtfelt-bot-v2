@@ -3,8 +3,8 @@ from telegram.ext import ContextTypes, CallbackContext
 from config import (
     UserState, user_states, HEARTFELT_MEMBERS, MESSAGES
 )
-from session_manager import SessionManager
-from queue_manager import QueueManager
+from src.bot.managers.session import SessionManager
+from src.bot.managers.queue import QueueManager
 
 class BotHandlers:
     def __init__(self, session_manager: SessionManager, queue_manager: QueueManager):
