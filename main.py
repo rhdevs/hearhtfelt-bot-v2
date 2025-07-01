@@ -48,6 +48,9 @@ async def main():
     # Message handler for regular messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))
     
+    # Sticker handler for stickers during conversations
+    application.add_handler(MessageHandler(filters.Sticker.ALL, handlers.handle_sticker))
+    
     # Callback query handler for inline keyboards
     application.add_handler(CallbackQueryHandler(handlers.handle_callback_query))
     

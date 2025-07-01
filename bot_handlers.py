@@ -157,6 +157,23 @@ class BotHandlers:
             "I'm not sure what you mean. Use /help to start a conversation with a support member."
         )
     
+    async def handle_sticker(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle and relay stickers during an active conversation"""
+        user_id = update.effective_user.id
+        sticker_file_id = update.message.sticker.file_id
+        
+        # Check if the user is in an active session
+        session_id = self.session_manager.get_session_by_user(user_id)
+        
+        if session_id:
+            # If a session exists, forward the sticker
+            success = await self.session_manager.forward_sticker(session_id, user_id, sticker_file_id)
+            if not success:
+                await update.message.reply_text("Sorry, there was an error sending your sticker. Please try again.")
+        else:
+            # If no session, inform the user
+            await update.message.reply_text("You can only send stickers during an active conversation. Use /help to start.")
+    
     async def _handle_help_description(self, update: Update, context: ContextTypes.DEFAULT_TYPE, description: str):
         """Handle help description from user"""
         user_id = update.effective_user.id
