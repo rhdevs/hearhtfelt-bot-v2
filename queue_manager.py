@@ -1,5 +1,6 @@
 import datetime
 import uuid
+import html
 import random
 from typing import Optional, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -12,30 +13,18 @@ class QueueManager:
         self.used_anonymous_ids = set()  # Track used IDs to avoid duplicates
     
     def _generate_anonymous_id(self) -> str:
-        """Generate a unique random anonymous ID"""
-        # List of adjectives and animals for friendly anonymous names
-        adjectives = [
-            "Brave", "Kind", "Gentle", "Strong", "Wise", "Caring", "Hopeful", "Bright",
-            "Calm", "Patient", "Peaceful", "Thoughtful", "Creative", "Curious", "Friendly"
-        ]
-        animals = [
-            "Owl", "Butterfly", "Dolphin", "Panda", "Fox", "Rabbit", "Deer", "Bird",
-            "Cat", "Turtle", "Swan", "Bee", "Whale", "Eagle", "Bear"
-        ]
-        
+        """Generate a unique anonymous ID using RHesident format"""
         # Try up to 50 times to generate a unique ID
         for _ in range(50):
-            adj = random.choice(adjectives)
-            animal = random.choice(animals)
-            number = random.randint(100, 999)
-            anonymous_id = f"{adj} {animal} #{number}"
+            number = random.randint(1000, 9999)
+            anonymous_id = f"RHesident #{number}"
             
             if anonymous_id not in self.used_anonymous_ids:
                 self.used_anonymous_ids.add(anonymous_id)
                 return anonymous_id
         
-        # Fallback to UUID if we can't generate unique friendly name
-        fallback_id = f"Anonymous User #{str(uuid.uuid4())[:8]}"
+        # Fallback to UUID if we can't generate unique ID
+        fallback_id = f"RHesident #{str(uuid.uuid4())[:8]}"
         self.used_anonymous_ids.add(fallback_id)
         return fallback_id
     
@@ -148,23 +137,32 @@ class QueueManager:
         """Edit the queue message to show it's been claimed"""
         claimed_time = datetime.datetime.now()
         
-        # Create the claimed message text
+        # Create the claimed message text with HTML formatting
+        # Escape user-provided content to prevent HTML injection
+        safe_member_name = html.escape(heartfelt_member_name)
+        safe_description = html.escape(queue_entry['description'][:200])
+        description_suffix = '...' if len(queue_entry['description']) > 200 else ''
+
         claimed_message_text = (
-            f"✅ **CLAIMED** - Help Request\n\n"
+            f"✅ <b>CLAIMED</b> - Help Request\n\n"
             f"From: {queue_entry['anonymous_id']}\n"
             f"Requested: {queue_entry['created_at'].strftime('%H:%M')}\n"
-            f"Claimed by: {heartfelt_member_name}\n"
+            f"Claimed by: {safe_member_name}\n"
             f"Claimed at: {claimed_time.strftime('%H:%M')}\n\n"
-            f"Description: {queue_entry['description'][:200]}{'...' if len(queue_entry['description']) > 200 else ''}"
+            f"Description: {safe_description}{description_suffix}"
         )
-        
-        # Edit the message with no inline keyboard (removes the claim button)
-        await self.bot.edit_message_text(
-            chat_id=ADMIN_CHANNEL_ID,
-            message_id=queue_entry['message_id'],
-            text=claimed_message_text,
-            reply_markup=None
-        )
+
+        # Edit the message, removing the claim button and applying HTML formatting
+        try:
+            await self.bot.edit_message_text(
+                chat_id=ADMIN_CHANNEL_ID,
+                message_id=queue_entry['message_id'],
+                text=claimed_message_text,
+                reply_markup=None,
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            print(f"Error editing claimed message: {e}")
     
     def get_queue_position(self, user_id: int) -> Optional[int]:
         """Get user's position in queue - O(1) lookup"""

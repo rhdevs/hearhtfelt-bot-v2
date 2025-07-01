@@ -11,30 +11,18 @@ class SessionManager:
         self.used_anonymous_ids = set()  # Track used IDs to avoid duplicates
     
     def _generate_anonymous_id(self) -> str:
-        """Generate a unique random anonymous ID"""
-        # List of adjectives and animals for friendly anonymous names
-        adjectives = [
-            "Brave", "Kind", "Gentle", "Strong", "Wise", "Caring", "Hopeful", "Bright",
-            "Calm", "Patient", "Peaceful", "Thoughtful", "Creative", "Curious", "Friendly"
-        ]
-        animals = [
-            "Owl", "Butterfly", "Dolphin", "Panda", "Fox", "Rabbit", "Deer", "Bird",
-            "Cat", "Turtle", "Swan", "Bee", "Whale", "Eagle", "Bear"
-        ]
-        
+        """Generate a unique anonymous ID using RHesident format"""
         # Try up to 50 times to generate a unique ID
         for _ in range(50):
-            adj = random.choice(adjectives)
-            animal = random.choice(animals)
-            number = random.randint(100, 999)
-            anonymous_id = f"{adj} {animal} #{number}"
+            number = random.randint(1000, 9999)
+            anonymous_id = f"RHesident #{number}"
             
             if anonymous_id not in self.used_anonymous_ids:
                 self.used_anonymous_ids.add(anonymous_id)
                 return anonymous_id
         
-        # Fallback to UUID if we can't generate unique friendly name
-        fallback_id = f"Anonymous User #{str(uuid.uuid4())[:8]}"
+        # Fallback to UUID if we can't generate unique ID
+        fallback_id = f"RHesident #{str(uuid.uuid4())[:8]}"
         self.used_anonymous_ids.add(fallback_id)
         return fallback_id
     
