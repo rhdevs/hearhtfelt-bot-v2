@@ -5,6 +5,7 @@ import logging
 from typing import Optional, Tuple
 from telegram import Bot
 from config import active_sessions, safety_logs, user_to_session_map
+from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +30,28 @@ class SessionManager:
         self.used_anonymous_ids.add(fallback_id)
         return fallback_id
     
-    def create_session(self, user_id: int, heartfelt_member_id: int) -> str:
+    def create_session(self, user_id: int, heartfelt_member_id: int, session_id: str = None) -> str:
         """Create a new anonymous session between user and heartfelt member"""
-        session_id = str(uuid.uuid4())
+        # Use provided session_id (from queue_id) or generate new one
+        if session_id is None:
+            session_id = str(uuid.uuid4())
+        
+        anonymous_user_id = self._generate_anonymous_id()
         
         active_sessions[session_id] = {
             'user_id': user_id,
             'heartfelt_member_id': heartfelt_member_id,
             'created_at': datetime.datetime.now(),
-            'anonymous_user_id': self._generate_anonymous_id()
+            'anonymous_user_id': anonymous_user_id
         }
         
         # Maintain O(1) lookup indices
         user_to_session_map[user_id] = session_id
         user_to_session_map[heartfelt_member_id] = session_id
+        
+        # Save to database - claim existing pending session or create new active one
+        if db_mgr.db_available:
+            db_mgr.claim_session(session_id, heartfelt_member_id)
         
         # Safety log for developers
         safety_logs.append({
@@ -109,6 +118,16 @@ class SessionManager:
                 text=formatted_message
             )
             
+            # Log to database
+            if db_mgr.db_available:
+                db_mgr.log_message(
+                    session_id=session_id,
+                    from_user_id=from_user_id,
+                    to_user_id=other_party_id,
+                    message_type="text",
+                    content=message_text
+                )
+            
             # Safety log
             safety_logs.append({
                 'session_id': session_id,
@@ -144,6 +163,17 @@ class SessionManager:
                 text=f"🎭 {anonymous_name} sent a sticker"
             )
             
+            # Log to database
+            if db_mgr.db_available:
+                db_mgr.log_message(
+                    session_id=session_id,
+                    from_user_id=from_user_id,
+                    to_user_id=other_party_id,
+                    message_type="file",
+                    file_id=sticker_file_id,
+                    file_type="sticker"
+                )
+            
             # Safety log
             safety_logs.append({
                 'session_id': session_id,
@@ -166,6 +196,10 @@ class SessionManager:
         
         user_id = session['user_id']
         heartfelt_member_id = session['heartfelt_member_id']
+        
+        # End session in database
+        if db_mgr.db_available:
+            db_mgr.end_session(session_id, ended_by_user_id)
         
         # Remove session and clean up indices
         del active_sessions[session_id]

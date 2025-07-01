@@ -3,8 +3,8 @@ from telegram.ext import ContextTypes, CallbackContext
 from config import (
     UserState, user_states, HEARTFELT_MEMBERS, MESSAGES
 )
-from session_manager import SessionManager
-from queue_manager import QueueManager
+from src.bot.managers.session import SessionManager
+from src.bot.managers.queue import QueueManager
 
 class BotHandlers:
     def __init__(self, session_manager: SessionManager, queue_manager: QueueManager):
@@ -233,8 +233,8 @@ class BotHandlers:
             await query.answer("This request has already been claimed or expired.", show_alert=True)
             return
         
-        # Create session
-        session_id = self.session_manager.create_session(claimed_user_id, user_id)
+        # Create session using the queue_id as session_id to maintain database consistency
+        session_id = self.session_manager.create_session(claimed_user_id, user_id, queue_id)
         
         # Update states
         user_states[claimed_user_id] = UserState.IN_CONVERSATION

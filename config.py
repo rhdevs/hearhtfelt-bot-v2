@@ -12,6 +12,7 @@ class UserState(Enum):
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID")
+MONGODB_URI = os.getenv("MONGODB_URI")
 
 HEARTFELT_MEMBERS = [
     1522275008,
