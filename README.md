@@ -65,7 +65,7 @@ This bot creates a safe, anonymous space where users can request support and be 
 
 1. Create a private Telegram channel
 2. Add your bot as administrator
-3. Grant permissions: Send Messages, Delete Messages
+3. Grant permissions: Send Messages, Edit Messages, Delete Messages
 4. Get channel ID (forward message to @userinfobot)
 5. Add channel ID to `.env` file
 

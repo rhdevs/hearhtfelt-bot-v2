@@ -200,8 +200,13 @@ class BotHandlers:
             await query.answer("You are already in a conversation. End it first before claiming a new one.", show_alert=True)
             return
         
+        # Get heartfelt member name for display
+        heartfelt_member_name = query.from_user.first_name or f"Member #{user_id}"
+        if query.from_user.last_name:
+            heartfelt_member_name += f" {query.from_user.last_name}"
+        
         # Claim the queue
-        claimed_user_id = await self.queue_manager.claim_queue(queue_id, user_id)
+        claimed_user_id = await self.queue_manager.claim_queue(queue_id, user_id, heartfelt_member_name)
         
         if claimed_user_id is None:
             await query.answer("This request has already been claimed or expired.", show_alert=True)

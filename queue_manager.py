@@ -109,7 +109,7 @@ class QueueManager:
             else:
                 return False, "unknown_error"
     
-    async def claim_queue(self, queue_id: str, heartfelt_member_id: int) -> Optional[int]:
+    async def claim_queue(self, queue_id: str, heartfelt_member_id: int, heartfelt_member_name: str = None) -> Optional[int]:
         """Claim a queue entry and return the user ID"""
         queue_entry = queue_entries.get(queue_id)
         if not queue_entry:
@@ -118,15 +118,20 @@ class QueueManager:
         user_id = queue_entry['user_id']
         message_id = queue_entry['message_id']
         
-        # Delete the queue message from admin channel
+        # Edit the queue message to show it's been claimed instead of deleting it
         try:
             if message_id:
+                await self._edit_claimed_message(queue_entry, heartfelt_member_name or f"Member #{heartfelt_member_id}")
+        except Exception as e:
+            print(f"Error editing queue message: {e}")
+            # Fallback to deletion if edit fails
+            try:
                 await self.bot.delete_message(
                     chat_id=ADMIN_CHANNEL_ID,
                     message_id=message_id
                 )
-        except Exception as e:
-            print(f"Error deleting queue message: {e}")
+            except Exception as delete_error:
+                print(f"Error deleting queue message as fallback: {delete_error}")
         
         # Remove from queue and clean up indices
         del queue_entries[queue_id]
@@ -138,6 +143,28 @@ class QueueManager:
             queue_order.remove(queue_id)
         
         return user_id
+    
+    async def _edit_claimed_message(self, queue_entry: dict, heartfelt_member_name: str):
+        """Edit the queue message to show it's been claimed"""
+        claimed_time = datetime.datetime.now()
+        
+        # Create the claimed message text
+        claimed_message_text = (
+            f"✅ **CLAIMED** - Help Request\n\n"
+            f"From: {queue_entry['anonymous_id']}\n"
+            f"Requested: {queue_entry['created_at'].strftime('%H:%M')}\n"
+            f"Claimed by: {heartfelt_member_name}\n"
+            f"Claimed at: {claimed_time.strftime('%H:%M')}\n\n"
+            f"Description: {queue_entry['description'][:200]}{'...' if len(queue_entry['description']) > 200 else ''}"
+        )
+        
+        # Edit the message with no inline keyboard (removes the claim button)
+        await self.bot.edit_message_text(
+            chat_id=ADMIN_CHANNEL_ID,
+            message_id=queue_entry['message_id'],
+            text=claimed_message_text,
+            reply_markup=None
+        )
     
     def get_queue_position(self, user_id: int) -> Optional[int]:
         """Get user's position in queue - O(1) lookup"""
@@ -213,14 +240,12 @@ class QueueManager:
             return False, "not_in_queue"
         
         # Try to delete the admin channel message
-        message_deleted = False
         if queue_entry.get('message_id') and self.channel_accessible:
             try:
                 await self.bot.delete_message(
                     chat_id=ADMIN_CHANNEL_ID,
                     message_id=queue_entry['message_id']
                 )
-                message_deleted = True
             except Exception as e:
                 print(f"Error deleting queue message during cancellation: {e}")
                 # Continue with removal even if message deletion fails
