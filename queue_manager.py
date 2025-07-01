@@ -5,6 +5,7 @@ import random
 from typing import Optional, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from config import queue_entries, ADMIN_CHANNEL_ID, QUEUE_EXPIRE_MINUTES, user_to_queue_map, queue_order
+from db_manager import db_mgr
 
 class QueueManager:
     def __init__(self, bot: Bot):
@@ -31,18 +32,23 @@ class QueueManager:
     def add_to_queue(self, user_id: int, description: str) -> str:
         """Add user to the help queue"""
         queue_id = str(uuid.uuid4())
+        anonymous_id = self._generate_anonymous_id()
         
         queue_entries[queue_id] = {
             'user_id': user_id,
             'description': description,
             'created_at': datetime.datetime.now(),
-            'anonymous_id': self._generate_anonymous_id(),
+            'anonymous_id': anonymous_id,
             'message_id': None  # Will be set after posting to channel
         }
         
         # Maintain O(1) lookup indices
         user_to_queue_map[user_id] = queue_id
         queue_order.append(queue_id)
+        
+        # Create pending session in database using queue_id as session_id
+        if db_mgr.db_available:
+            db_mgr.create_session(user_id, description, anonymous_id, queue_id)
         
         return queue_id
     
@@ -106,6 +112,10 @@ class QueueManager:
         
         user_id = queue_entry['user_id']
         message_id = queue_entry['message_id']
+        
+        # Claim the session in database (queue_id is used as session_id)
+        if db_mgr.db_available:
+            db_mgr.claim_session(queue_id, heartfelt_member_id)
         
         # Edit the queue message to show it's been claimed instead of deleting it
         try:

@@ -1,11 +1,11 @@
 import asyncio
 import logging
-from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from config import BOT_TOKEN, ADMIN_CHANNEL_ID, HEARTFELT_MEMBERS, validate_channel_access
 from session_manager import SessionManager
 from queue_manager import QueueManager
 from bot_handlers import BotHandlers
+from db_manager import db_mgr
 
 # Enable logging
 logging.basicConfig(
@@ -28,6 +28,14 @@ async def main():
     
     if not HEARTFELT_MEMBERS:
         logger.warning("No HEARTFELT_MEMBERS configured. Please add authorized user IDs to config.py")
+    
+    # Initialize database
+    logger.info("Initializing database connection...")
+    db_available = db_mgr.initialize()
+    if db_available:
+        logger.info("✅ Database connected successfully")
+    else:
+        logger.warning("🟡 Database unavailable - running in memory-only mode")
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()

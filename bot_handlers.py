@@ -233,8 +233,8 @@ class BotHandlers:
             await query.answer("This request has already been claimed or expired.", show_alert=True)
             return
         
-        # Create session
-        session_id = self.session_manager.create_session(claimed_user_id, user_id)
+        # Create session using the queue_id as session_id to maintain database consistency
+        session_id = self.session_manager.create_session(claimed_user_id, user_id, queue_id)
         
         # Update states
         user_states[claimed_user_id] = UserState.IN_CONVERSATION
