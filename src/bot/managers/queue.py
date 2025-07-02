@@ -29,7 +29,7 @@ class QueueManager:
         self.used_anonymous_ids.add(fallback_id)
         return fallback_id
     
-    def add_to_queue(self, user_id: int, description: str) -> str:
+    def add_to_queue(self, user_id: int, description: str, user_telehandle: str = None) -> str:
         """Add user to the help queue"""
         queue_id = str(uuid.uuid4())
         anonymous_id = self._generate_anonymous_id()
@@ -48,7 +48,7 @@ class QueueManager:
         
         # Create pending session in database using queue_id as session_id
         if db_mgr.db_available:
-            db_mgr.create_session(user_id, description, anonymous_id, queue_id)
+            db_mgr.create_session(user_id, description, anonymous_id, queue_id, user_telehandle)
         
         return queue_id
     
@@ -104,7 +104,7 @@ class QueueManager:
             else:
                 return False, "unknown_error"
     
-    async def claim_queue(self, queue_id: str, heartfelt_member_id: int, heartfelt_member_name: str = None) -> Optional[int]:
+    async def claim_queue(self, queue_id: str, heartfelt_member_id: int, heartfelt_member_name: str = None, heartfelt_member_telehandle: str = None) -> Optional[int]:
         """Claim a queue entry and return the user ID"""
         queue_entry = queue_entries.get(queue_id)
         if not queue_entry:
@@ -115,7 +115,7 @@ class QueueManager:
         
         # Claim the session in database (queue_id is used as session_id)
         if db_mgr.db_available:
-            db_mgr.claim_session(queue_id, heartfelt_member_id)
+            db_mgr.claim_session(queue_id, heartfelt_member_id, heartfelt_member_telehandle)
         
         # Edit the queue message to show it's been claimed instead of deleting it
         try:

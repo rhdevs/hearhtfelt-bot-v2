@@ -36,7 +36,16 @@ class SessionManager:
         if session_id is None:
             session_id = str(uuid.uuid4())
         
-        anonymous_user_id = self._generate_anonymous_id()
+        # Get existing anonymous_user_id from database if session exists
+        anonymous_user_id = None
+        if db_mgr.db_available and session_id:
+            db_session = db_mgr.get_session(session_id)
+            if db_session:
+                anonymous_user_id = db_session.get('anonymous_user_id')
+        
+        # Generate new anonymous ID only if we don't have one from database
+        if not anonymous_user_id:
+            anonymous_user_id = self._generate_anonymous_id()
         
         now = datetime.datetime.now()
         active_sessions[session_id] = {
@@ -53,6 +62,7 @@ class SessionManager:
         
         # Save to database - claim existing pending session or create new active one
         if db_mgr.db_available:
+            # We don't have heartfelt member telehandle here, it will be set during claim_session in queue manager
             db_mgr.claim_session(session_id, heartfelt_member_id)
         
         # Safety log for developers

@@ -15,8 +15,8 @@ ADMIN_CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID")
 MONGODB_URI = os.getenv("MONGODB_URI")
 
 HEARTFELT_MEMBERS = [
-    1522275008,
-    968176987,  # Authorized heartfelt member
+    1522275008, # tzefoong
+    968176987, # lcw
     # Add more authorized heartfelt member Telegram user IDs here
 ]
 

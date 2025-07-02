@@ -179,7 +179,8 @@ class BotHandlers:
         user_id = update.effective_user.id
         
         # Add to queue
-        queue_id = self.queue_manager.add_to_queue(user_id, description)
+        user_telehandle = f"@{update.effective_user.username}" if update.effective_user.username else None
+        queue_id = self.queue_manager.add_to_queue(user_id, description, user_telehandle)
         
         # Post to admin channel
         success, error_type = await self.queue_manager.post_queue_to_channel(queue_id)
@@ -227,7 +228,8 @@ class BotHandlers:
             heartfelt_member_name += f" {query.from_user.last_name}"
         
         # Claim the queue
-        claimed_user_id = await self.queue_manager.claim_queue(queue_id, user_id, heartfelt_member_name)
+        heartfelt_member_telehandle = f"@{query.from_user.username}" if query.from_user.username else None
+        claimed_user_id = await self.queue_manager.claim_queue(queue_id, user_id, heartfelt_member_name, heartfelt_member_telehandle)
         
         if claimed_user_id is None:
             await query.answer("This request has already been claimed or expired.", show_alert=True)

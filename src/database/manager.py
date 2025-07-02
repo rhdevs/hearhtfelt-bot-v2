@@ -17,7 +17,7 @@ class DBManager:
     
     # SESSION MANAGEMENT
     
-    def create_session(self, user_id: int, description: str, anonymous_user_id: str, session_id: str = None) -> Optional[str]:
+    def create_session(self, user_id: int, description: str, anonymous_user_id: str, session_id: str = None, user_telehandle: str = None) -> Optional[str]:
         """Create a new session in pending state"""
         if not self.db_available:
             return None
@@ -29,7 +29,9 @@ class DBManager:
             now = datetime.datetime.utcnow()
             session_doc = {
                 'session_id': session_id,
+                'user_telehandle': user_telehandle,
                 'user_id': user_id,
+                'heartfelt_member_telehandle': None, # null until claimed
                 'heartfelt_member_id': None,  # null until claimed
                 'anonymous_user_id': anonymous_user_id,
                 'status': 'pending',
@@ -38,7 +40,7 @@ class DBManager:
                 'last_activity_at': now,  # Track activity for auto-expiry
                 'claimed_at': None,
                 'ended_at': None,
-                'ended_by_user_id': None
+                'ended_by_user_id': None,
             }
             
             db_manager.db.sessions.insert_one(session_doc)
@@ -49,7 +51,7 @@ class DBManager:
             logger.error(f"Error creating session: {e}")
             return None
     
-    def claim_session(self, session_id: str, heartfelt_member_id: int) -> bool:
+    def claim_session(self, session_id: str, heartfelt_member_id: int, heartfelt_member_telehandle: str = None) -> bool:
         """Claim a pending session and activate it"""
         if not self.db_available:
             return False
@@ -60,6 +62,7 @@ class DBManager:
                 {
                     '$set': {
                         'heartfelt_member_id': heartfelt_member_id,
+                        'heartfelt_member_telehandle': heartfelt_member_telehandle,
                         'status': 'active',
                         'claimed_at': datetime.datetime.utcnow()
                     },
