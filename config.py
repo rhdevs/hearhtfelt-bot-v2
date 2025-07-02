@@ -32,6 +32,14 @@ queue_order = []          # ordered list of queue_ids for position tracking
 
 QUEUE_EXPIRE_MINUTES = 30
 
+# Session timeout settings
+SESSION_TIMEOUT_MINUTES = 10      # Auto-expire sessions after 10 minutes of inactivity
+SESSION_WARNING_MINUTES = 5       # Send warning 5 minutes before expiry
+SESSION_SWEEP_SECONDS = 180       # Check for expired sessions every 3 minutes
+
+# Session warning tracking (in-memory only)
+session_warnings = {}             # session_id -> bool (has warning been sent?)
+
 MESSAGES = {
     "welcome": (
         "Welcome to the Heartfelt Anonymous Helpline! 🤗\n\n"
@@ -44,7 +52,7 @@ MESSAGES = {
         "5️⃣ Chat freely - your identity stays private\n"
         "6️⃣ Use /end when you're ready to finish\n\n"
         "🔒 Complete anonymity guaranteed\n"
-        "💙 Confidential and judgment-free\n\n"
+        "💚 Confidential and judgment-free\n\n"
         "Commands:\n"
         "/help - Request support (start here!)\n"
         "/status - Check your queue position\n"
@@ -54,8 +62,8 @@ MESSAGES = {
     "help_request": "Please describe what you'd like help with. Your message will be shared anonymously with our support team.",
     "queue_added": "Thank you. You've been added to the queue. A support member will be with you shortly.",
     "conversation_started": "A support member has joined the conversation. You can now chat anonymously.",
-    "conversation_ended": "The conversation has ended. Thank you for using our service. Take care! 💙",
-    "conversation_ended_heartfelt": "This conversation has ended. Thank you for helping someone today! 💙",
+    "conversation_ended": "The conversation has ended. Thank you for using our service. Take care! 💚",
+    "conversation_ended_heartfelt": "This conversation has ended. Thank you for helping someone today! 💚",
     "no_active_conversation": "You don't have an active conversation to end.",
     "already_in_queue": "You're already in the queue. Please wait for a support member to connect with you.",
     "already_in_conversation": "You're already in a conversation. Use /end to finish your current conversation first.",
@@ -67,7 +75,10 @@ MESSAGES = {
     "queue_system_offline": "The queue system is currently offline. Your request has been noted but may experience delays.",
     "queue_cancelled": "✅ You have been removed from the queue. Thank you for considering our support service. You can use /help again anytime if you need assistance.",
     "not_in_queue": "You are not currently in the queue. Use /help to request support or /status to check your current status.",
-    "cancel_error": "There was an error removing you from the queue. Please try again or use /status to check your current status."
+    "cancel_error": "There was an error removing you from the queue. Please try again or use /status to check your current status.",
+    "session_warning": "⏰ Are you still there? This conversation will automatically close in 5 minutes if there's no activity.",
+    "session_expired": "⏱️ This conversation has been automatically closed due to inactivity. You can start a new conversation anytime with /help. Take care! 💚",
+    "session_expired_heartfelt": "⏱️ This conversation has been automatically closed due to inactivity. Thank you for your time helping someone today! 💚"
 }
 
 async def validate_channel_access(bot, channel_id):

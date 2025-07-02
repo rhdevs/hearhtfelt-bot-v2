@@ -26,6 +26,7 @@ class DBManager:
             if session_id is None:
                 session_id = str(uuid.uuid4())
                 
+            now = datetime.datetime.utcnow()
             session_doc = {
                 'session_id': session_id,
                 'user_id': user_id,
@@ -33,7 +34,8 @@ class DBManager:
                 'anonymous_user_id': anonymous_user_id,
                 'status': 'pending',
                 'description': description,
-                'created_at': datetime.datetime.utcnow(),
+                'created_at': now,
+                'last_activity_at': now,  # Track activity for auto-expiry
                 'claimed_at': None,
                 'ended_at': None,
                 'ended_by_user_id': None
@@ -60,6 +62,9 @@ class DBManager:
                         'heartfelt_member_id': heartfelt_member_id,
                         'status': 'active',
                         'claimed_at': datetime.datetime.utcnow()
+                    },
+                    '$currentDate': {
+                        'last_activity_at': True  # Atomic timestamp update
                     }
                 }
             )
@@ -73,39 +78,44 @@ class DBManager:
             logger.error(f"Error claiming session {session_id}: {e}")
             return False
     
-    def end_session(self, session_id: str, ended_by_user_id: int) -> bool:
+    def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False) -> bool:
         """End an active session and calculate duration"""
         if not self.db_available:
             return False
             
         try:
-            # Get session to calculate duration
-            session = db_manager.db.sessions.find_one({'session_id': session_id})
-            if not session or session['status'] not in ['pending', 'active']:
-                return False
-            
             ended_at = datetime.datetime.utcnow()
             
-            # Calculate duration from claimed_at if available, otherwise from created_at
-            start_time = session.get('claimed_at', session['created_at'])
-            duration_minutes = int((ended_at - start_time).total_seconds() / 60)
-            
-            result = db_manager.db.sessions.update_one(
-                {'session_id': session_id},
+            # Use atomic operation to prevent double-termination
+            result = db_manager.db.sessions.find_one_and_update(
+                {'session_id': session_id, 'status': {'$in': ['pending', 'active']}},
                 {
                     '$set': {
                         'status': 'ended',
                         'ended_at': ended_at,
-                        'ended_by_user_id': ended_by_user_id,
-                        'duration_minutes': duration_minutes
+                        'ended_by_user_id': ended_by_user_id if not system_end else None,
+                        'ended_by_system': system_end
                     }
-                }
+                },
+                return_document=True
             )
             
-            success = result.modified_count > 0
-            if success:
-                logger.info(f"Session {session_id} ended by user {ended_by_user_id}, duration: {duration_minutes}m")
-            return success
+            if not result:
+                return False  # Session already ended or doesn't exist
+            
+            # Calculate duration from claimed_at if available, otherwise from created_at
+            start_time = result.get('claimed_at', result['created_at'])
+            duration_minutes = int((ended_at - start_time).total_seconds() / 60)
+            
+            # Update with calculated duration
+            db_manager.db.sessions.update_one(
+                {'session_id': session_id},
+                {'$set': {'duration_minutes': duration_minutes}}
+            )
+
+            end_reason = "system auto-expiry" if system_end else f"user {ended_by_user_id}"
+            logger.info(f"Session {session_id} ended by {end_reason}, duration: {duration_minutes}m")
+            return True
             
         except Exception as e:
             logger.error(f"Error ending session {session_id}: {e}")
@@ -148,6 +158,35 @@ class DBManager:
             ))
         except Exception as e:
             logger.error(f"Error getting pending sessions: {e}")
+            return []
+    
+    def update_session_activity(self, session_id: str) -> bool:
+        """Update last_activity_at timestamp for a session"""
+        if not self.db_available:
+            return False
+            
+        try:
+            result = db_manager.db.sessions.update_one(
+                {'session_id': session_id, 'status': 'active'},
+                {'$currentDate': {'last_activity_at': True}}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error updating session activity {session_id}: {e}")
+            return False
+    
+    def get_sessions_by_activity(self, cutoff_time: datetime.datetime) -> List[Dict[str, Any]]:
+        """Get active sessions with last activity before cutoff time"""
+        if not self.db_available:
+            return []
+            
+        try:
+            return list(db_manager.db.sessions.find({
+                'status': 'active',
+                'last_activity_at': {'$lte': cutoff_time}
+            }))
+        except Exception as e:
+            logger.error(f"Error getting sessions by activity: {e}")
             return []
     
     # MESSAGE MANAGEMENT

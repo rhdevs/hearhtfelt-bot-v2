@@ -4,6 +4,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from config import BOT_TOKEN, ADMIN_CHANNEL_ID, HEARTFELT_MEMBERS, validate_channel_access
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager
+from src.bot.managers.expiry import SessionExpiryManager
 from src.bot.handlers import BotHandlers
 from src.database.manager import db_mgr
 
@@ -44,6 +45,7 @@ async def main():
     bot = application.bot
     session_manager = SessionManager(bot)
     queue_manager = QueueManager(bot)
+    expiry_manager = SessionExpiryManager(bot, session_manager)
     handlers = BotHandlers(session_manager, queue_manager)
     
     # Register handlers
@@ -83,7 +85,7 @@ async def main():
         logger.error("   2. Grant permissions: Send Messages, Delete Messages")
         logger.error("   3. Verify ADMIN_CHANNEL_ID is correct")
     
-    # Start periodic cleanup task
+    # Start periodic cleanup tasks
     async def cleanup_expired_queues():
         """Periodic task to clean up expired queue entries"""
         while True:
@@ -97,8 +99,9 @@ async def main():
             # Wait 5 minutes before next cleanup
             await asyncio.sleep(300)
     
-    # Start cleanup task
-    cleanup_task = asyncio.create_task(cleanup_expired_queues())
+    # Start cleanup tasks
+    queue_cleanup_task = asyncio.create_task(cleanup_expired_queues())
+    session_expiry_task = asyncio.create_task(expiry_manager.start())
     
     try:
         # Run the bot
@@ -121,7 +124,9 @@ async def main():
         logger.error(f"An error occurred: {e}")
     finally:
         # Clean shutdown
-        cleanup_task.cancel()
+        queue_cleanup_task.cancel()
+        expiry_manager.stop()
+        session_expiry_task.cancel()
         logger.info("Bot stopped.")
 
 if __name__ == "__main__":

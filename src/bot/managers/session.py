@@ -4,7 +4,7 @@ import random
 import logging
 from typing import Optional, Tuple
 from telegram import Bot
-from config import active_sessions, safety_logs, user_to_session_map
+from config import active_sessions, safety_logs, user_to_session_map, session_warnings
 from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
@@ -38,10 +38,12 @@ class SessionManager:
         
         anonymous_user_id = self._generate_anonymous_id()
         
+        now = datetime.datetime.now()
         active_sessions[session_id] = {
             'user_id': user_id,
             'heartfelt_member_id': heartfelt_member_id,
-            'created_at': datetime.datetime.now(),
+            'created_at': now,
+            'last_activity_at': now,  # Track activity for auto-expiry
             'anonymous_user_id': anonymous_user_id
         }
         
@@ -103,6 +105,22 @@ class SessionManager:
         else:
             return session['anonymous_user_id']
     
+    def update_session_activity(self, session_id: str) -> None:
+        """Update session activity timestamp in both memory and database"""
+        now = datetime.datetime.now()
+        
+        # Update in-memory session
+        if session_id in active_sessions:
+            active_sessions[session_id]['last_activity_at'] = now
+            
+            # Reset warning flag when activity is detected
+            if session_id in session_warnings:
+                session_warnings[session_id] = False
+        
+        # Update database
+        if db_mgr.db_available:
+            db_mgr.update_session_activity(session_id)
+    
     async def forward_message(self, session_id: str, from_user_id: int, message_text: str) -> bool:
         """Forward message to the other party in the session"""
         try:
@@ -117,6 +135,9 @@ class SessionManager:
                 chat_id=other_party_id,
                 text=formatted_message
             )
+            
+            # Update session activity
+            self.update_session_activity(session_id)
             
             # Log to database
             if db_mgr.db_available:
@@ -163,6 +184,9 @@ class SessionManager:
                 text=f"🎭 {anonymous_name} sent a sticker"
             )
             
+            # Update session activity
+            self.update_session_activity(session_id)
+            
             # Log to database
             if db_mgr.db_available:
                 db_mgr.log_message(
@@ -188,7 +212,7 @@ class SessionManager:
             logger.error(f"Error forwarding sticker in session {session_id}: {e}")
             return False
     
-    async def end_session(self, session_id: str, ended_by_user_id: int) -> Tuple[Optional[int], Optional[int]]:
+    async def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False) -> Tuple[Optional[int], Optional[int]]:
         """End a session and return both user IDs"""
         session = active_sessions.get(session_id)
         if not session:
@@ -199,7 +223,7 @@ class SessionManager:
         
         # End session in database
         if db_mgr.db_available:
-            db_mgr.end_session(session_id, ended_by_user_id)
+            db_mgr.end_session(session_id, ended_by_user_id, system_end)
         
         # Remove session and clean up indices
         del active_sessions[session_id]
@@ -209,6 +233,10 @@ class SessionManager:
             del user_to_session_map[user_id]
         if heartfelt_member_id in user_to_session_map:
             del user_to_session_map[heartfelt_member_id]
+        
+        # Clean up warning tracking
+        if session_id in session_warnings:
+            del session_warnings[session_id]
         
         # Safety log
         safety_logs.append({
