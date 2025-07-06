@@ -61,6 +61,9 @@ async def main():
     # Sticker handler for stickers during conversations
     application.add_handler(MessageHandler(filters.Sticker.ALL, handlers.handle_sticker))
     
+    # Photo handler for photos during conversations
+    application.add_handler(MessageHandler(filters.PHOTO, handlers.handle_photo))
+    
     # Callback query handler for inline keyboards
     application.add_handler(CallbackQueryHandler(handlers.handle_callback_query))
     

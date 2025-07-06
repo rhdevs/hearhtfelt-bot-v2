@@ -222,6 +222,54 @@ class SessionManager:
             logger.error(f"Error forwarding sticker in session {session_id}: {e}")
             return False
     
+    async def forward_photo(self, session_id: str, from_user_id: int, photo_file_id: str, file_size: int = None) -> bool:
+        """Forward a photo to the other party in the session"""
+        try:
+            other_party_id = self.get_other_party(session_id, from_user_id)
+            if not other_party_id:
+                return False
+            
+            anonymous_name = self.get_anonymous_name(session_id, other_party_id)
+            
+            # Send the photo
+            await self.bot.send_photo(
+                chat_id=other_party_id,
+                photo=photo_file_id,
+                caption=f"📸 {anonymous_name} shared a photo"
+            )
+            
+            # Update session activity
+            self.update_session_activity(session_id)
+            
+            # Log to database
+            if db_mgr.db_available:
+                db_mgr.log_message(
+                    session_id=session_id,
+                    from_user_id=from_user_id,
+                    to_user_id=other_party_id,
+                    message_type="file",
+                    file_id=photo_file_id,
+                    file_type="photo"
+                )
+            
+            # Safety log
+            safety_logs.append({
+                'session_id': session_id,
+                'from_user_id': from_user_id,
+                'to_user_id': other_party_id,
+                'timestamp': datetime.datetime.now(),
+                'action': 'photo_forwarded',
+                'file_id': photo_file_id,
+                'file_size': file_size,
+                'file_type': 'photo'
+            })
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error forwarding photo in session {session_id}: {e}")
+            return False
+    
     async def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False) -> Tuple[Optional[int], Optional[int]]:
         """End a session and return both user IDs"""
         session = active_sessions.get(session_id)

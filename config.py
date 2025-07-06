@@ -15,8 +15,8 @@ ADMIN_CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID")
 MONGODB_URI = os.getenv("MONGODB_URI")
 
 HEARTFELT_MEMBERS = [
-    1522275008, # tzefoong
-    968176987, # lcw
+    1522275008, # tzefoong (rhdevs)
+    968176987, # lcw (rhdevs)
     # Add more authorized heartfelt member Telegram user IDs here
 ]
 
@@ -40,19 +40,21 @@ SESSION_SWEEP_SECONDS = 180       # Check for expired sessions every 3 minutes
 # Session warning tracking (in-memory only)
 session_warnings = {}             # session_id -> bool (has warning been sent?)
 
+
 MESSAGES = {
     "welcome": (
-        "Welcome to the Heartfelt Anonymous Helpline! 🤗\n\n"
-        "This is a safe, anonymous space where you can speak with our trained support team.\n\n"
+        "Welcome to the HeaRHtfelt Companion Helpline! 🤗\n\n"
+        "This is a safe, anonymous space where you can speak with our hearhtfelt members.\n\n"
         "📋 How it works:\n"
         "1️⃣ Use /help to request support\n"
         "2️⃣ Describe what you need help with\n"
         "3️⃣ You'll be placed in a queue\n"
-        "4️⃣ A support member will connect with you anonymously\n"
-        "5️⃣ Chat freely - your identity stays private\n"
+        "4️⃣ A hearhtfelt member will connect with you anonymously\n"
+        "5️⃣ Chat freely - share text, photos, and stickers\n"
         "6️⃣ Use /end when you're ready to finish\n\n"
         "🔒 Complete anonymity guaranteed\n"
-        "💚 Confidential and judgment-free\n\n"
+        "💚 Confidential and judgment-free\n"
+        "📸 Photos and media supported\n\n"
         "Commands:\n"
         "/help - Request support (start here!)\n"
         "/status - Check your queue position\n"
@@ -78,7 +80,9 @@ MESSAGES = {
     "cancel_error": "There was an error removing you from the queue. Please try again or use /status to check your current status.",
     "session_warning": "⏰ Are you still there? This conversation will automatically close in 5 minutes if there's no activity.",
     "session_expired": "⏱️ This conversation has been automatically closed due to inactivity. You can start a new conversation anytime with /help. Take care! 💚",
-    "session_expired_heartfelt": "⏱️ This conversation has been automatically closed due to inactivity. Thank you for your time helping someone today! 💚"
+    "session_expired_heartfelt": "⏱️ This conversation has been automatically closed due to inactivity. Thank you for your time helping someone today! 💚",
+    "photo_size_limit": "⚠️ Photo is too large. Please send a smaller image (max 10MB).",
+    "photo_error": "❌ Unable to send photo. Please try again or use text instead."
 }
 
 async def validate_channel_access(bot, channel_id):

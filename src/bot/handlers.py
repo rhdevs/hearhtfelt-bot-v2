@@ -1,7 +1,7 @@
 from telegram import Update
 from telegram.ext import ContextTypes, CallbackContext
 from config import (
-    UserState, user_states, HEARTFELT_MEMBERS, MESSAGES
+    UserState, user_states, HEARTFELT_MEMBERS, MESSAGES, PHOTO_SHARING_ENABLED
 )
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager
@@ -173,6 +173,33 @@ class BotHandlers:
         else:
             # If no session, inform the user
             await update.message.reply_text("You can only send stickers during an active conversation. Use /help to start.")
+    
+    async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle and relay photos during an active conversation with size validation"""
+        user_id = update.effective_user.id
+        
+        # Check if the user is in an active session
+        session_id = self.session_manager.get_session_by_user(user_id)
+        
+        if session_id:
+            # Get the largest photo size for best quality
+            photo = update.message.photo[-1]
+            
+            # Check file size (Telegram limit is 10MB for photos)
+            if photo.file_size and photo.file_size > 10 * 1024 * 1024:  # 10MB limit
+                await update.message.reply_text(MESSAGES["photo_size_limit"])
+                return
+            
+            success = await self.session_manager.forward_photo(
+                session_id, user_id, photo.file_id, photo.file_size
+            )
+            if not success:
+                await update.message.reply_text(MESSAGES["photo_error"])
+        else:
+            # If no session, inform the user
+            await update.message.reply_text(
+                "You can only send photos during an active conversation. Use /help to start."
+            )
     
     async def _handle_help_description(self, update: Update, context: ContextTypes.DEFAULT_TYPE, description: str):
         """Handle help description from user"""
