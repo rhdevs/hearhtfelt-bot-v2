@@ -13,7 +13,7 @@ from telegram import Bot
 def get_anonymous_name(session_doc, for_user_type='user'):
     """Helper to get anonymous display name from session document"""
     if for_user_type == 'user':
-        return "Heartfelt Member"
+        return "Hearhtfelt Member"
     else:
         return session_doc.get('anonymous_user_id', 'Anonymous User')
 
