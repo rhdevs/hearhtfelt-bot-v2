@@ -73,3 +73,8 @@ python3 main.py                 # Start bot and test user flow
 ```
 
 Test flow: User sends `/help` → describe issue → check admin channel → claim → chat → `/end`
+
+## Privacy Policy
+
+We value your privacy. Please review our full privacy policy here:  
+[Heartfelt Companion Privacy Policy](https://docs.google.com/document/d/1pWvutw151h_sypdttkwEH7hDiBwBdX-qF_xJypffn7Y/edit?usp=sharing)

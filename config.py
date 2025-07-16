@@ -17,6 +17,11 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 HEARTFELT_MEMBERS = [
     1522275008, # tzefoong (rhdevs)
     968176987, # lcw (rhdevs)
+    7389740882, # purav (rhdevs)
+    802699568, # pauline (rhdevs)
+    5645796797, # arushi (hearhtfelt)
+    566339809, # eddy (hearhtfelt)
+    5206468379, # elysia (hearhtfelt)
     # Add more authorized heartfelt member Telegram user IDs here
 ]
 
@@ -36,6 +41,9 @@ QUEUE_EXPIRE_MINUTES = 30
 SESSION_TIMEOUT_MINUTES = 10      # Auto-expire sessions after 10 minutes of inactivity
 SESSION_WARNING_MINUTES = 5       # Send warning 5 minutes before expiry
 SESSION_SWEEP_SECONDS = 180       # Check for expired sessions every 3 minutes
+
+# Feature flags
+PHOTO_SHARING_ENABLED = True      # Allow users to send photos
 
 # Session warning tracking (in-memory only)
 session_warnings = {}             # session_id -> bool (has warning been sent?)
@@ -59,7 +67,9 @@ MESSAGES = {
         "/help - Request support (start here!)\n"
         "/status - Check your queue position\n"
         "/cancel - Leave the queue if you're waiting\n"
-        "/end - End your current conversation"
+        "/end - End your current conversation\n\n"
+        "We value your privacy. Please review our full privacy policy here:\n"
+        "https://docs.google.com/document/d/1pWvutw151h_sypdttkwEH7hDiBwBdX-qF_xJypffn7Y/edit?usp=sharing"
     ),
     "help_request": "Please describe what you'd like help with. Your message will be shared anonymously with our support team.",
     "queue_added": "Thank you. You've been added to the queue. A support member will be with you shortly.",
