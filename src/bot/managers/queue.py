@@ -6,9 +6,10 @@ import uuid
 from typing import Optional, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from config import (
-    ADMIN_CHANNEL_ID,
     QUEUE_EXPIRE_MINUTES,
+    ServiceType,
     UserState,
+    get_service,
     queue_entries,
     queue_order,
     user_states,
@@ -28,46 +29,56 @@ logger = logging.getLogger(__name__)
 class QueueManager:
     def __init__(self, bot: Bot):
         self.bot = bot
-        self.channel_accessible = True  # Track channel accessibility
+        self.channel_accessible = {}  # service_key -> bool (per-service channel reachability)
         self.used_anonymous_ids = set()  # Track used IDs to avoid duplicates
-    
-    def _generate_anonymous_id(self) -> str:
-        """Generate a unique anonymous ID using RHesident format"""
+
+    def _channel_for(self, entry: dict):
+        """Resolve the queue channel for a given queue entry's service."""
+        return get_service(entry.get('service')).channel_id
+
+    def get_queue_entry(self, queue_id: str) -> Optional[dict]:
+        """Return the in-memory queue entry (or None) without mutating it."""
+        return queue_entries.get(queue_id)
+
+    def _generate_anonymous_id(self, prefix: str = "RHesident") -> str:
+        """Generate a unique anonymous ID using the given prefix"""
         # Try up to 50 times to generate a unique ID
         for _ in range(50):
             number = random.randint(1000, 9999)
-            anonymous_id = f"RHesident #{number}"
-            
+            anonymous_id = f"{prefix} #{number}"
+
             if anonymous_id not in self.used_anonymous_ids:
                 self.used_anonymous_ids.add(anonymous_id)
                 return anonymous_id
-        
+
         # Fallback to UUID if we can't generate unique ID
-        fallback_id = f"RHesident #{str(uuid.uuid4())[:8]}"
+        fallback_id = f"{prefix} #{str(uuid.uuid4())[:8]}"
         self.used_anonymous_ids.add(fallback_id)
         return fallback_id
-    
-    def add_to_queue(self, user_id: int, description: str, user_telehandle: str = None) -> str:
-        """Add user to the help queue"""
+
+    def add_to_queue(self, user_id: int, description: str, user_telehandle: str = None,
+                     service_key: str = ServiceType.HF.value) -> str:
+        """Add user to the help queue for the given service"""
         queue_id = str(uuid.uuid4())
-        anonymous_id = self._generate_anonymous_id()
-        
+        anonymous_id = self._generate_anonymous_id(get_service(service_key).anon_prefix)
+
         queue_entries[queue_id] = {
             'user_id': user_id,
             'description': description,
             'created_at': datetime.datetime.now(),
             'anonymous_id': anonymous_id,
-            'message_id': None  # Will be set after posting to channel
+            'message_id': None,  # Will be set after posting to channel
+            'service': service_key,
         }
-        
+
         # Maintain O(1) lookup indices
         user_to_queue_map[user_id] = queue_id
         queue_order.append(queue_id)
-        
+
         # Create pending session in database using queue_id as session_id
         if db_mgr.db_available:
-            db_mgr.create_session(user_id, description, anonymous_id, queue_id, user_telehandle)
-        
+            db_mgr.create_session(user_id, description, anonymous_id, queue_id, user_telehandle, service=service_key)
+
         return queue_id
     
     async def post_queue_to_channel(self, queue_id: str) -> Tuple[bool, str]:
@@ -76,46 +87,49 @@ class QueueManager:
             queue_entry = queue_entries.get(queue_id)
             if not queue_entry:
                 return False, "Queue entry not found"
-            
-            # Skip if channel is known to be inaccessible
-            if not self.channel_accessible:
+
+            svc = get_service(queue_entry.get('service'))
+
+            # Skip if this service's channel is known to be inaccessible
+            if not self.channel_accessible.get(svc.key, True):
                 return False, "channel_offline"
-            
+
             # Create message text
             message_text = (
-                f"🆘 New Help Request\n\n"
+                f"{svc.request_title}\n\n"
                 f"From: {queue_entry['anonymous_id']}\n"
                 f"Time: {queue_entry['created_at'].strftime('%H:%M')}\n\n"
                 f"Description: {queue_entry['description'][:200]}{'...' if len(queue_entry['description']) > 200 else ''}"
             )
-            
+
             # Create inline keyboard with claim button
             keyboard = [[InlineKeyboardButton("📞 Claim", callback_data=f"claim_{queue_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            # Send message to admin channel
+
+            # Send message to this service's queue channel
             message = await self.bot.send_message(
-                chat_id=ADMIN_CHANNEL_ID,
+                chat_id=svc.channel_id,
                 text=message_text,
                 reply_markup=reply_markup
             )
-            
+
             # Store message ID for later deletion
             queue_entries[queue_id]['message_id'] = message.message_id
-            self.channel_accessible = True  # Mark as accessible on success
-            
+            self.channel_accessible[svc.key] = True  # Mark as accessible on success
+
             return True, "success"
-            
+
         except Exception as e:
             error_msg = str(e).lower()
             print(f"Error posting queue to channel: {e}")
-            
+            svc_key = get_service(queue_entries.get(queue_id, {}).get('service')).key
+
             # Categorize the error
             if "chat not found" in error_msg:
-                self.channel_accessible = False
+                self.channel_accessible[svc_key] = False
                 return False, "chat_not_found"
             elif "forbidden" in error_msg or "not enough rights" in error_msg:
-                self.channel_accessible = False
+                self.channel_accessible[svc_key] = False
                 return False, "access_denied"
             elif "network" in error_msg or "timeout" in error_msg:
                 return False, "network_error"
@@ -135,10 +149,15 @@ class QueueManager:
         if user_id == heartfelt_member_id:
             raise SelfClaimError("Claimant cannot take their own queue entry")
         
-        # Claim the session in database (queue_id is used as session_id)
+        # Claim the session in database (queue_id is used as session_id).
+        # When DB is available this is the atomic winner-selection: only the first
+        # claimer flips status pending->active, so a losing concurrent claim aborts here.
         if db_mgr.db_available:
-            db_mgr.claim_session(queue_id, heartfelt_member_id, heartfelt_member_telehandle)
-        
+            claimed = db_mgr.claim_session(queue_id, heartfelt_member_id, heartfelt_member_telehandle)
+            if not claimed:
+                logger.info("Queue %s already claimed (DB guard); ignoring duplicate claim by %s", queue_id, heartfelt_member_id)
+                return None
+
         # Edit the queue message to show it's been claimed instead of deleting it
         try:
             if message_id:
@@ -148,14 +167,14 @@ class QueueManager:
             # Fallback to deletion if edit fails
             try:
                 await self.bot.delete_message(
-                    chat_id=ADMIN_CHANNEL_ID,
+                    chat_id=self._channel_for(queue_entry),
                     message_id=message_id
                 )
             except Exception as delete_error:
                 print(f"Error deleting queue message as fallback: {delete_error}")
-        
+
         # Remove from queue and clean up indices
-        del queue_entries[queue_id]
+        queue_entries.pop(queue_id, None)
         
         # Clean up O(1) lookup indices
         if user_id in user_to_queue_map:
@@ -187,7 +206,7 @@ class QueueManager:
         # Edit the message, removing the claim button and applying HTML formatting
         try:
             await self.bot.edit_message_text(
-                chat_id=ADMIN_CHANNEL_ID,
+                chat_id=self._channel_for(queue_entry),
                 message_id=queue_entry['message_id'],
                 text=claimed_message_text,
                 reply_markup=None,
@@ -276,11 +295,12 @@ class QueueManager:
                 del user_to_queue_map[user_id]
             return False, "not_in_queue"
         
-        # Try to delete the admin channel message
-        if queue_entry.get('message_id') and self.channel_accessible:
+        # Try to delete the service's queue channel message
+        svc = get_service(queue_entry.get('service'))
+        if queue_entry.get('message_id') and self.channel_accessible.get(svc.key, True):
             try:
                 await self.bot.delete_message(
-                    chat_id=ADMIN_CHANNEL_ID,
+                    chat_id=svc.channel_id,
                     message_id=queue_entry['message_id']
                 )
             except Exception as e:

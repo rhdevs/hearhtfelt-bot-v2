@@ -1,19 +1,22 @@
 import os
 import threading
+from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set
 from dotenv import load_dotenv
 
 load_dotenv()
 
 class UserState(Enum):
     IDLE = "idle"
+    WAITING_FOR_SERVICE = "waiting_for_service"   # only entered when >=2 services are runnable
     WAITING_FOR_DESCRIPTION = "waiting_for_description"
     IN_QUEUE = "in_queue"
     IN_CONVERSATION = "in_conversation"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID")
+PSS_CHANNEL_ID = os.getenv("PSS_CHANNEL_ID")   # unset in Phase 1 -> None (PSS not runnable)
 MONGODB_URI = os.getenv("MONGODB_URI")
 
 
@@ -109,7 +112,97 @@ DEFAULT_HEARTFELT_MEMBERS = [
     # Add more authorized heartfelt member Telegram user IDs here
 ]
 
-HEARTFELT_MEMBERS = AuthorizedMembersStore(DEFAULT_HEARTFELT_MEMBERS)
+DEFAULT_PSS_MEMBERS: List[int] = []   # empty in Phase 1; populated when PSS is enabled
+
+
+class ServiceType(str, Enum):
+    """Support tracks under the umbrella. str-mixin so it serializes to "hf"/"pss" in Mongo."""
+    HF = "hf"
+    PSS = "pss"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass
+class Service:
+    """Configuration for a single support track (e.g. HF or PSS)."""
+    key: str
+    display_name: str          # chooser button label (only shown when >1 service runnable)
+    member_label: str          # requester-facing helper name (used by get_anonymous_name)
+    anon_prefix: str           # prefix for the requester's anonymous id
+    request_title: str         # header line of the channel queue post
+    channel_id: Optional[str]  # queue channel for this service
+    members_collection: str    # Mongo collection of authorized members
+    default_members: List[int]
+    roster: "AuthorizedMembersStore"
+    enabled: bool              # explicit on/off flag
+
+    @property
+    def runnable(self) -> bool:
+        # A service is only offered/posted-to when enabled AND fully configured with a channel.
+        return bool(self.enabled and self.channel_id)
+
+
+SERVICES: Dict[str, Service] = {
+    ServiceType.HF.value: Service(
+        key=ServiceType.HF.value,
+        display_name="Talk to a HF member (friendly listening ear)",
+        member_label="Hearhtfelt Member",
+        anon_prefix="RHesident",
+        request_title="🆘 New Help Request",
+        channel_id=ADMIN_CHANNEL_ID,
+        members_collection="heartfelt_members",
+        default_members=DEFAULT_HEARTFELT_MEMBERS,
+        roster=AuthorizedMembersStore(DEFAULT_HEARTFELT_MEMBERS),
+        enabled=True,
+    ),
+    ServiceType.PSS.value: Service(
+        key=ServiceType.PSS.value,
+        display_name="Talk to a PSS (trained peers who can offer support)",
+        member_label="Peer Supporter",
+        anon_prefix="RHesident",
+        request_title="🆘 New Peer Support Request",
+        channel_id=PSS_CHANNEL_ID,                # None in Phase 1 -> runnable == False
+        members_collection="peer_supporters",
+        default_members=DEFAULT_PSS_MEMBERS,
+        roster=AuthorizedMembersStore(DEFAULT_PSS_MEMBERS),
+        enabled=_env_bool("PSS_ENABLED", False),  # False in Phase 1
+    ),
+}
+
+
+def get_service(key: Optional[str]) -> Service:
+    """Resolve a service by key, falling back to HF for unknown/missing keys."""
+    return SERVICES.get(key or ServiceType.HF.value, SERVICES[ServiceType.HF.value])
+
+
+def enabled_services() -> List[Service]:
+    """Services that are both enabled and fully configured (have a channel)."""
+    return [s for s in SERVICES.values() if s.runnable]
+
+
+def default_service_key() -> str:
+    """The implicit service when no chooser is shown (single runnable service, else HF)."""
+    svcs = enabled_services()
+    return svcs[0].key if len(svcs) == 1 else ServiceType.HF.value
+
+
+def is_member_of_service(user_id: int, service_key: str) -> bool:
+    """True if the user is in the given service's roster."""
+    return user_id in get_service(service_key).roster
+
+
+def is_any_member(user_id: int) -> bool:
+    """True if the user belongs to any enabled service's roster."""
+    return any(user_id in s.roster for s in SERVICES.values() if s.enabled)
+
+
+# Back-compat: HEARTFELT_MEMBERS must be the SAME store instance held in SERVICES["hf"],
+# so the existing refresh loop mutates the object the rest of the code reads.
+HF_SERVICE = SERVICES[ServiceType.HF.value]
+HEARTFELT_MEMBERS = HF_SERVICE.roster
 
 active_sessions = {}
 user_states = {}
@@ -118,8 +211,9 @@ safety_logs = []
 
 # Performance optimization: O(1) lookup indices
 user_to_session_map = {}  # user_id -> session_id for fast session lookups
-user_to_queue_map = {}    # user_id -> queue_id for fast queue lookups  
+user_to_queue_map = {}    # user_id -> queue_id for fast queue lookups
 queue_order = []          # ordered list of queue_ids for position tracking
+user_to_service_map = {}  # user_id -> chosen service key (set at /help or via the chooser)
 
 QUEUE_EXPIRE_MINUTES = 60
 AUTHORIZED_MEMBER_REFRESH_SECONDS = 300  # Interval for refreshing Heartfelt members from DB
@@ -158,6 +252,7 @@ MESSAGES = {
         "We value your privacy. Please review our full privacy policy here:\n"
         "https://docs.google.com/document/d/1pWvutw151h_sypdttkwEH7hDiBwBdX-qF_xJypffn7Y/edit?usp=sharing"
     ),
+    "choose_service": "Which kind of support would you like? Please choose below.",
     "help_request": "Please describe what you'd like help with. Your message will be shared anonymously with our support team. You can use /cancel to cancel.",
     "queue_added": "Thank you. You've been added to the queue. A support member will be with you shortly.",
     "conversation_started": "A support member has joined the conversation. You can now chat anonymously.",
@@ -194,8 +289,13 @@ MESSAGES = {
 
 
 def is_heartfelt_member(user_id: int) -> bool:
-    """Return True if the given user ID is an authorized heartfelt member."""
-    return user_id in HEARTFELT_MEMBERS
+    """Back-compat shim: True if the user belongs to any enabled service roster.
+
+    In Phase 1 only HF is enabled, so this is exactly the old HF membership check.
+    In Phase 2 a PSS supporter is also a "member" here, which is what the end/expiry
+    copy ("thank you for helping") wants.
+    """
+    return is_any_member(user_id)
 
 
 def get_heartfelt_members() -> List[int]:

@@ -18,18 +18,19 @@ class DBManager:
     
     # SESSION MANAGEMENT
     
-    def create_session(self, user_id: int, description: str, anonymous_user_id: str, session_id: str = None, user_telehandle: str = None) -> Optional[str]:
+    def create_session(self, user_id: int, description: str, anonymous_user_id: str, session_id: str = None, user_telehandle: str = None, service: str = "hf") -> Optional[str]:
         """Create a new session in pending state"""
         if not self.db_available:
             return None
-            
+
         try:
             if session_id is None:
                 session_id = str(uuid.uuid4())
-                
+
             now = datetime.datetime.utcnow()
             session_doc = {
                 'session_id': session_id,
+                'service': service,
                 'user_telehandle': user_telehandle,
                 'user_id': user_id,
                 'heartfelt_member_telehandle': None, # null until claimed
@@ -195,14 +196,15 @@ class DBManager:
 
     # AUTHORIZED HEARTFELT MEMBERS
 
-    def ensure_authorized_members_seed(self, default_members: Iterable[int]) -> None:
+    def ensure_authorized_members_seed(self, default_members: Iterable[int], collection: str = None) -> None:
         """Seed the authorized members collection with defaults if empty."""
         if not self.db_available:
             return
 
         try:
-            collection = db_manager.db[self._authorized_collection]
-            if collection.estimated_document_count() > 0:
+            coll = collection or self._authorized_collection
+            coll_obj = db_manager.db[coll]
+            if coll_obj.estimated_document_count() > 0:
                 return
 
             now = datetime.datetime.utcnow()
@@ -220,29 +222,30 @@ class DBManager:
                 })
 
             if docs:
-                collection.insert_many(docs, ordered=False)
-                logger.info("Seeded authorized heartfelt members into MongoDB")
+                coll_obj.insert_many(docs, ordered=False)
+                logger.info("Seeded authorized members into MongoDB collection '%s'", coll)
         except Exception as e:
             logger.error(f"Error seeding authorized members: {e}")
 
-    def _fetch_authorized_member_docs(self, include_inactive: bool = False) -> Optional[List[Dict[str, Any]]]:
+    def _fetch_authorized_member_docs(self, include_inactive: bool = False, collection: str = None) -> Optional[List[Dict[str, Any]]]:
         if not self.db_available:
             return None
 
         try:
+            coll = collection or self._authorized_collection
             query = {}
             if not include_inactive:
                 query['active'] = {'$ne': False}
 
-            docs = list(db_manager.db[self._authorized_collection].find(query))
+            docs = list(db_manager.db[coll].find(query))
             return docs
         except Exception as e:
             logger.error(f"Error retrieving authorized member records: {e}")
             return None
 
-    def get_authorized_members(self, include_inactive: bool = False) -> Optional[List[int]]:
-        """Fetch authorized heartfelt member IDs from MongoDB."""
-        docs = self._fetch_authorized_member_docs(include_inactive=include_inactive)
+    def get_authorized_members(self, include_inactive: bool = False, collection: str = None) -> Optional[List[int]]:
+        """Fetch authorized member IDs from a service's MongoDB collection."""
+        docs = self._fetch_authorized_member_docs(include_inactive=include_inactive, collection=collection)
         if docs is None:
             return None
 
@@ -257,16 +260,17 @@ class DBManager:
                 )
         return members
 
-    def get_authorized_member_records(self, include_inactive: bool = True) -> Optional[List[Dict[str, Any]]]:
-        """Return raw authorized heartfelt member documents from MongoDB."""
-        return self._fetch_authorized_member_docs(include_inactive=include_inactive)
+    def get_authorized_member_records(self, include_inactive: bool = True, collection: str = None) -> Optional[List[Dict[str, Any]]]:
+        """Return raw authorized member documents from a service's MongoDB collection."""
+        return self._fetch_authorized_member_docs(include_inactive=include_inactive, collection=collection)
 
-    def add_authorized_member(self, member_id: int, username: str = None, active: bool = True) -> bool:
-        """Upsert an authorized heartfelt member record."""
+    def add_authorized_member(self, member_id: int, username: str = None, active: bool = True, collection: str = None) -> bool:
+        """Upsert an authorized member record in a service's collection."""
         if not self.db_available:
             return False
 
         try:
+            coll = collection or self._authorized_collection
             now = datetime.datetime.utcnow()
             update = {
                 '$set': {
@@ -280,7 +284,7 @@ class DBManager:
             if username:
                 update['$set']['username'] = username
 
-            result = db_manager.db[self._authorized_collection].update_one(
+            result = db_manager.db[coll].update_one(
                 {'telegram_id': int(member_id)},
                 update,
                 upsert=True
@@ -290,13 +294,14 @@ class DBManager:
             logger.error(f"Error adding authorized member {member_id}: {e}")
             return False
 
-    def deactivate_authorized_member(self, member_id: int) -> bool:
-        """Mark an authorized member as inactive."""
+    def deactivate_authorized_member(self, member_id: int, collection: str = None) -> bool:
+        """Mark an authorized member as inactive in a service's collection."""
         if not self.db_available:
             return False
 
         try:
-            result = db_manager.db[self._authorized_collection].update_one(
+            coll = collection or self._authorized_collection
+            result = db_manager.db[coll].update_one(
                 {'telegram_id': int(member_id)},
                 {
                     '$set': {
@@ -310,13 +315,14 @@ class DBManager:
             logger.error(f"Error deactivating authorized member {member_id}: {e}")
             return False
 
-    def remove_authorized_member(self, member_id: int) -> bool:
-        """Completely remove an authorized member record."""
+    def remove_authorized_member(self, member_id: int, collection: str = None) -> bool:
+        """Completely remove an authorized member record from a service's collection."""
         if not self.db_available:
             return False
 
         try:
-            result = db_manager.db[self._authorized_collection].delete_one({'telegram_id': int(member_id)})
+            coll = collection or self._authorized_collection
+            result = db_manager.db[coll].delete_one({'telegram_id': int(member_id)})
             return result.deleted_count > 0
         except Exception as e:
             logger.error(f"Error removing authorized member {member_id}: {e}")

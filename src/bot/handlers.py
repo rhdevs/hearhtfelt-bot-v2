@@ -1,14 +1,25 @@
-from telegram import Update
+import logging
+import re
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CallbackContext
 from config import (
     UserState,
     user_states,
+    user_to_service_map,
     MESSAGES,
     PHOTO_SHARING_ENABLED,
     is_heartfelt_member,
+    is_any_member,
+    is_member_of_service,
+    enabled_services,
+    default_service_key,
+    get_service,
 )
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager, SelfClaimError
+
+logger = logging.getLogger(__name__)
 
 class BotHandlers:
     def __init__(self, session_manager: SessionManager, queue_manager: QueueManager):
@@ -42,9 +53,25 @@ class BotHandlers:
             await update.message.reply_text(MESSAGES["already_in_conversation"])
             return
         
-        # Set state to waiting for description
-        user_states[user_id] = UserState.WAITING_FOR_DESCRIPTION
-        await update.message.reply_text(MESSAGES["help_request"])
+        # Landing page: if more than one support track is available, let the user
+        # choose. With a single runnable service (Phase 1 = HF only) we skip the
+        # chooser entirely so behaviour is identical to before.
+        svcs = enabled_services()
+        if len(svcs) <= 1:
+            user_to_service_map[user_id] = default_service_key()
+            user_states[user_id] = UserState.WAITING_FOR_DESCRIPTION
+            await update.message.reply_text(MESSAGES["help_request"])
+            return
+
+        user_states[user_id] = UserState.WAITING_FOR_SERVICE
+        keyboard = [
+            [InlineKeyboardButton(s.display_name, callback_data=f"svc_{s.key}")]
+            for s in svcs
+        ]
+        await update.message.reply_text(
+            MESSAGES["choose_service"],
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
     
     async def end_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /end command to end conversation"""
@@ -219,10 +246,13 @@ class BotHandlers:
     async def _handle_help_description(self, update: Update, context: ContextTypes.DEFAULT_TYPE, description: str):
         """Handle help description from user"""
         user_id = update.effective_user.id
-        
+
+        # Which service did the user pick? (read-and-clear; defaults to hf in Phase 1)
+        service_key = user_to_service_map.pop(user_id, default_service_key())
+
         # Add to queue
         user_telehandle = f"@{update.effective_user.username}" if update.effective_user.username else None
-        queue_id = self.queue_manager.add_to_queue(user_id, description, user_telehandle)
+        queue_id = self.queue_manager.add_to_queue(user_id, description, user_telehandle, service_key)
         
         # Post to admin channel
         success, error_type = await self.queue_manager.post_queue_to_channel(queue_id)
@@ -245,35 +275,55 @@ class BotHandlers:
         """Handle inline keyboard button presses"""
         query = update.callback_query
         user_id = query.from_user.id
-        
-        # Check if user is authorized heartfelt member
-        if not is_heartfelt_member(user_id):
+        data = query.data or ""
+
+        # Requester picking a service on the landing page. Requesters are NOT members,
+        # so this MUST be dispatched before the membership gate below.
+        if data.startswith("svc_"):
+            await self._handle_service_choice(update, context)
+            return
+
+        # Membership gate first, matching the original ordering: any non-svc action by a
+        # non-member gets "not authorized" before we distinguish claim vs other data.
+        if not is_any_member(user_id):
             await query.answer("You are not authorized to perform this action.", show_alert=True)
             return
-        
-        # Parse callback data
-        if not query.data.startswith("claim_"):
+
+        # Only claim actions remain valid for members
+        if not data.startswith("claim_"):
             await query.answer("Invalid action.", show_alert=True)
             return
-        
-        queue_id = query.data.replace("claim_", "")
-        
+
+        queue_id = data[len("claim_"):]
+
         # Block claims if the member still has their own pending request
         if self.queue_manager.is_user_in_queue(user_id):
             await query.answer(MESSAGES["member_cancel_before_claim"], show_alert=True)
             return
 
-        # Check if heartfelt member is already in a conversation
+        # Check if the member is already in a conversation
         existing_session = self.session_manager.get_session_by_user(user_id)
         if existing_session:
             await query.answer("You are already in a conversation. End it first before claiming a new one.", show_alert=True)
             return
-        
-        # Get heartfelt member name for display
+
+        # Resolve the queue entry for service-scoped authorization + threading
+        entry = self.queue_manager.get_queue_entry(queue_id)
+        if entry is None:
+            await query.answer("This request has already been claimed or expired.", show_alert=True)
+            return
+
+        # A member may only claim requests for their own service's roster.
+        service_key = entry.get('service', 'hf')
+        if not is_member_of_service(user_id, service_key):
+            await query.answer("You are not authorized to claim this request.", show_alert=True)
+            return
+
+        # Get member name for display
         heartfelt_member_name = query.from_user.first_name or f"Member #{user_id}"
         if query.from_user.last_name:
             heartfelt_member_name += f" {query.from_user.last_name}"
-        
+
         # Claim the queue
         heartfelt_member_telehandle = f"@{query.from_user.username}" if query.from_user.username else None
         try:
@@ -290,9 +340,9 @@ class BotHandlers:
         if claimed_user_id is None:
             await query.answer("This request has already been claimed or expired.", show_alert=True)
             return
-        
+
         # Create session using the queue_id as session_id to maintain database consistency
-        session_id = self.session_manager.create_session(claimed_user_id, user_id, queue_id)
+        session_id = self.session_manager.create_session(claimed_user_id, user_id, queue_id, service=service_key)
         
         # Update states
         user_states[claimed_user_id] = UserState.IN_CONVERSATION
@@ -320,7 +370,32 @@ class BotHandlers:
             pass
         
         await query.answer("Conversation claimed successfully!")
-    
+
+    async def _handle_service_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle the requester's landing-page service selection (Phase 2 chooser)."""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        if user_states.get(user_id) != UserState.WAITING_FOR_SERVICE:
+            await query.answer("This choice is no longer valid. Use /help to start.", show_alert=True)
+            return
+
+        key = (query.data or "")[len("svc_"):]
+        svc = get_service(key)
+        if not svc.runnable:
+            await query.answer("That option isn't available right now.", show_alert=True)
+            return
+
+        user_to_service_map[user_id] = svc.key
+        user_states[user_id] = UserState.WAITING_FOR_DESCRIPTION
+        try:
+            await query.edit_message_text(MESSAGES["help_request"])
+        except Exception:
+            # If the message can't be edited, fall back to a fresh prompt
+            await context.bot.send_message(chat_id=user_id, text=MESSAGES["help_request"])
+        await query.answer()
+
     async def handle_error(self, update: Update, context: CallbackContext):
-        """Handle errors"""
-        print(f"Update {update} caused error {context.error}")
+        """Handle errors, scrubbing the bot token from any error text before logging."""
+        scrubbed = re.sub(r"/bot\d+:[\w-]+/", "/bot<redacted>/", str(context.error))
+        logger.error("Update caused error %s: %s", type(context.error).__name__, scrubbed)

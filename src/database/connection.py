@@ -2,7 +2,7 @@ import os
 import logging
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
-from config import MONGODB_URI
+from config import MONGODB_URI, SERVICES
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +60,10 @@ class DatabaseManager:
             # Messages collection indexes
             self.db.messages.create_index([("session_id", 1), ("timestamp", 1)])
 
-            # Authorized heartfelt members indexes
-            self.db.heartfelt_members.create_index("telegram_id", unique=True)
-            self.db.heartfelt_members.create_index("active")
+            # Authorized member collections (one per registered service)
+            for svc in SERVICES.values():
+                self.db[svc.members_collection].create_index("telegram_id", unique=True)
+                self.db[svc.members_collection].create_index("active")
 
             logger.info("Database indexes created successfully")
         except Exception as e:

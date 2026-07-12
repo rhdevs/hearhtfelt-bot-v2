@@ -7,12 +7,12 @@ Usage: python db_utils.py [command]
 import datetime
 import argparse
 from src.database.manager import db_mgr
-from config import DEFAULT_HEARTFELT_MEMBERS
+from config import get_service
 
 def get_anonymous_name(session_doc, for_user_type='user'):
     """Helper to get anonymous display name from session document"""
     if for_user_type == 'user':
-        return "Hearhtfelt Member"
+        return get_service(session_doc.get('service')).member_label
     else:
         return session_doc.get('anonymous_user_id', 'Anonymous User')
 
@@ -119,21 +119,26 @@ def show_session_stats():
         completion_rate = (ended / total) * 100
         print(f"Completion Rate: {completion_rate:.1f}%")
 
-def manage_authorized_members(action: str, telegram_id: int = None, username: str = None, include_inactive: bool = False):
-    """CLI helper to manage authorized heartfelt members."""
+def manage_authorized_members(action: str, telegram_id: int = None, username: str = None, include_inactive: bool = False, service: str = 'hf'):
+    """CLI helper to manage authorized members for a given service (hf/pss)."""
     if not db_mgr.initialize():
         print("❌ Database not available")
         return
 
-    db_mgr.ensure_authorized_members_seed(DEFAULT_HEARTFELT_MEMBERS)
+    svc = get_service(service)
+    collection = svc.members_collection
+    label = svc.member_label
+
+    if svc.default_members:
+        db_mgr.ensure_authorized_members_seed(svc.default_members, collection=collection)
 
     if action == 'list':
-        records = db_mgr.get_authorized_member_records(include_inactive=include_inactive)
+        records = db_mgr.get_authorized_member_records(include_inactive=include_inactive, collection=collection)
         if not records:
-            print("No authorized heartfelt members found.")
+            print(f"No authorized members found for service '{svc.key}'.")
             return
 
-        print("\n💚 Authorized Heartfelt Members")
+        print(f"\n💚 Authorized Members — {label} ({svc.key})")
         print("-" * 40)
         for doc in records:
             member_id = doc.get('telegram_id')
@@ -147,23 +152,23 @@ def manage_authorized_members(action: str, telegram_id: int = None, username: st
         return
 
     if action == 'add':
-        success = db_mgr.add_authorized_member(telegram_id, username=username, active=True)
+        success = db_mgr.add_authorized_member(telegram_id, username=username, active=True, collection=collection)
         if success:
-            print(f"✅ Added/updated heartfelt member {telegram_id}")
+            print(f"✅ Added/updated {label} {telegram_id}")
         else:
-            print(f"❌ Failed to add heartfelt member {telegram_id}")
+            print(f"❌ Failed to add {label} {telegram_id}")
     elif action == 'deactivate':
-        success = db_mgr.deactivate_authorized_member(telegram_id)
+        success = db_mgr.deactivate_authorized_member(telegram_id, collection=collection)
         if success:
-            print(f"✅ Deactivated heartfelt member {telegram_id}")
+            print(f"✅ Deactivated {label} {telegram_id}")
         else:
-            print(f"❌ Failed to deactivate heartfelt member {telegram_id}")
+            print(f"❌ Failed to deactivate {label} {telegram_id}")
     elif action == 'remove':
-        success = db_mgr.remove_authorized_member(telegram_id)
+        success = db_mgr.remove_authorized_member(telegram_id, collection=collection)
         if success:
-            print(f"✅ Removed heartfelt member {telegram_id}")
+            print(f"✅ Removed {label} {telegram_id}")
         else:
-            print(f"❌ Failed to remove heartfelt member {telegram_id}")
+            print(f"❌ Failed to remove {label} {telegram_id}")
     else:
         print(f"❌ Unsupported action: {action}")
 
@@ -179,6 +184,8 @@ def main():
     parser.add_argument('--username', help='Optional username when adding an admin')
     parser.add_argument('--include-inactive', action='store_true',
                         help='Include inactive members when listing admins')
+    parser.add_argument('--service', choices=['hf', 'pss'], default='hf',
+                        help='Which service roster to manage (default: hf)')
 
     args = parser.parse_args()
 
@@ -200,6 +207,7 @@ def main():
             telegram_id=args.telegram_id,
             username=args.username,
             include_inactive=args.include_inactive,
+            service=args.service,
         )
 
 if __name__ == "__main__":

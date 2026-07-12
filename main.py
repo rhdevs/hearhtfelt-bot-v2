@@ -4,12 +4,11 @@ import time
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from config import (
     BOT_TOKEN,
-    ADMIN_CHANNEL_ID,
-    HEARTFELT_MEMBERS,
-    DEFAULT_HEARTFELT_MEMBERS,
     AUTHORIZED_MEMBER_REFRESH_SECONDS,
     MESSAGES,
     validate_channel_access,
+    SERVICES,
+    enabled_services,
 )
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager
@@ -22,6 +21,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+# Quiet httpx: its INFO logs print full Telegram API URLs, which contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 async def main():
@@ -31,48 +32,51 @@ async def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not found in environment variables")
         return
-    
-    if not ADMIN_CHANNEL_ID:
-        logger.error("ADMIN_CHANNEL_ID not found in environment variables")
+
+    runnable = enabled_services()
+    if not runnable:
+        logger.error("No runnable services configured (each needs an enabled flag and a channel). Aborting.")
         return
-    
-    if not HEARTFELT_MEMBERS:
-        logger.warning("No HEARTFELT_MEMBERS configured. Please add authorized user IDs to config.py")
-    
+    for svc in runnable:
+        if not svc.roster:
+            logger.warning("No members configured for service '%s'", svc.key)
+
     # Initialize database
     logger.info("Initializing database connection...")
     db_available = db_mgr.initialize()
     if db_available:
         logger.info("✅ Database connected successfully")
-        db_mgr.ensure_authorized_members_seed(DEFAULT_HEARTFELT_MEMBERS)
+        for svc in SERVICES.values():
+            if svc.default_members:
+                db_mgr.ensure_authorized_members_seed(svc.default_members, collection=svc.members_collection)
     else:
         logger.warning("🟡 Database unavailable - running in memory-only mode")
 
-    async def refresh_authorized_members() -> None:
+    async def refresh_all_rosters() -> None:
         if not db_mgr.db_available:
             return
-
-        members = db_mgr.get_authorized_members()
-        if members is None:
-            return
-
-        if HEARTFELT_MEMBERS.replace(members):
-            logger.info(
-                "Authorized Heartfelt member list updated from database (%d entries)",
-                len(HEARTFELT_MEMBERS),
-            )
-        HEARTFELT_MEMBERS.update_last_synced(time.time())
+        for svc in SERVICES.values():
+            try:
+                members = db_mgr.get_authorized_members(collection=svc.members_collection)
+                if members is None:
+                    # DB error for this collection -> keep the current roster (no-op)
+                    continue
+                if svc.roster.replace(members):
+                    logger.info("Roster '%s' updated from database (%d entries)", svc.key, len(svc.roster))
+                svc.roster.update_last_synced(time.time())
+            except Exception as exc:
+                logger.error("Error refreshing roster '%s': %s", svc.key, exc)
 
     async def refresh_authorized_members_periodically() -> None:
         while True:
             try:
-                await refresh_authorized_members()
+                await refresh_all_rosters()
             except Exception as exc:
                 logger.error("Error refreshing authorized members: %s", exc)
             await asyncio.sleep(AUTHORIZED_MEMBER_REFRESH_SECONDS)
 
     if db_available:
-        await refresh_authorized_members()
+        await refresh_all_rosters()
 
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
@@ -108,21 +112,21 @@ async def main():
     
     # Start the bot
     logger.info("Starting Heartfelt Anonymous Helpline Bot...")
-    logger.info(f"Admin Channel ID: {ADMIN_CHANNEL_ID}")
-    logger.info(f"Authorized Heartfelt Members: {len(HEARTFELT_MEMBERS)}")
-    
-    # Validate channel access
-    logger.info("Validating admin channel access...")
-    channel_ok, channel_msg = await validate_channel_access(bot, ADMIN_CHANNEL_ID)
-    if channel_ok:
-        logger.info(f"✅ Channel access verified: {channel_msg}")
-    else:
-        logger.error(f"❌ Channel access failed: {channel_msg}")
-        logger.error("⚠️  Bot will continue but queue system may not work properly")
-        logger.error("📋 Setup instructions:")
-        logger.error("   1. Add bot to admin channel as administrator")
-        logger.error("   2. Grant permissions: Send Messages, Delete Messages")
-        logger.error("   3. Verify ADMIN_CHANNEL_ID is correct")
+
+    # Validate channel access for every enabled service
+    logger.info("Validating channel access for enabled services...")
+    for svc in enabled_services():
+        logger.info("Service '%s' -> channel %s, members: %d", svc.key, svc.channel_id, len(svc.roster))
+        channel_ok, channel_msg = await validate_channel_access(bot, svc.channel_id)
+        if channel_ok:
+            logger.info("✅ Channel access verified for '%s': %s", svc.key, channel_msg)
+        else:
+            logger.error("❌ Channel access failed for '%s': %s", svc.key, channel_msg)
+            logger.error(
+                "⚠️  Bot will continue but the '%s' queue may not work. Add the bot to the "
+                "channel as admin (Send + Delete messages) and verify the channel id.",
+                svc.key,
+            )
     
     # Start periodic cleanup tasks
     async def cleanup_expired_queues():

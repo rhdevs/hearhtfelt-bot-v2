@@ -4,7 +4,7 @@ import random
 import logging
 from typing import Optional, Tuple
 from telegram import Bot
-from config import active_sessions, safety_logs, user_to_session_map, session_warnings
+from config import active_sessions, safety_logs, user_to_session_map, session_warnings, get_service
 from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
@@ -14,46 +14,52 @@ class SessionManager:
         self.bot = bot
         self.used_anonymous_ids = set()  # Track used IDs to avoid duplicates
     
-    def _generate_anonymous_id(self) -> str:
-        """Generate a unique anonymous ID using RHesident format"""
+    def _generate_anonymous_id(self, prefix: str = "RHesident") -> str:
+        """Generate a unique anonymous ID using the given prefix"""
         # Try up to 50 times to generate a unique ID
         for _ in range(50):
             number = random.randint(1000, 9999)
-            anonymous_id = f"RHesident #{number}"
-            
+            anonymous_id = f"{prefix} #{number}"
+
             if anonymous_id not in self.used_anonymous_ids:
                 self.used_anonymous_ids.add(anonymous_id)
                 return anonymous_id
-        
+
         # Fallback to UUID if we can't generate unique ID
-        fallback_id = f"RHesident #{str(uuid.uuid4())[:8]}"
+        fallback_id = f"{prefix} #{str(uuid.uuid4())[:8]}"
         self.used_anonymous_ids.add(fallback_id)
         return fallback_id
-    
-    def create_session(self, user_id: int, heartfelt_member_id: int, session_id: str = None) -> str:
+
+    def create_session(self, user_id: int, heartfelt_member_id: int, session_id: str = None, service: str = None) -> str:
         """Create a new anonymous session between user and heartfelt member"""
         # Use provided session_id (from queue_id) or generate new one
         if session_id is None:
             session_id = str(uuid.uuid4())
-        
-        # Get existing anonymous_user_id from database if session exists
+
+        # Get existing anonymous_user_id (and service) from database if session exists
         anonymous_user_id = None
         if db_mgr.db_available and session_id:
             db_session = db_mgr.get_session(session_id)
             if db_session:
                 anonymous_user_id = db_session.get('anonymous_user_id')
-        
+                if service is None:
+                    service = db_session.get('service')
+
+        # Default to HF for legacy/missing service so labels stay correct
+        service = service or "hf"
+
         # Generate new anonymous ID only if we don't have one from database
         if not anonymous_user_id:
-            anonymous_user_id = self._generate_anonymous_id()
-        
+            anonymous_user_id = self._generate_anonymous_id(get_service(service).anon_prefix)
+
         now = datetime.datetime.now()
         active_sessions[session_id] = {
             'user_id': user_id,
             'heartfelt_member_id': heartfelt_member_id,
             'created_at': now,
             'last_activity_at': now,  # Track activity for auto-expiry
-            'anonymous_user_id': anonymous_user_id
+            'anonymous_user_id': anonymous_user_id,
+            'service': service,
         }
         
         # Maintain O(1) lookup indices
@@ -111,7 +117,7 @@ class SessionManager:
             return "Unknown"
         
         if session['user_id'] == for_user_id:
-            return "Hearhtfelt Member"
+            return get_service(session.get('service')).member_label
         else:
             return session['anonymous_user_id']
     
