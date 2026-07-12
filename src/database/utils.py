@@ -7,8 +7,7 @@ Usage: python db_utils.py [command]
 import datetime
 import argparse
 from src.database.manager import db_mgr
-from src.bot.managers.session import SessionManager
-from telegram import Bot
+from config import DEFAULT_HEARTFELT_MEMBERS
 
 def get_anonymous_name(session_doc, for_user_type='user'):
     """Helper to get anonymous display name from session document"""
@@ -55,9 +54,9 @@ def format_session_transcript(session_id):
         
         # Determine sender display name
         if msg['from_user_id'] == session['user_id']:
-            sender = get_anonymous_name(session, 'member')  # User sees "Heartfelt Member"
+            sender = get_anonymous_name(session, 'member')  # User sees "HeaRHtfelt Member"
         else:
-            sender = get_anonymous_name(session, 'user')    # Member sees "Anonymous User #1234"
+            sender = get_anonymous_name(session, 'user')    # Member sees "RHesident #1234"
         
         if msg['message_type'] == 'text':
             print(f"[{timestamp}] {sender}: {msg['content']}")
@@ -120,14 +119,69 @@ def show_session_stats():
         completion_rate = (ended / total) * 100
         print(f"Completion Rate: {completion_rate:.1f}%")
 
+def manage_authorized_members(action: str, telegram_id: int = None, username: str = None, include_inactive: bool = False):
+    """CLI helper to manage authorized heartfelt members."""
+    if not db_mgr.initialize():
+        print("❌ Database not available")
+        return
+
+    db_mgr.ensure_authorized_members_seed(DEFAULT_HEARTFELT_MEMBERS)
+
+    if action == 'list':
+        records = db_mgr.get_authorized_member_records(include_inactive=include_inactive)
+        if not records:
+            print("No authorized heartfelt members found.")
+            return
+
+        print("\n💚 Authorized Heartfelt Members")
+        print("-" * 40)
+        for doc in records:
+            member_id = doc.get('telegram_id')
+            status = 'active' if doc.get('active', True) else 'inactive'
+            username_display = doc.get('username') or '—'
+            print(f"{member_id}: {status} (username: {username_display})")
+        return
+
+    if telegram_id is None:
+        print("❌ --telegram-id is required for this action")
+        return
+
+    if action == 'add':
+        success = db_mgr.add_authorized_member(telegram_id, username=username, active=True)
+        if success:
+            print(f"✅ Added/updated heartfelt member {telegram_id}")
+        else:
+            print(f"❌ Failed to add heartfelt member {telegram_id}")
+    elif action == 'deactivate':
+        success = db_mgr.deactivate_authorized_member(telegram_id)
+        if success:
+            print(f"✅ Deactivated heartfelt member {telegram_id}")
+        else:
+            print(f"❌ Failed to deactivate heartfelt member {telegram_id}")
+    elif action == 'remove':
+        success = db_mgr.remove_authorized_member(telegram_id)
+        if success:
+            print(f"✅ Removed heartfelt member {telegram_id}")
+        else:
+            print(f"❌ Failed to remove heartfelt member {telegram_id}")
+    else:
+        print(f"❌ Unsupported action: {action}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Database utility for Heartfelt Bot')
-    parser.add_argument('command', choices=['transcript', 'monthly', 'stats'], 
+    parser.add_argument('command', choices=['transcript', 'monthly', 'stats', 'admins'],
                        help='Command to execute')
     parser.add_argument('--session-id', help='Session ID for transcript command')
-    
+    parser.add_argument('--action', choices=['list', 'add', 'deactivate', 'remove'],
+                        help='Action for admins command')
+    parser.add_argument('--telegram-id', type=int, help='Telegram ID for admins command')
+    parser.add_argument('--username', help='Optional username when adding an admin')
+    parser.add_argument('--include-inactive', action='store_true',
+                        help='Include inactive members when listing admins')
+
     args = parser.parse_args()
-    
+
     if args.command == 'transcript':
         if not args.session_id:
             print("❌ --session-id required for transcript command")
@@ -137,6 +191,16 @@ def main():
         show_sessions_this_month()
     elif args.command == 'stats':
         show_session_stats()
+    elif args.command == 'admins':
+        if not args.action:
+            print("❌ --action required for admins command")
+            return
+        manage_authorized_members(
+            action=args.action,
+            telegram_id=args.telegram_id,
+            username=args.username,
+            include_inactive=args.include_inactive,
+        )
 
 if __name__ == "__main__":
     main()

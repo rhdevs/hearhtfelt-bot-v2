@@ -1,7 +1,7 @@
 import datetime
 import uuid
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Iterable, Optional, List, Dict, Any
 from src.database.connection import db_manager
 
 logger = logging.getLogger(__name__)
@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 class DBManager:
     def __init__(self):
         self.db_available = False
+        self._authorized_collection = 'heartfelt_members'
         
     def initialize(self):
         """Initialize database connection"""
@@ -191,7 +192,136 @@ class DBManager:
         except Exception as e:
             logger.error(f"Error getting sessions by activity: {e}")
             return []
-    
+
+    # AUTHORIZED HEARTFELT MEMBERS
+
+    def ensure_authorized_members_seed(self, default_members: Iterable[int]) -> None:
+        """Seed the authorized members collection with defaults if empty."""
+        if not self.db_available:
+            return
+
+        try:
+            collection = db_manager.db[self._authorized_collection]
+            if collection.estimated_document_count() > 0:
+                return
+
+            now = datetime.datetime.utcnow()
+            docs = []
+            for member_id in default_members:
+                try:
+                    member_int = int(member_id)
+                except (TypeError, ValueError):
+                    continue
+                docs.append({
+                    'telegram_id': member_int,
+                    'active': True,
+                    'created_at': now,
+                    'updated_at': now,
+                })
+
+            if docs:
+                collection.insert_many(docs, ordered=False)
+                logger.info("Seeded authorized heartfelt members into MongoDB")
+        except Exception as e:
+            logger.error(f"Error seeding authorized members: {e}")
+
+    def _fetch_authorized_member_docs(self, include_inactive: bool = False) -> Optional[List[Dict[str, Any]]]:
+        if not self.db_available:
+            return None
+
+        try:
+            query = {}
+            if not include_inactive:
+                query['active'] = {'$ne': False}
+
+            docs = list(db_manager.db[self._authorized_collection].find(query))
+            return docs
+        except Exception as e:
+            logger.error(f"Error retrieving authorized member records: {e}")
+            return None
+
+    def get_authorized_members(self, include_inactive: bool = False) -> Optional[List[int]]:
+        """Fetch authorized heartfelt member IDs from MongoDB."""
+        docs = self._fetch_authorized_member_docs(include_inactive=include_inactive)
+        if docs is None:
+            return None
+
+        members: List[int] = []
+        for doc in docs:
+            member_id = doc.get('telegram_id')
+            try:
+                members.append(int(member_id))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring authorized member with invalid telegram_id: %s", member_id
+                )
+        return members
+
+    def get_authorized_member_records(self, include_inactive: bool = True) -> Optional[List[Dict[str, Any]]]:
+        """Return raw authorized heartfelt member documents from MongoDB."""
+        return self._fetch_authorized_member_docs(include_inactive=include_inactive)
+
+    def add_authorized_member(self, member_id: int, username: str = None, active: bool = True) -> bool:
+        """Upsert an authorized heartfelt member record."""
+        if not self.db_available:
+            return False
+
+        try:
+            now = datetime.datetime.utcnow()
+            update = {
+                '$set': {
+                    'active': active,
+                    'updated_at': now,
+                },
+                '$setOnInsert': {
+                    'created_at': now,
+                }
+            }
+            if username:
+                update['$set']['username'] = username
+
+            result = db_manager.db[self._authorized_collection].update_one(
+                {'telegram_id': int(member_id)},
+                update,
+                upsert=True
+            )
+            return result.acknowledged
+        except Exception as e:
+            logger.error(f"Error adding authorized member {member_id}: {e}")
+            return False
+
+    def deactivate_authorized_member(self, member_id: int) -> bool:
+        """Mark an authorized member as inactive."""
+        if not self.db_available:
+            return False
+
+        try:
+            result = db_manager.db[self._authorized_collection].update_one(
+                {'telegram_id': int(member_id)},
+                {
+                    '$set': {
+                        'active': False,
+                        'updated_at': datetime.datetime.utcnow()
+                    }
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error deactivating authorized member {member_id}: {e}")
+            return False
+
+    def remove_authorized_member(self, member_id: int) -> bool:
+        """Completely remove an authorized member record."""
+        if not self.db_available:
+            return False
+
+        try:
+            result = db_manager.db[self._authorized_collection].delete_one({'telegram_id': int(member_id)})
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Error removing authorized member {member_id}: {e}")
+            return False
+
     # MESSAGE MANAGEMENT
     
     def log_message(self, session_id: str, from_user_id: int, to_user_id: int, 

@@ -111,7 +111,7 @@ class SessionManager:
             return "Unknown"
         
         if session['user_id'] == for_user_id:
-            return "Heartfelt Member"
+            return "Hearhtfelt Member"
         else:
             return session['anonymous_user_id']
     

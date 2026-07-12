@@ -59,7 +59,11 @@ class DatabaseManager:
             
             # Messages collection indexes
             self.db.messages.create_index([("session_id", 1), ("timestamp", 1)])
-            
+
+            # Authorized heartfelt members indexes
+            self.db.heartfelt_members.create_index("telegram_id", unique=True)
+            self.db.heartfelt_members.create_index("active")
+
             logger.info("Database indexes created successfully")
         except Exception as e:
             logger.error(f"Error creating indexes: {e}")

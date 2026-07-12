@@ -8,6 +8,11 @@ venv/
 
 # Environment variables
 .env
+.env.*
+!.env.example
+
+# Local reference copy of deployed source (not part of repo)
+_deployed_reference/
 
 # Logs and temporary files
 *.log

@@ -1,7 +1,16 @@
 import asyncio
 import logging
+import time
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
-from config import BOT_TOKEN, ADMIN_CHANNEL_ID, HEARTFELT_MEMBERS, validate_channel_access
+from config import (
+    BOT_TOKEN,
+    ADMIN_CHANNEL_ID,
+    HEARTFELT_MEMBERS,
+    DEFAULT_HEARTFELT_MEMBERS,
+    AUTHORIZED_MEMBER_REFRESH_SECONDS,
+    MESSAGES,
+    validate_channel_access,
+)
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager
 from src.bot.managers.expiry import SessionExpiryManager
@@ -35,9 +44,36 @@ async def main():
     db_available = db_mgr.initialize()
     if db_available:
         logger.info("✅ Database connected successfully")
+        db_mgr.ensure_authorized_members_seed(DEFAULT_HEARTFELT_MEMBERS)
     else:
         logger.warning("🟡 Database unavailable - running in memory-only mode")
-    
+
+    async def refresh_authorized_members() -> None:
+        if not db_mgr.db_available:
+            return
+
+        members = db_mgr.get_authorized_members()
+        if members is None:
+            return
+
+        if HEARTFELT_MEMBERS.replace(members):
+            logger.info(
+                "Authorized Heartfelt member list updated from database (%d entries)",
+                len(HEARTFELT_MEMBERS),
+            )
+        HEARTFELT_MEMBERS.update_last_synced(time.time())
+
+    async def refresh_authorized_members_periodically() -> None:
+        while True:
+            try:
+                await refresh_authorized_members()
+            except Exception as exc:
+                logger.error("Error refreshing authorized members: %s", exc)
+            await asyncio.sleep(AUTHORIZED_MEMBER_REFRESH_SECONDS)
+
+    if db_available:
+        await refresh_authorized_members()
+
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
@@ -93,9 +129,24 @@ async def main():
         """Periodic task to clean up expired queue entries"""
         while True:
             try:
-                expired_count = queue_manager.cleanup_expired_queues()
-                if expired_count > 0:
-                    logger.info(f"Cleaned up {expired_count} expired queue entries")
+                expired_entries = queue_manager.cleanup_expired_queues()
+                if expired_entries:
+                    logger.info("Cleaned up %d expired queue entries", len(expired_entries))
+                    for expired in expired_entries:
+                        user_id = expired.get("user_id")
+                        if not user_id:
+                            continue
+                        try:
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=MESSAGES["queue_expired"]
+                            )
+                        except Exception as send_error:
+                            logger.warning(
+                                "Failed to notify user %s about queue expiry: %s",
+                                user_id,
+                                send_error
+                            )
             except Exception as e:
                 logger.error(f"Error during queue cleanup: {e}")
             
@@ -105,6 +156,9 @@ async def main():
     # Start cleanup tasks
     queue_cleanup_task = asyncio.create_task(cleanup_expired_queues())
     session_expiry_task = asyncio.create_task(expiry_manager.start())
+    authorized_members_task = None
+    if db_available:
+        authorized_members_task = asyncio.create_task(refresh_authorized_members_periodically())
     
     try:
         # Run the bot
@@ -130,6 +184,8 @@ async def main():
         queue_cleanup_task.cancel()
         expiry_manager.stop()
         session_expiry_task.cancel()
+        if authorized_members_task:
+            authorized_members_task.cancel()
         logger.info("Bot stopped.")
 
 if __name__ == "__main__":

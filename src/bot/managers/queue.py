@@ -1,11 +1,29 @@
 import datetime
-import uuid
 import html
+import logging
 import random
+import uuid
 from typing import Optional, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from config import queue_entries, ADMIN_CHANNEL_ID, QUEUE_EXPIRE_MINUTES, user_to_queue_map, queue_order
+from config import (
+    ADMIN_CHANNEL_ID,
+    QUEUE_EXPIRE_MINUTES,
+    UserState,
+    queue_entries,
+    queue_order,
+    user_states,
+    user_to_queue_map,
+)
 from src.database.manager import db_mgr
+
+
+class SelfClaimError(Exception):
+    """Raised when the claimant tries to take their own queue entry"""
+    pass
+
+
+logger = logging.getLogger(__name__)
+
 
 class QueueManager:
     def __init__(self, bot: Bot):
@@ -108,10 +126,14 @@ class QueueManager:
         """Claim a queue entry and return the user ID"""
         queue_entry = queue_entries.get(queue_id)
         if not queue_entry:
+            logger.warning("Claim attempted on missing or expired queue entry %s by member %s", queue_id, heartfelt_member_id)
             return None
-        
+
         user_id = queue_entry['user_id']
         message_id = queue_entry['message_id']
+
+        if user_id == heartfelt_member_id:
+            raise SelfClaimError("Claimant cannot take their own queue entry")
         
         # Claim the session in database (queue_id is used as session_id)
         if db_mgr.db_available:
@@ -194,15 +216,16 @@ class QueueManager:
         return position * 5
     
     def cleanup_expired_queues(self):
-        """Remove expired queue entries"""
+        """Remove expired queue entries and reset user state when needed"""
         now = datetime.datetime.now()
         expired_queue_ids = []
-        
-        for queue_id, entry in queue_entries.items():
+
+        for queue_id, entry in list(queue_entries.items()):
             time_diff = now - entry['created_at']
             if time_diff.total_seconds() > (QUEUE_EXPIRE_MINUTES * 60):
                 expired_queue_ids.append(queue_id)
-        
+
+        expired_users = []
         for queue_id in expired_queue_ids:
             # Try to delete the message from admin channel
             try:
@@ -217,16 +240,22 @@ class QueueManager:
             entry = queue_entries.get(queue_id)
             if entry:
                 user_id = entry.get('user_id')
+                if user_id:
+                    current_state = user_states.get(user_id)
+                    if current_state == UserState.IN_QUEUE:
+                        user_states[user_id] = UserState.IDLE
+                        expired_users.append({"user_id": user_id})
+
                 if user_id and user_id in user_to_queue_map:
                     del user_to_queue_map[user_id]
-            
-            del queue_entries[queue_id]
-            
+
+            queue_entries.pop(queue_id, None)
+
             # Remove from queue order
             if queue_id in queue_order:
                 queue_order.remove(queue_id)
-        
-        return len(expired_queue_ids)
+
+        return expired_users
     
     def is_user_in_queue(self, user_id: int) -> bool:
         """Check if user is already in queue - O(1) lookup"""

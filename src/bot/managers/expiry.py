@@ -4,9 +4,15 @@ import logging
 from typing import Dict, Any
 from telegram import Bot
 from config import (
-    active_sessions, session_warnings, user_states, UserState,
-    SESSION_TIMEOUT_MINUTES, SESSION_WARNING_MINUTES, SESSION_SWEEP_SECONDS,
-    MESSAGES, HEARTFELT_MEMBERS
+    active_sessions,
+    session_warnings,
+    user_states,
+    UserState,
+    SESSION_TIMEOUT_MINUTES,
+    SESSION_WARNING_MINUTES,
+    SESSION_SWEEP_SECONDS,
+    MESSAGES,
+    is_heartfelt_member,
 )
 from src.database.manager import db_mgr
 
@@ -153,9 +159,11 @@ class SessionExpiryManager:
             # Send expiry notifications
             if user_id:
                 try:
-                    message = (MESSAGES["session_expired_heartfelt"] 
-                              if user_id in HEARTFELT_MEMBERS 
-                              else MESSAGES["session_expired"])
+                    message = (
+                        MESSAGES["session_expired_heartfelt"]
+                        if is_heartfelt_member(user_id)
+                        else MESSAGES["session_expired"]
+                    )
                     await self.bot.send_message(
                         chat_id=user_id,
                         text=message
@@ -165,9 +173,11 @@ class SessionExpiryManager:
             
             if heartfelt_member_id and heartfelt_member_id != user_id:
                 try:
-                    message = (MESSAGES["session_expired_heartfelt"] 
-                              if heartfelt_member_id in HEARTFELT_MEMBERS 
-                              else MESSAGES["session_expired"])
+                    message = (
+                        MESSAGES["session_expired_heartfelt"]
+                        if is_heartfelt_member(heartfelt_member_id)
+                        else MESSAGES["session_expired"]
+                    )
                     await self.bot.send_message(
                         chat_id=heartfelt_member_id,
                         text=message

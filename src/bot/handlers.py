@@ -1,10 +1,14 @@
 from telegram import Update
 from telegram.ext import ContextTypes, CallbackContext
 from config import (
-    UserState, user_states, HEARTFELT_MEMBERS, MESSAGES, PHOTO_SHARING_ENABLED
+    UserState,
+    user_states,
+    MESSAGES,
+    PHOTO_SHARING_ENABLED,
+    is_heartfelt_member,
 )
 from src.bot.managers.session import SessionManager
-from src.bot.managers.queue import QueueManager
+from src.bot.managers.queue import QueueManager, SelfClaimError
 
 class BotHandlers:
     def __init__(self, session_manager: SessionManager, queue_manager: QueueManager):
@@ -66,7 +70,11 @@ class BotHandlers:
         if user_id_session:
             try:
                 # Send user message to user, heartfelt message to heartfelt member
-                message = MESSAGES["conversation_ended_heartfelt"] if user_id_session in HEARTFELT_MEMBERS else MESSAGES["conversation_ended"]
+                message = (
+                    MESSAGES["conversation_ended_heartfelt"]
+                    if is_heartfelt_member(user_id_session)
+                    else MESSAGES["conversation_ended"]
+                )
                 await context.bot.send_message(
                     chat_id=user_id_session,
                     text=message
@@ -77,7 +85,11 @@ class BotHandlers:
         if heartfelt_id_session and heartfelt_id_session != user_id:
             try:
                 # Send user message to user, heartfelt message to heartfelt member
-                message = MESSAGES["conversation_ended_heartfelt"] if heartfelt_id_session in HEARTFELT_MEMBERS else MESSAGES["conversation_ended"]
+                message = (
+                    MESSAGES["conversation_ended_heartfelt"]
+                    if is_heartfelt_member(heartfelt_id_session)
+                    else MESSAGES["conversation_ended"]
+                )
                 await context.bot.send_message(
                     chat_id=heartfelt_id_session,
                     text=message
@@ -93,14 +105,11 @@ class BotHandlers:
         if current_state == UserState.IN_CONVERSATION:
             await update.message.reply_text(MESSAGES["conversation_status"])
         elif current_state == UserState.IN_QUEUE:
-            position = self.queue_manager.get_queue_position(user_id)
-            if position:
-                wait_time = self.queue_manager.get_estimated_wait_time(position)
-                message = MESSAGES["queue_status"].format(
-                    position=position, wait_time=wait_time
-                )
-                await update.message.reply_text(message)
+            if self.queue_manager.is_user_in_queue(user_id):
+                await update.message.reply_text(MESSAGES["queue_status"])
             else:
+                # State drift: reset local state to avoid confusing responses
+                user_states[user_id] = UserState.IDLE
                 await update.message.reply_text(MESSAGES["idle_status"])
         else:
             await update.message.reply_text(MESSAGES["idle_status"])
@@ -110,6 +119,12 @@ class BotHandlers:
         user_id = update.effective_user.id
         current_state = user_states.get(user_id, UserState.IDLE)
         
+        # Allow users to cancel while providing their request description
+        if current_state == UserState.WAITING_FOR_DESCRIPTION:
+            user_states[user_id] = UserState.IDLE
+            await update.message.reply_text(MESSAGES["help_request_cancelled"])
+            return
+
         # Check if user is actually in queue
         if current_state != UserState.IN_QUEUE:
             await update.message.reply_text(MESSAGES["not_in_queue"])
@@ -232,7 +247,7 @@ class BotHandlers:
         user_id = query.from_user.id
         
         # Check if user is authorized heartfelt member
-        if user_id not in HEARTFELT_MEMBERS:
+        if not is_heartfelt_member(user_id):
             await query.answer("You are not authorized to perform this action.", show_alert=True)
             return
         
@@ -243,6 +258,11 @@ class BotHandlers:
         
         queue_id = query.data.replace("claim_", "")
         
+        # Block claims if the member still has their own pending request
+        if self.queue_manager.is_user_in_queue(user_id):
+            await query.answer(MESSAGES["member_cancel_before_claim"], show_alert=True)
+            return
+
         # Check if heartfelt member is already in a conversation
         existing_session = self.session_manager.get_session_by_user(user_id)
         if existing_session:
@@ -256,8 +276,17 @@ class BotHandlers:
         
         # Claim the queue
         heartfelt_member_telehandle = f"@{query.from_user.username}" if query.from_user.username else None
-        claimed_user_id = await self.queue_manager.claim_queue(queue_id, user_id, heartfelt_member_name, heartfelt_member_telehandle)
-        
+        try:
+            claimed_user_id = await self.queue_manager.claim_queue(
+                queue_id,
+                user_id,
+                heartfelt_member_name,
+                heartfelt_member_telehandle
+            )
+        except SelfClaimError:
+            await query.answer("You can't claim your own request.", show_alert=True)
+            return
+
         if claimed_user_id is None:
             await query.answer("This request has already been claimed or expired.", show_alert=True)
             return
