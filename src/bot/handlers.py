@@ -133,7 +133,8 @@ class BotHandlers:
             await update.message.reply_text(MESSAGES["conversation_status"])
         elif current_state == UserState.IN_QUEUE:
             if self.queue_manager.is_user_in_queue(user_id):
-                await update.message.reply_text(MESSAGES["queue_status"])
+                svc = get_service(self.queue_manager.get_user_service(user_id))
+                await update.message.reply_text(MESSAGES["queue_status"].format(member=svc.member_label))
             else:
                 # State drift: reset local state to avoid confusing responses
                 user_states[user_id] = UserState.IDLE

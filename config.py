@@ -233,12 +233,12 @@ session_warnings = {}             # session_id -> bool (has warning been sent?)
 MESSAGES = {
     "welcome": (
         "Welcome to the HeaRHtfelt Companion Helpline! 🤗\n\n"
-        "This is a safe, anonymous space where you can speak with our hearhtfelt members.\n\n"
+        "This is a safe, anonymous space where you can speak with one of our companions.\n\n"
         "📋 How it works:\n"
         "1️⃣ Use /help to request support\n"
         "2️⃣ Describe what you need help with\n"
         "3️⃣ You'll be placed in a queue\n"
-        "4️⃣ A hearhtfelt member will connect with you anonymously\n"
+        "4️⃣ One of our companions will connect with you anonymously\n"
         "5️⃣ Chat freely - share text, photos, and stickers\n"
         "6️⃣ Use /end when you're ready to finish\n\n"
         "🔒 Complete anonymity guaranteed\n"
@@ -263,7 +263,7 @@ MESSAGES = {
     "member_cancel_before_claim": "You are in a queue. Use /cancel to remove it before claiming another conversation.",
     "already_in_conversation": "You're already in a conversation. Use /end to finish your current conversation first.",
     "queue_status": (
-        "You are currently in the queue. We'll notify you as soon as a Hearhtfelt member is available."
+        "You are currently in the queue. We'll notify you as soon as a {member} is available."
     ),
     "conversation_status": "You are currently in a conversation with a support member.",
     "idle_status": "You are not currently in a queue or conversation. Use /help to start.",
@@ -275,7 +275,7 @@ MESSAGES = {
         "Your help request has been cancelled. You can use /help again anytime when you're ready."
     ),
     "queue_expired": (
-        "⏱️ Your place in the queue expired because no Hearhtfelt member was available in time. "
+        "⏱️ Your place in the queue expired because no {member} was available in time. "
         "You can use /help to join the queue again whenever you're ready."
     ),
     "not_in_queue": "You are not currently in the queue. Use /help to request support or /status to check your current status.",

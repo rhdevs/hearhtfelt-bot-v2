@@ -40,6 +40,12 @@ class QueueManager:
         """Return the in-memory queue entry (or None) without mutating it."""
         return queue_entries.get(queue_id)
 
+    def get_user_service(self, user_id: int) -> Optional[str]:
+        """Return the service key of the user's active queue entry, if any."""
+        queue_id = user_to_queue_map.get(user_id)
+        entry = queue_entries.get(queue_id) if queue_id else None
+        return entry.get('service') if entry else None
+
     def _generate_anonymous_id(self, prefix: str = "RHesident") -> str:
         """Generate a unique anonymous ID using the given prefix"""
         # Try up to 50 times to generate a unique ID
@@ -263,7 +269,7 @@ class QueueManager:
                     current_state = user_states.get(user_id)
                     if current_state == UserState.IN_QUEUE:
                         user_states[user_id] = UserState.IDLE
-                        expired_users.append({"user_id": user_id})
+                        expired_users.append({"user_id": user_id, "service": entry.get('service')})
 
                 if user_id and user_id in user_to_queue_map:
                     del user_to_queue_map[user_id]

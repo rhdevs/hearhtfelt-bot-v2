@@ -9,6 +9,7 @@ from config import (
     validate_channel_access,
     SERVICES,
     enabled_services,
+    get_service,
 )
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager
@@ -141,9 +142,10 @@ async def main():
                         if not user_id:
                             continue
                         try:
+                            member_label = get_service(expired.get("service")).member_label
                             await bot.send_message(
                                 chat_id=user_id,
-                                text=MESSAGES["queue_expired"]
+                                text=MESSAGES["queue_expired"].format(member=member_label)
                             )
                         except Exception as send_error:
                             logger.warning(
