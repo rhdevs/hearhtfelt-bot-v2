@@ -1,0 +1,4 @@
+# Shell scripts and workflows must use LF so they run correctly on Linux.
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
