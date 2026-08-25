@@ -24,11 +24,52 @@ from config import (
 )
 
 
+# Every spelling of the pre-Phase-1 brand. Compared against a lowercased string,
+# so "Heartfelt", "HeaRHtfelt" and "HEARTFELT" are all covered.
+STALE_BRAND_TOKENS = ("heartfelt", "hearhtfelt")
+
+
 def test_welcome_is_rebranded():
     welcome = MESSAGES["welcome"]
+
+    # Pin the greeting line itself, not merely "Care Network appears somewhere".
+    # `assert "Care Network" in welcome` stayed true when the FIRST line -- the
+    # most-read string in the product, the one every requester sees on /start --
+    # was reverted to the old brand, because the two later mentions still
+    # satisfied it. See test_no_message_mentions_the_old_brand.
+    assert welcome.startswith("Welcome to the Care Network Bot"), (
+        "welcome must open with the Care Network greeting, got: "
+        f"{welcome.splitlines()[0]!r}"
+    )
+
     assert "Care Network" in welcome
     assert "HeaRHtfelt Companion Helpline" not in welcome
     assert "/chat" in welcome
+
+
+def test_no_message_mentions_the_old_brand():
+    """No requester-facing string may carry the pre-rebrand name.
+
+    This is the assertion that makes a PARTIAL rebrand fail. MESSAGES["welcome"]
+    says "Care Network" three times; reverting any ONE of them to "Heartfelt"
+    left `"Care Network" in welcome` true and all nine suites green, so a
+    half-rebranded greeting could reach a live helpline straight through the CI
+    gate. Asserting the ABSENCE of the old brand cannot be satisfied by a
+    surviving mention elsewhere in the same string.
+
+    Message KEYS may still say heartfelt -- conversation_ended_heartfelt and
+    session_expired_heartfelt are the member-facing variants. Their VALUES may not.
+    """
+    for key, value in MESSAGES.items():
+        assert isinstance(value, str), key
+        lowered = value.lower()
+        for token in STALE_BRAND_TOKENS:
+            assert token not in lowered, (
+                f"MESSAGES[{key!r}] still mentions the old brand ({token!r}). "
+                "Phase 1 rebranded requester-facing copy to 'Care Network'; a "
+                "surviving mention means the rewrite was only partial. "
+                f"Value: {value!r}"
+            )
 
 
 def test_help_is_mentioned_exactly_once():
