@@ -3,6 +3,7 @@ import datetime
 import logging
 from typing import Dict, Any
 from telegram import Bot
+import config
 from config import (
     active_sessions,
     session_warnings,
@@ -177,6 +178,30 @@ class SessionExpiryManager:
             # those WITHOUT touching Mongo, so we have to close them ourselves below.
             in_memory = session_id in active_sessions
 
+            # How stale is this? A conversation whose last activity is further in the
+            # past than its own window PLUS the stale-notify grace period is not one
+            # anybody is still waiting on: either the bot was down for hours, or this
+            # is an orphaned row left by an earlier deploy. Close it -- but tell NOBODY.
+            #
+            # Without this, the boot-time run_once() in main() reaches back over every
+            # status='active' document in the collection and DMs both parties of each,
+            # months after the fact. RESTORE_DRY_RUN, RESTORE_ENABLED=false and the
+            # RESTORE_MAX_* circuit breaker all make that WORSE, not better: each of
+            # them leaves active_sessions empty, so every ancient row looks like an
+            # orphan to the DB-fallback branch below. This is the session-side twin of
+            # the pending horizon in restore._restore_pending.
+            svc = get_service(session_data.get('service'))
+            last_activity = ensure_aware_utc(
+                session_data.get('last_activity_at')
+                or session_data.get('claimed_at')
+                or session_data.get('created_at')
+            )
+            horizon = svc.session_timeout_minutes + config.STALE_NOTIFY_GRACE_MINUTES
+            stale = (
+                last_activity is not None
+                and (utcnow() - last_activity).total_seconds() / 60.0 > horizon
+            )
+
             # Log system message to transcript if database available
             if db_mgr.db_available:
                 try:
@@ -190,34 +215,52 @@ class SessionExpiryManager:
                 except Exception as e:
                     logger.warning(f"Could not log system message for session {session_id}: {e}")
             
-            # End the session (this handles database updates and cleanup)
-            await self.session_manager.end_session(session_id, user_id, system_end=True)
+            # Close the Mongo row FIRST, and gate every notification on winning that
+            # atomic find_one_and_update -- for the in-memory case as well as the orphan
+            # case. SessionManager.end_session also calls db_mgr.end_session, but it
+            # DISCARDS the return value, so it cannot be the gate: during a deploy
+            # rollback two instances briefly run, both rehydrate the same document into
+            # their own memory, both expire it, and both would DM the same two people.
+            # The redundant close inside session_manager.end_session below is a no-op --
+            # the row is no longer pending/active, so its filter matches nothing.
+            won = True
+            if db_mgr.db_available:
+                won = db_mgr.end_session(session_id, user_id, system_end=True,
+                                         end_reason='idle_expired')
+            elif not in_memory:
+                logger.warning(
+                    "Orphan session %s expired with no DB to close it against", session_id
+                )
 
-            if not in_memory:
-                # The row exists in Mongo but not in memory. SessionManager.end_session
-                # returned early WITHOUT touching Mongo, so close it here -- otherwise the
-                # doc stays status='active' and this sweep re-expires and re-notifies the
-                # same pair every SESSION_SWEEP_SECONDS, forever.
-                if db_mgr.db_available:
-                    closed = db_mgr.end_session(session_id, user_id, system_end=True,
-                                                end_reason='idle_expired')
-                    if not closed:
-                        logger.info(
-                            "Session %s was already closed elsewhere; skipping notifications",
-                            session_id,
-                        )
-                        return
-                else:
-                    logger.warning(
-                        "Orphan session %s expired with no DB to close it against", session_id
-                    )
+            # Clean up memory regardless of who won: the row is closed either way, so
+            # the in-memory copy is stale. (A no-op when the session was never in memory.)
+            await self.session_manager.end_session(session_id, user_id, system_end=True,
+                                                   end_reason='idle_expired')
 
             # Update user states
             if user_id:
                 user_states[user_id] = UserState.IDLE
             if heartfelt_member_id:
                 user_states[heartfelt_member_id] = UserState.IDLE
-            
+
+            if not won:
+                logger.info(
+                    "Session %s was already closed elsewhere; skipping notifications",
+                    session_id,
+                )
+                return
+
+            if stale:
+                logger.info(
+                    "Session %s was idle %.0f min (> %d min horizon) -- closing it "
+                    "silently; notifying anyone this long after the fact would only "
+                    "confuse them",
+                    session_id,
+                    (utcnow() - last_activity).total_seconds() / 60.0,
+                    horizon,
+                )
+                return
+
             # Send expiry notifications
             if user_id:
                 try:

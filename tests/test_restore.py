@@ -60,12 +60,12 @@ class StubDB:
         if self.raise_on_pending:
             raise RuntimeError("Mongo said no")
         out = [d for d in self.docs.values() if d.get('status') == 'pending']
-        return sorted(out, key=lambda d: d.get('created_at') or datetime.datetime.min)
+        return sorted(out, key=lambda d: d.get('created_at') or datetime.datetime.min.replace(tzinfo=UTC))
 
     def get_active_sessions(self):
         self.calls.append(('get_active_sessions',))
         out = [d for d in self.docs.values() if d.get('status') == 'active']
-        return sorted(out, key=lambda d: d.get('created_at') or datetime.datetime.min)
+        return sorted(out, key=lambda d: d.get('created_at') or datetime.datetime.min.replace(tzinfo=UTC))
 
     def get_session(self, session_id):
         self.calls.append(('get_session', session_id))
@@ -578,6 +578,113 @@ async def case_r_db_fallback_respects_each_service_window():
     print("OK  r. the DB-fallback sweep catches HF orphans promptly and spares PSS ones")
 
 
+async def _boot(docs, **cfg):
+    """main()'s boot steps 3 and 4, verbatim: restore, then the two expiry passes
+    that run BEFORE polling starts."""
+    reset_state()
+    saved = {k: getattr(config, k) for k in cfg}
+    for k, v in cfg.items():
+        setattr(config, k, v)
+    try:
+        stub = StubDB(docs)
+        stub.activity_ignores_status = True   # Mongo keeps handing back 'active' rows
+        bot, sm, qm, em, _ = build(stub)
+        restore_state(qm, sm)                 # step 3
+        await qm.sweep_expired_queues()       # step 4a
+        await em.run_once()                   # step 4b
+        return bot, stub
+    finally:
+        for k, v in saved.items():
+            setattr(config, k, v)
+
+
+async def case_s_ancient_active_sessions_are_closed_silently():
+    """Boot must never DM the two parties of a months-old status='active' row.
+
+    The collection holds these today: every deploy that landed mid-conversation left
+    one, and until the T3.0 fix they were re-notified every 3 minutes. Closing them is
+    right; telling a mental-health helpline's past users "your conversation has been
+    automatically closed" months later is not.
+
+    Critically, this must hold under the three restore safety switches too. Each of
+    them leaves active_sessions EMPTY, which makes every ancient row look like an
+    orphan to the expiry sweep's DB-fallback branch -- so before the stale horizon
+    existed, turning a safety switch ON strictly increased the number of DMs sent.
+    """
+    ancient = [active_doc(f"old-{i}", 5000 + i, HF_MEMBER + i, 90 * 24 * 60)
+               for i in range(5)]
+
+    for label, docs, cfg in [
+        ("normal boot", ancient, {}),
+        ("RESTORE_DRY_RUN=true", ancient, {"RESTORE_DRY_RUN": True}),
+        ("RESTORE_ENABLED=false", ancient, {"RESTORE_ENABLED": False}),
+        ("circuit breaker tripped",
+         [active_doc(f"old-{i}", 5000 + i, HF_MEMBER + i, 90 * 24 * 60) for i in range(60)],
+         {}),
+    ]:
+        bot, stub = await _boot([dict(d) for d in docs], **cfg)
+        assert bot.sent == [], (
+            f"{label}: boot DMed {len(bot.sent)} people about months-old sessions: "
+            f"{bot.sent[:3]}")
+        # ...but the rows must still be closed, or the storm just continues.
+        assert stub.called('end_session'), f"{label}: ancient rows must still be closed"
+
+    print("OK  s. months-old active sessions are closed silently, under every restore switch")
+
+
+async def case_t_recently_dead_sessions_still_notify():
+    """The horizon must not become a blanket mute: a conversation that died while the
+    bot was briefly down is inside the grace window and its parties DO get told."""
+    reset_state()
+    # HF: dies at 30 min idle, horizon is 30 + STALE_NOTIFY_GRACE_MINUTES (120) = 150.
+    doc = active_doc("a-t", 4701, HF_MEMBER, 40)      # past the window, well inside grace
+    stub = StubDB([doc])
+    stub.activity_ignores_status = True
+    bot, sm, qm, em, _ = build(stub)
+
+    await em.run_once()
+
+    assert stub.end_reason_for("a-t") == 'idle_expired', stub.ended
+    assert bot.texts_to(4701), "a conversation that died 40 min ago must still be announced"
+    assert bot.texts_to(HF_MEMBER), "and so must its companion"
+    print("OK  t. a session that died inside the grace window is still announced to both parties")
+
+
+async def case_u_exactly_once_across_two_instances():
+    """Deploy rollback briefly runs two containers. Both rehydrate the SAME document
+    into their own memory and both expire it. Only the instance that wins the atomic
+    find_one_and_update may notify -- otherwise both parties are told twice.
+
+    Two processes sharing one Mongo are modelled here as two _expire_session passes
+    over one StubDB, re-seeding active_sessions in between to stand in for the second
+    container's independent memory.
+    """
+    reset_state()
+    doc = active_doc("a-u", 4801, HF_MEMBER, 40)
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+
+    # Instance A: session is in ITS memory.
+    restore_state(qm, sm)
+    assert "a-u" in config.active_sessions
+    await em.run_once()
+    first = list(bot.sent)
+    assert len(first) == 2, f"instance A tells both parties exactly once: {first}"
+
+    # Instance B: same document, its own memory, same Mongo.
+    config.active_sessions["a-u"] = {
+        'user_id': 4801, 'heartfelt_member_id': HF_MEMBER,
+        'created_at': doc['created_at'], 'last_activity_at': doc['last_activity_at'],
+        'anonymous_user_id': doc['anonymous_user_id'], 'service': 'hf',
+    }
+    bot.sent.clear()
+    await em.run_once()
+    assert bot.sent == [], (
+        f"instance B lost the atomic close and must stay silent; these are duplicate "
+        f"DMs to real people: {bot.sent}")
+    print("OK  u. a second instance that loses the atomic close never re-notifies")
+
+
 # --------------------------------------------------------------------------- runner
 async def run():
     case_a_happy_pending()
@@ -598,6 +705,9 @@ async def run():
     case_p_shared_anon_set()
     await case_q_p0_regression_no_notification_storm()
     await case_r_db_fallback_respects_each_service_window()
+    await case_s_ancient_active_sessions_are_closed_silently()
+    await case_t_recently_dead_sessions_still_notify()
+    await case_u_exactly_once_across_two_instances()
 
 
 if __name__ == "__main__":
