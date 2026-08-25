@@ -216,14 +216,26 @@ async def main():
 
     except KeyboardInterrupt:
         logger.info("Received interrupt signal. Shutting down...")
-    except Exception as e:
-        logger.error(f"An error occurred: {e}")
+    except Exception:
+        # logger.exception, not logger.error: deploy.sh only ever shows
+        # `docker logs --tail 50`, and a one-line message with no traceback is not
+        # enough to diagnose a boot failure on a live helpline.
+        logger.exception("An error occurred; shutting down")
     finally:
         # Clean shutdown
         expiry_manager.stop()
-        for task in (queue_cleanup_task, session_expiry_task, authorized_members_task):
-            if task:
-                task.cancel()
+        pending = [t for t in (queue_cleanup_task, session_expiry_task,
+                               authorized_members_task) if t]
+        for task in pending:
+            task.cancel()
+        # Actually wait for the cancellations to land. Without this the loop closes
+        # with the tasks still pending, so a sweep interrupted between closing a
+        # Mongo row and notifying its user never finishes either half.
+        if pending:
+            try:
+                await asyncio.wait(pending, timeout=5)
+            except Exception:
+                logger.warning("Background tasks did not shut down cleanly", exc_info=True)
         logger.info("Bot stopped.")
 
 if __name__ == "__main__":
