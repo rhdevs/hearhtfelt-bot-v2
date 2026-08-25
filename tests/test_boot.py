@@ -476,6 +476,41 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
     )
     assert len(app.error_handlers) == 1, f"expected one error handler, got {app.error_handlers!r}"
 
+    # WHICH callback is wired to WHICH handler, not just how many there are.
+    # Counting handlers and collecting command names leaves every callback
+    # identity unchecked: swapping handlers.handle_photo for handlers.handle_sticker
+    # in main.py keeps the count at 9 and the command set identical, so the suite
+    # stayed green while every photo a requester sends went through the sticker
+    # path. The same held for handle_message <-> handle_callback_query and for
+    # handle_error <-> handle_message.
+    registered = [(type(h).__name__, h.callback.__name__) for h in app.handlers]
+    assert registered == [
+        ("CommandHandler", "start_command"),
+        ("CommandHandler", "chat_command"),
+        ("CommandHandler", "end_command"),
+        ("CommandHandler", "status_command"),
+        ("CommandHandler", "cancel_command"),
+        ("MessageHandler", "handle_message"),
+        ("MessageHandler", "handle_sticker"),
+        ("MessageHandler", "handle_photo"),
+        ("CallbackQueryHandler", "handle_callback_query"),
+    ], f"main() wired its handlers differently: {registered!r}"
+
+    assert app.error_handlers[0].__name__ == "handle_error", (
+        f"the error handler must be handlers.handle_error, got "
+        f"{app.error_handlers[0].__name__!r}"
+    )
+
+    # The two singleton filters, by identity: a swap of the FILTERS rather than the
+    # callbacks would leave the list above unchanged.
+    sticker_h, photo_h = app.handlers[6], app.handlers[7]
+    assert sticker_h.filters is filters.Sticker.ALL, (
+        f"handle_sticker must be filtered on filters.Sticker.ALL, got {sticker_h.filters!r}"
+    )
+    assert photo_h.filters is filters.PHOTO, (
+        f"handle_photo must be filtered on filters.PHOTO, got {photo_h.filters!r}"
+    )
+
     commands = set()
     for h in app.handlers:
         commands |= set(getattr(h, "commands", ()) or ())
