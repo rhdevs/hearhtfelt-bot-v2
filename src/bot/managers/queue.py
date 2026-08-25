@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from config import (
     QUEUE_EXPIRE_MINUTES,
+    used_anonymous_ids,
     ServiceType,
     UserState,
     get_service,
@@ -15,6 +16,7 @@ from config import (
     user_states,
     user_to_queue_map,
 )
+from src.timeutil import ensure_aware_utc, format_hhmm, utcnow
 from src.database.manager import db_mgr
 
 
@@ -30,7 +32,8 @@ class QueueManager:
     def __init__(self, bot: Bot):
         self.bot = bot
         self.channel_accessible = {}  # service_key -> bool (per-service channel reachability)
-        self.used_anonymous_ids = set()  # Track used IDs to avoid duplicates
+        # Shared with SessionManager via config so the two never collide.
+        self.used_anonymous_ids = used_anonymous_ids
 
     def _channel_for(self, entry: dict):
         """Resolve the queue channel for a given queue entry's service."""
@@ -71,7 +74,7 @@ class QueueManager:
         queue_entries[queue_id] = {
             'user_id': user_id,
             'description': description,
-            'created_at': datetime.datetime.now(),
+            'created_at': utcnow(),
             'anonymous_id': anonymous_id,
             'message_id': None,  # Will be set after posting to channel
             'service': service_key,
@@ -104,7 +107,7 @@ class QueueManager:
             message_text = (
                 f"{svc.request_title}\n\n"
                 f"From: {queue_entry['anonymous_id']}\n"
-                f"Time: {queue_entry['created_at'].strftime('%H:%M')}\n\n"
+                f"Time: {format_hhmm(queue_entry['created_at'])}\n\n"
                 f"Description: {queue_entry['description'][:200]}{'...' if len(queue_entry['description']) > 200 else ''}"
             )
 
@@ -192,7 +195,7 @@ class QueueManager:
     
     async def _edit_claimed_message(self, queue_entry: dict, heartfelt_member_name: str):
         """Edit the queue message to show it's been claimed"""
-        claimed_time = datetime.datetime.now()
+        claimed_time = utcnow()
         
         # Create the claimed message text with HTML formatting
         # Escape user-provided content to prevent HTML injection
@@ -203,9 +206,9 @@ class QueueManager:
         claimed_message_text = (
             f"✅ <b>CLAIMED</b> - Help Request\n\n"
             f"From: {queue_entry['anonymous_id']}\n"
-            f"Requested: {queue_entry['created_at'].strftime('%H:%M')}\n"
+            f"Requested: {format_hhmm(queue_entry['created_at'])}\n"
             f"Claimed by: {safe_member_name}\n"
-            f"Claimed at: {claimed_time.strftime('%H:%M')}\n\n"
+            f"Claimed at: {format_hhmm(claimed_time)}\n\n"
             f"Description: {safe_description}{description_suffix}"
         )
 
@@ -242,7 +245,7 @@ class QueueManager:
     
     def cleanup_expired_queues(self):
         """Remove expired queue entries and reset user state when needed"""
-        now = datetime.datetime.now()
+        now = utcnow()
         expired_queue_ids = []
 
         for queue_id, entry in list(queue_entries.items()):

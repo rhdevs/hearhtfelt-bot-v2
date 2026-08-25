@@ -213,7 +213,11 @@ safety_logs = []
 user_to_session_map = {}  # user_id -> session_id for fast session lookups
 user_to_queue_map = {}    # user_id -> queue_id for fast queue lookups
 queue_order = []          # ordered list of queue_ids for position tracking
-user_to_service_map = {}  # user_id -> chosen service key (set at /help or via the chooser)
+user_to_service_map = {}  # user_id -> chosen service key (set at /chat or via the chooser)
+
+# Anonymous ids are handed out by BOTH QueueManager and SessionManager. They must draw
+# from one set, or a session can be created with an id a queue entry already holds.
+used_anonymous_ids: Set[str] = set()
 
 QUEUE_EXPIRE_MINUTES = 60
 AUTHORIZED_MEMBER_REFRESH_SECONDS = 300  # Interval for refreshing Heartfelt members from DB

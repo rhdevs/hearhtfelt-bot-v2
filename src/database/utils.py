@@ -7,6 +7,7 @@ Usage: python db_utils.py [command]
 import datetime
 import argparse
 from src.database.manager import db_mgr
+from src.timeutil import UTC, utcnow
 from config import get_service
 
 def get_anonymous_name(session_doc, for_user_type='user'):
@@ -71,8 +72,8 @@ def show_sessions_this_month():
         return
     
     # Get start of current month
-    now = datetime.datetime.utcnow()
-    start_of_month = datetime.datetime(now.year, now.month, 1)
+    now = utcnow()
+    start_of_month = datetime.datetime(now.year, now.month, 1, tzinfo=UTC)
     
     sessions = db_mgr.get_sessions_in_date_range(start_of_month, now)
     

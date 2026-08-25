@@ -13,6 +13,7 @@ import os
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from src.timeutil import utcnow
 from src.bot.managers.session import SessionManager
 from src.bot.managers.expiry import SessionExpiryManager
 from src.database.manager import DBManager
@@ -133,7 +134,7 @@ class TestSessionExpiry(unittest.TestCase):
         self.session_manager.create_session(user_id, heartfelt_id, session_id)
         
         # Simulate 6-minute old activity (should trigger warning)
-        old_time = datetime.datetime.now() - datetime.timedelta(minutes=6)
+        old_time = utcnow() - datetime.timedelta(minutes=6)
         active_sessions[session_id]['last_activity_at'] = old_time
         
         # Run warning check
@@ -164,7 +165,7 @@ class TestSessionExpiry(unittest.TestCase):
             user_states[heartfelt_id] = UserState.IN_CONVERSATION
             
             # Simulate 11-minute old activity (should trigger expiry)
-            old_time = datetime.datetime.now() - datetime.timedelta(minutes=11)
+            old_time = utcnow() - datetime.timedelta(minutes=11)
             active_sessions[session_id]['last_activity_at'] = old_time
             
             # Run expiry
@@ -199,7 +200,7 @@ class TestSessionExpiry(unittest.TestCase):
                 user_states[heartfelt_id] = UserState.IN_CONVERSATION
                 
                 # Set activity time
-                old_time = datetime.datetime.now() - datetime.timedelta(minutes=minutes_ago)
+                old_time = utcnow() - datetime.timedelta(minutes=minutes_ago)
                 active_sessions[session_id]['last_activity_at'] = old_time
             
             # Mock database query to return empty (testing memory-only behavior)
@@ -232,11 +233,11 @@ class TestSessionExpiry(unittest.TestCase):
         heartfelt_id = 67890
         self.session_manager.create_session(user_id, heartfelt_id, session_id)
         
-        old_time = datetime.datetime.now() - datetime.timedelta(minutes=6)
+        old_time = utcnow() - datetime.timedelta(minutes=6)
         active_sessions[session_id]['last_activity_at'] = old_time
         
         # Mock the cleanup to see if warning would be sent
-        now = datetime.datetime.now()
+        now = utcnow()
         warning_cutoff = now - datetime.timedelta(minutes=5)
         
         sessions_to_warn = []

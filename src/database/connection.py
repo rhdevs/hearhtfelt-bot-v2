@@ -21,6 +21,7 @@ class DatabaseManager:
                 
             self.client = MongoClient(
                 MONGODB_URI,
+                tz_aware=True,                  # decode BSON datetimes as aware UTC
                 serverSelectionTimeoutMS=5000,  # 5 second timeout
                 connectTimeoutMS=5000,
                 socketTimeoutMS=5000

@@ -7,6 +7,7 @@ import os
 import sys
 import datetime
 from src.database.manager import db_mgr
+from src.timeutil import utcnow
 
 def test_fallback_mode():
     """Test that the system works without MongoDB"""
@@ -124,7 +125,7 @@ def test_analytics_queries():
     print(f"✅ Session stats: {stats}")
     
     # Test date range query
-    end_date = datetime.datetime.utcnow()
+    end_date = utcnow()
     start_date = end_date - datetime.timedelta(days=30)
     sessions = db_mgr.get_sessions_in_date_range(start_date, end_date)
     print(f"✅ Found {len(sessions)} sessions in last 30 days")

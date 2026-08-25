@@ -14,6 +14,7 @@ from config import (
     MESSAGES,
     is_heartfelt_member,
 )
+from src.timeutil import ensure_aware_utc, utcnow
 from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ class SessionExpiryManager:
     
     async def _cleanup_expired_sessions(self):
         """Check for expired sessions and handle warnings/cleanup"""
-        now = datetime.datetime.now()
+        now = utcnow()
         
         # Calculate cutoff times
         expiry_cutoff = now - datetime.timedelta(minutes=SESSION_TIMEOUT_MINUTES)

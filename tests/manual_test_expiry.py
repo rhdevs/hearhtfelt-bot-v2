@@ -12,6 +12,7 @@ import os
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from src.timeutil import utcnow
 from src.bot.managers.session import SessionManager
 from src.bot.managers.expiry import SessionExpiryManager
 from config import active_sessions, session_warnings, user_states, UserState
@@ -27,7 +28,7 @@ class MockBot:
         self.sent_messages.append({
             'chat_id': chat_id,
             'text': text,
-            'timestamp': datetime.datetime.now()
+            'timestamp': utcnow()
         })
         print(f"📱 Message to {chat_id}: {text}")
 
@@ -69,7 +70,7 @@ async def demonstrate_session_expiry():
     
     # Fast-forward time to trigger warning (simulate 6 minutes of inactivity)
     print(f"\n3. Fast-forwarding 6 minutes (warning threshold)...")
-    old_time = datetime.datetime.now() - datetime.timedelta(minutes=6)
+    old_time = utcnow() - datetime.timedelta(minutes=6)
     active_sessions[session_id]['last_activity_at'] = old_time
     
     print(f"   🕐 Simulated last activity: {old_time}")
@@ -86,7 +87,7 @@ async def demonstrate_session_expiry():
     
     # Fast-forward time to trigger expiry (simulate 11 minutes total)
     print(f"\n5. Fast-forwarding 5 more minutes (expiry threshold)...")
-    old_time = datetime.datetime.now() - datetime.timedelta(minutes=11)
+    old_time = utcnow() - datetime.timedelta(minutes=11)
     active_sessions[session_id]['last_activity_at'] = old_time
     
     print(f"   🕐 Simulated last activity: {old_time}")
@@ -139,7 +140,7 @@ async def demonstrate_activity_reset():
     session_manager.create_session(user_id, heartfelt_id, session_id)
     
     # Simulate inactivity to trigger warning
-    old_time = datetime.datetime.now() - datetime.timedelta(minutes=6)
+    old_time = utcnow() - datetime.timedelta(minutes=6)
     active_sessions[session_id]['last_activity_at'] = old_time
     
     # Run cleanup to send warning

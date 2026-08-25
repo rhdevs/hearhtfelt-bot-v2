@@ -3,6 +3,7 @@ import uuid
 import logging
 from typing import Iterable, Optional, List, Dict, Any
 from src.database.connection import db_manager
+from src.timeutil import ensure_aware_utc, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class DBManager:
             if session_id is None:
                 session_id = str(uuid.uuid4())
 
-            now = datetime.datetime.utcnow()
+            now = utcnow()
             session_doc = {
                 'session_id': session_id,
                 'service': service,
@@ -66,7 +67,7 @@ class DBManager:
                         'heartfelt_member_id': heartfelt_member_id,
                         'heartfelt_member_telehandle': heartfelt_member_telehandle,
                         'status': 'active',
-                        'claimed_at': datetime.datetime.utcnow()
+                        'claimed_at': utcnow()
                     },
                     '$currentDate': {
                         'last_activity_at': True  # Atomic timestamp update
@@ -89,7 +90,7 @@ class DBManager:
             return False
             
         try:
-            ended_at = datetime.datetime.utcnow()
+            ended_at = utcnow()
             
             # Use atomic operation to prevent double-termination
             result = db_manager.db.sessions.find_one_and_update(
@@ -108,9 +109,14 @@ class DBManager:
             if not result:
                 return False  # Session already ended or doesn't exist
             
-            # Calculate duration from claimed_at if available, otherwise from created_at
-            start_time = result.get('claimed_at', result['created_at'])
-            duration_minutes = int((ended_at - start_time).total_seconds() / 60)
+            # Calculate duration from claimed_at if available, otherwise from created_at.
+            # Both are normalised to aware UTC: a legacy naive value would otherwise
+            # raise TypeError against the aware `ended_at` and lose the whole close.
+            start_time = ensure_aware_utc(result.get('claimed_at') or result.get('created_at'))
+            if start_time is None:
+                duration_minutes = 0
+            else:
+                duration_minutes = int((ended_at - start_time).total_seconds() / 60)
             
             # Update with calculated duration
             db_manager.db.sessions.update_one(
@@ -207,7 +213,7 @@ class DBManager:
             if coll_obj.estimated_document_count() > 0:
                 return
 
-            now = datetime.datetime.utcnow()
+            now = utcnow()
             docs = []
             for member_id in default_members:
                 try:
@@ -271,7 +277,7 @@ class DBManager:
 
         try:
             coll = collection or self._authorized_collection
-            now = datetime.datetime.utcnow()
+            now = utcnow()
             update = {
                 '$set': {
                     'active': active,
@@ -306,7 +312,7 @@ class DBManager:
                 {
                     '$set': {
                         'active': False,
-                        'updated_at': datetime.datetime.utcnow()
+                        'updated_at': utcnow()
                     }
                 }
             )
@@ -346,7 +352,7 @@ class DBManager:
                 'content': content,
                 'file_id': file_id,
                 'file_type': file_type,
-                'timestamp': datetime.datetime.utcnow()
+                'timestamp': utcnow()
             }
             
             db_manager.db.messages.insert_one(message_doc)
