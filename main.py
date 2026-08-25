@@ -14,6 +14,7 @@ from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager
 from src.bot.managers.expiry import SessionExpiryManager
 from src.bot.handlers import BotHandlers
+from src.bot.restore import restore_state
 from src.database.manager import db_mgr
 
 # Enable logging
@@ -136,21 +137,6 @@ async def main():
     # Start the bot
     logger.info("Starting Care Network Bot...")
 
-    # Validate channel access for every enabled service
-    logger.info("Validating channel access for enabled services...")
-    for svc in enabled_services():
-        logger.info("Service '%s' -> channel %s, members: %d", svc.key, svc.channel_id, len(svc.roster))
-        channel_ok, channel_msg = await validate_channel_access(bot, svc.channel_id)
-        if channel_ok:
-            logger.info("✅ Channel access verified for '%s': %s", svc.key, channel_msg)
-        else:
-            logger.error("❌ Channel access failed for '%s': %s", svc.key, channel_msg)
-            logger.error(
-                "⚠️  Bot will continue but the '%s' queue may not work. Add the bot to the "
-                "channel as admin (Send + Delete messages) and verify the channel id.",
-                svc.key,
-            )
-    
     # Start periodic cleanup tasks
     async def queue_cleanup_loop():
         """Periodic task to clean up expired queue entries.
@@ -169,40 +155,75 @@ async def main():
 
             # Wait 5 minutes before next cleanup
             await asyncio.sleep(300)
-    
-    # Start cleanup tasks
-    queue_cleanup_task = asyncio.create_task(queue_cleanup_loop())
-    session_expiry_task = asyncio.create_task(expiry_manager.start())
+
+    # Pre-bound so the finally block can cancel them even if we never get that far:
+    # they are created inside the `async with`, so an early failure would otherwise
+    # leave these names unbound.
+    queue_cleanup_task = None
+    session_expiry_task = None
     authorized_members_task = None
-    if db_available:
-        authorized_members_task = asyncio.create_task(refresh_authorized_members_periodically())
-    
+
     try:
-        # Run the bot
-        logger.info("Bot is running. Press Ctrl+C to stop.")
-        
-        # Start polling and run until stopped
+        # Everything below runs inside the initialised application. Channel validation
+        # used to run before initialize(); it happened to work, but the restore and
+        # sweep steps message real users, so all of it belongs in here.
         async with application:
-            await application.start()
+            await application.start()   # update processor up; polling NOT started yet
+
+            # 1. Channel reachability
+            logger.info("Validating channel access for enabled services...")
+            for svc in enabled_services():
+                logger.info("Service '%s' -> channel %s, members: %d",
+                            svc.key, svc.channel_id, len(svc.roster))
+                channel_ok, channel_msg = await validate_channel_access(bot, svc.channel_id)
+                if channel_ok:
+                    logger.info("✅ Channel access verified for '%s': %s", svc.key, channel_msg)
+                else:
+                    logger.error("❌ Channel access failed for '%s': %s", svc.key, channel_msg)
+                    logger.error(
+                        "⚠️  Bot will continue but the '%s' queue may not work. Add the bot to the "
+                        "channel as admin (Send + Delete messages) and verify the channel id.",
+                        svc.key,
+                    )
+
+            # 2. Publish the command menu (never fatal)
+            await register_bot_commands(bot)
+
+            # 3. Rehydrate from Mongo. Synchronous, no Telegram I/O, never raises.
+            restore_state(queue_manager, session_manager)
+
+            # 4. Retire anything already past its window BEFORE any update can be
+            #    processed, so a member cannot claim an entry mid-rehydration and a
+            #    stale entry cannot be claimed before it is expired.
+            await queue_manager.sweep_expired_queues()
+            await expiry_manager.run_once()
+
+            # 5. Only now start the background loops.
+            queue_cleanup_task = asyncio.create_task(queue_cleanup_loop())
+            session_expiry_task = asyncio.create_task(expiry_manager.start())
+            if db_available:
+                authorized_members_task = asyncio.create_task(refresh_authorized_members_periodically())
+
+            # 6. Open the doors.
+            logger.info("Bot is running. Press Ctrl+C to stop.")
             await application.updater.start_polling(allowed_updates=["message", "callback_query"])
-            
+
             # Keep running until interrupted
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 pass
-        
+
     except KeyboardInterrupt:
         logger.info("Received interrupt signal. Shutting down...")
     except Exception as e:
         logger.error(f"An error occurred: {e}")
     finally:
         # Clean shutdown
-        queue_cleanup_task.cancel()
         expiry_manager.stop()
-        session_expiry_task.cancel()
-        if authorized_members_task:
-            authorized_members_task.cancel()
+        for task in (queue_cleanup_task, session_expiry_task, authorized_members_task):
+            if task:
+                task.cancel()
         logger.info("Bot stopped.")
 
 if __name__ == "__main__":

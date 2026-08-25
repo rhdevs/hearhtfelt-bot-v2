@@ -36,8 +36,11 @@ class QueueManager:
         self.used_anonymous_ids = used_anonymous_ids
 
     def _channel_for(self, entry: dict):
-        """Resolve the queue channel for a given queue entry's service."""
-        return get_service(entry.get('service')).channel_id
+        """Channel this entry's post actually lives in.
+
+        The recorded value wins over current config, because a service's channel_id
+        can change between restarts and the post does not move with it."""
+        return entry.get('channel_id') or get_service(entry.get('service')).channel_id
 
     def get_queue_entry(self, queue_id: str) -> Optional[dict]:
         """Return the in-memory queue entry (or None) without mutating it."""
@@ -77,6 +80,7 @@ class QueueManager:
             'created_at': utcnow(),
             'anonymous_id': anonymous_id,
             'message_id': None,  # Will be set after posting to channel
+            'channel_id': None,  # ditto -- the channel the post actually landed in
             'service': service_key,
         }
 
@@ -124,7 +128,18 @@ class QueueManager:
 
             # Store message ID for later deletion
             queue_entries[queue_id]['message_id'] = message.message_id
+            queue_entries[queue_id]['channel_id'] = svc.channel_id
             self.channel_accessible[svc.key] = True  # Mark as accessible on success
+
+            # Persist it so a restarted bot can still edit or delete this post. A DB
+            # hiccup here must NOT fail the post: the requester is already queued and
+            # the in-memory entry is complete. The only cost is losing edit/delete
+            # ability across a restart.
+            if db_mgr.db_available:
+                try:
+                    db_mgr.set_queue_message(queue_id, svc.channel_id, message.message_id)
+                except Exception as exc:
+                    logger.warning("Could not persist queue message id for %s: %s", queue_id, exc)
 
             return True, "success"
 
@@ -153,7 +168,11 @@ class QueueManager:
             return None
 
         user_id = queue_entry['user_id']
-        message_id = queue_entry['message_id']
+        message_id = queue_entry.get('message_id')
+        if not message_id and queue_entry.get('restored'):
+            logger.warning(
+                "Claimed restored entry %s with no recorded message_id; channel post "
+                "left unedited", queue_id)
 
         if user_id == heartfelt_member_id:
             raise SelfClaimError("Claimant cannot take their own queue entry")
@@ -397,7 +416,7 @@ class QueueManager:
         if queue_entry.get('message_id') and self.channel_accessible.get(svc.key, True):
             try:
                 await self.bot.delete_message(
-                    chat_id=svc.channel_id,
+                    chat_id=self._channel_for(queue_entry),
                     message_id=queue_entry['message_id']
                 )
             except Exception as e:
@@ -412,5 +431,15 @@ class QueueManager:
             del user_to_queue_map[user_id]
         if queue_id_to_remove in queue_order:
             queue_order.remove(queue_id_to_remove)
-        
+
+        # Close the Mongo row. Without this a cancelled request stays status='pending'
+        # forever and would be resurrected by rehydration on the next restart.
+        if db_mgr.db_available:
+            try:
+                db_mgr.end_session(queue_id_to_remove, user_id, system_end=False,
+                                   end_reason='user_cancelled')
+            except Exception as exc:
+                logger.warning("Could not close cancelled queue row %s: %s",
+                               queue_id_to_remove, exc)
+
         return True, "success"

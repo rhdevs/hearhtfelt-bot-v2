@@ -82,12 +82,20 @@ class SessionExpiryManager:
 
         # If the database is available, also catch sessions missing from memory (a
         # restart mid-conversation, or a doc whose rehydration was deliberately
-        # skipped). Query at the LOOSEST cutoff and re-filter per service, so an HF
-        # session can never be expired against PSS's much longer window.
+        # skipped).
+        #
+        # The cutoff uses the SHORTEST timeout across services, because
+        # get_sessions_by_activity returns rows with last_activity <= cutoff: the
+        # shortest timeout puts the cutoff nearest to now and so returns the widest
+        # superset -- every session that could possibly be expired by ANY service's
+        # rule. Using the longest timeout here would make the query narrower instead,
+        # and an orphaned HF conversation would go unclosed for a full 24 hours.
+        # The per-service re-filter below is what stops a PSS session from being
+        # expired against HF's much shorter window.
         if db_mgr.db_available:
             try:
-                loosest = max(s.session_timeout_minutes for s in SERVICES.values())
-                cutoff = now - datetime.timedelta(minutes=loosest)
+                widest = min(s.session_timeout_minutes for s in SERVICES.values())
+                cutoff = now - datetime.timedelta(minutes=widest)
                 for doc in db_mgr.get_sessions_by_activity(cutoff):
                     sid = doc.get('session_id')
                     if not sid or sid in active_sessions:

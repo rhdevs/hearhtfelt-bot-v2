@@ -134,6 +134,29 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# --- Restart durability (see src/bot/restore.py) -------------------------------
+# RESTORE_DRY_RUN exists because the FIRST deploy of this feature runs against a
+# sessions collection that has been accumulating never-closed pending rows since
+# the bot went live. A dry run logs exactly what WOULD be restored, expired,
+# notified and silently closed, and touches nothing.
+# RESTORE_MAX_* are a circuit breaker: if Mongo hands back more rows than this,
+# rehydration aborts entirely rather than messaging dozens of people.
+# STALE_NOTIFY_GRACE_MINUTES is the horizon past which "your request expired"
+# stops being kind and starts being confusing.
+RESTORE_ENABLED = _env_bool("RESTORE_ENABLED", True)
+RESTORE_DRY_RUN = _env_bool("RESTORE_DRY_RUN", False)
+RESTORE_MAX_PENDING = _env_int("RESTORE_MAX_PENDING", 50)
+RESTORE_MAX_ACTIVE = _env_int("RESTORE_MAX_ACTIVE", 50)
+STALE_NOTIFY_GRACE_MINUTES = _env_int("STALE_NOTIFY_GRACE_MINUTES", 120)
+
+
 @dataclass
 class Service:
     """Configuration for a single support track (e.g. HF or PSS)."""

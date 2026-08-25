@@ -44,6 +44,10 @@ class DBManager:
                 'claimed_at': None,
                 'ended_at': None,
                 'ended_by_user_id': None,
+                # Where this request's channel post lives, so a restarted bot can
+                # still edit or delete it. Filled in by set_queue_message.
+                'queue_channel_id': None,
+                'queue_message_id': None,
             }
             
             db_manager.db.sessions.insert_one(session_doc)
@@ -181,6 +185,47 @@ class DBManager:
             logger.error(f"Error getting pending sessions: {e}")
             return []
     
+    def set_queue_message(self, session_id: str, channel_id, message_id: int) -> bool:
+        """Record where this request's channel post lives, so a restarted bot can
+        edit or delete it.
+
+        Deliberately NOT filtered on status: the post physically exists whether or
+        not a member claimed it in the microsecond between send_message returning
+        and this write. channel_id is stored as a string to match the env form used
+        everywhere else."""
+        if not self.db_available:
+            return False
+
+        try:
+            result = db_manager.db.sessions.update_one(
+                {'session_id': session_id},
+                {'$set': {
+                    'queue_channel_id': str(channel_id) if channel_id is not None else None,
+                    'queue_message_id': int(message_id),
+                }}
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error recording queue message for session {session_id}: {e}")
+            return False
+
+    def get_active_sessions(self) -> List[Dict[str, Any]]:
+        """Get all active (claimed, unended) sessions, oldest first.
+
+        Sorted on created_at rather than claimed_at so it reuses the existing
+        (status, created_at) index."""
+        if not self.db_available:
+            return []
+
+        try:
+            return list(db_manager.db.sessions.find(
+                {'status': 'active'},
+                sort=[('created_at', 1)]
+            ))
+        except Exception as e:
+            logger.error(f"Error getting active sessions: {e}")
+            return []
+
     def update_session_activity(self, session_id: str) -> bool:
         """Update last_activity_at timestamp for a session"""
         if not self.db_available:
