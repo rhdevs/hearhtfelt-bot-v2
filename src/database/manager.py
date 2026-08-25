@@ -84,25 +84,33 @@ class DBManager:
             logger.error(f"Error claiming session {session_id}: {e}")
             return False
     
-    def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False) -> bool:
-        """End an active session and calculate duration"""
+    def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False,
+                    end_reason: str = None) -> bool:
+        """End an active session and calculate duration.
+
+        end_reason is purely additive metadata ('user_ended', 'queue_expired',
+        'idle_expired', 'user_cancelled', 'stale_startup_sweep', 'duplicate_pending',
+        'superseded_by_active'). status still becomes 'ended', so get_session_stats
+        and src/database/utils.py are unaffected."""
         if not self.db_available:
             return False
             
         try:
             ended_at = utcnow()
             
+            updates = {
+                'status': 'ended',
+                'ended_at': ended_at,
+                'ended_by_user_id': ended_by_user_id if not system_end else None,
+                'ended_by_system': system_end,
+            }
+            if end_reason is not None:
+                updates['end_reason'] = end_reason
+
             # Use atomic operation to prevent double-termination
             result = db_manager.db.sessions.find_one_and_update(
                 {'session_id': session_id, 'status': {'$in': ['pending', 'active']}},
-                {
-                    '$set': {
-                        'status': 'ended',
-                        'ended_at': ended_at,
-                        'ended_by_user_id': ended_by_user_id if not system_end else None,
-                        'ended_by_system': system_end
-                    }
-                },
+                {'$set': updates},
                 return_document=True
             )
             
@@ -124,8 +132,10 @@ class DBManager:
                 {'$set': {'duration_minutes': duration_minutes}}
             )
 
-            end_reason = "system auto-expiry" if system_end else f"user {ended_by_user_id}"
-            logger.info(f"Session {session_id} ended by {end_reason}, duration: {duration_minutes}m")
+            ended_by = "system auto-expiry" if system_end else f"user {ended_by_user_id}"
+            logger.info(f"Session {session_id} ended by {ended_by}"
+                        f"{' (' + end_reason + ')' if end_reason else ''}, "
+                        f"duration: {duration_minutes}m")
             return True
             
         except Exception as e:

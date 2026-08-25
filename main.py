@@ -6,11 +6,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from config import (
     BOT_TOKEN,
     AUTHORIZED_MEMBER_REFRESH_SECONDS,
-    MESSAGES,
     validate_channel_access,
     SERVICES,
     enabled_services,
-    get_service,
 )
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager
@@ -154,37 +152,26 @@ async def main():
             )
     
     # Start periodic cleanup tasks
-    async def cleanup_expired_queues():
-        """Periodic task to clean up expired queue entries"""
+    async def queue_cleanup_loop():
+        """Periodic task to clean up expired queue entries.
+
+        All the work -- closing the DB row, retiring the channel post, notifying the
+        requester -- lives in QueueManager.sweep_expired_queues, so boot-time and
+        periodic expiry go through exactly one code path.
+        """
         while True:
             try:
-                expired_entries = queue_manager.cleanup_expired_queues()
-                if expired_entries:
-                    logger.info("Cleaned up %d expired queue entries", len(expired_entries))
-                    for expired in expired_entries:
-                        user_id = expired.get("user_id")
-                        if not user_id:
-                            continue
-                        try:
-                            member_label = get_service(expired.get("service")).member_label
-                            await bot.send_message(
-                                chat_id=user_id,
-                                text=MESSAGES["queue_expired"].format(member=member_label)
-                            )
-                        except Exception as send_error:
-                            logger.warning(
-                                "Failed to notify user %s about queue expiry: %s",
-                                user_id,
-                                send_error
-                            )
+                expired = await queue_manager.sweep_expired_queues()
+                if expired:
+                    logger.info("Cleaned up %d expired queue entries", len(expired))
             except Exception as e:
                 logger.error(f"Error during queue cleanup: {e}")
-            
+
             # Wait 5 minutes before next cleanup
             await asyncio.sleep(300)
     
     # Start cleanup tasks
-    queue_cleanup_task = asyncio.create_task(cleanup_expired_queues())
+    queue_cleanup_task = asyncio.create_task(queue_cleanup_loop())
     session_expiry_task = asyncio.create_task(expiry_manager.start())
     authorized_members_task = None
     if db_available:

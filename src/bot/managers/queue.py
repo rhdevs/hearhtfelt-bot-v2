@@ -3,10 +3,10 @@ import html
 import logging
 import random
 import uuid
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from config import (
-    QUEUE_EXPIRE_MINUTES,
+    MESSAGES,
     used_anonymous_ids,
     ServiceType,
     UserState,
@@ -243,47 +243,135 @@ class QueueManager:
         # Simple estimation: 5 minutes per person ahead
         return position * 5
     
-    def cleanup_expired_queues(self):
-        """Remove expired queue entries and reset user state when needed"""
+    def cleanup_expired_queues(self) -> List[dict]:
+        """Remove expired queue entries. Returns the popped entries (sync, no Telegram I/O).
+
+        Each returned entry is the popped entry plus 'queue_id' and 'notify', where
+        notify is True iff the user was still IN_QUEUE at cleanup time -- the same
+        gate the old code used before messaging anyone.
+        """
         now = utcnow()
         expired_queue_ids = []
 
         for queue_id, entry in list(queue_entries.items()):
-            time_diff = now - entry['created_at']
-            if time_diff.total_seconds() > (QUEUE_EXPIRE_MINUTES * 60):
+            created = ensure_aware_utc(entry.get('created_at'))
+            window_seconds = get_service(entry.get('service')).queue_expire_minutes * 60
+            if created is None:
+                # Unusable timestamp: we cannot tell how long this has waited, and
+                # leaving it queued forever is worse than retiring it.
+                logger.warning("Queue entry %s has no usable created_at; expiring it", queue_id)
+                expired = True
+            else:
+                expired = (now - created).total_seconds() > window_seconds
+            if expired:
                 expired_queue_ids.append(queue_id)
 
-        expired_users = []
+        expired_entries = []
         for queue_id in expired_queue_ids:
-            # Try to delete the message from admin channel
-            try:
-                entry = queue_entries[queue_id]
-                if entry.get('message_id'):
-                    # Note: This should be called with await in an async context
-                    pass  # Will be handled by the main bot loop
-            except:
-                pass
-            
-            # Clean up all data structures
             entry = queue_entries.get(queue_id)
-            if entry:
-                user_id = entry.get('user_id')
-                if user_id:
-                    current_state = user_states.get(user_id)
-                    if current_state == UserState.IN_QUEUE:
-                        user_states[user_id] = UserState.IDLE
-                        expired_users.append({"user_id": user_id, "service": entry.get('service')})
+            if not entry:
+                continue
 
-                if user_id and user_id in user_to_queue_map:
+            notify = False
+            user_id = entry.get('user_id')
+            if user_id:
+                if user_states.get(user_id) == UserState.IN_QUEUE:
+                    user_states[user_id] = UserState.IDLE
+                    notify = True
+                if user_id in user_to_queue_map:
                     del user_to_queue_map[user_id]
 
             queue_entries.pop(queue_id, None)
-
-            # Remove from queue order
             if queue_id in queue_order:
                 queue_order.remove(queue_id)
 
-        return expired_users
+            expired_entries.append({**entry, 'queue_id': queue_id, 'notify': notify})
+
+        return expired_entries
+
+    async def sweep_expired_queues(self) -> List[dict]:
+        """Expire stale queue entries: close the DB row, retire the channel post,
+        notify the requester. Returns the entries actually acted on."""
+        acted = []
+        for entry in self.cleanup_expired_queues():
+            queue_id = entry['queue_id']
+            svc = get_service(entry.get('service'))
+
+            # 1. Close the Mongo row FIRST. end_session is an atomic
+            #    find_one_and_update filtered on status in {pending, active}, so a False
+            #    return means another actor already moved this row -- possibly a member
+            #    claiming it a moment ago. Telling that requester it expired would be a
+            #    lie, so we skip the notification entirely.
+            won = True
+            if db_mgr.db_available:
+                try:
+                    won = db_mgr.end_session(queue_id, None, system_end=True,
+                                             end_reason='queue_expired')
+                except Exception as exc:
+                    logger.warning("Could not close expired queue row %s: %s", queue_id, exc)
+                    won = False
+            if not won:
+                logger.info("Queue %s was already claimed or closed elsewhere; not notifying",
+                            queue_id)
+                continue
+
+            # 2. Retire the channel post so its Claim button stops being live.
+            await self._retire_channel_post(entry, svc)
+
+            # 3. Notify the requester.
+            if entry.get('notify') and entry.get('user_id'):
+                try:
+                    await self.bot.send_message(
+                        chat_id=entry['user_id'],
+                        text=MESSAGES["queue_expired"].format(member=svc.member_label),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to notify user %s about queue expiry: %s",
+                                   entry['user_id'], exc)
+
+            acted.append(entry)
+
+        return acted
+
+    async def _retire_channel_post(self, entry: dict, svc) -> None:
+        """Edit an expired request's channel post into an EXPIRED card and strip the
+        Claim button, falling back to deleting it. NEVER raises."""
+        message_id = entry.get('message_id')
+        if not message_id or not self.channel_accessible.get(svc.key, True):
+            return
+
+        description = entry.get('description') or ''
+        safe_description = html.escape(description[:200])
+        suffix = '...' if len(description) > 200 else ''
+        text = (
+            f"⌛ <b>EXPIRED</b> - Help Request\n\n"
+            f"From: {entry.get('anonymous_id', 'Unknown')}\n"
+            f"Requested: {format_hhmm(entry.get('created_at'))}\n"
+            f"Expired at: {format_hhmm(utcnow())}\n\n"
+            f"Description: {safe_description}{suffix}"
+        )
+
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self._channel_for(entry),
+                message_id=message_id,
+                text=text,
+                reply_markup=None,
+                parse_mode='HTML',
+            )
+            return
+        except Exception as exc:
+            logger.warning("Could not edit expired queue post %s: %s", entry.get('queue_id'), exc)
+
+        try:
+            await self.bot.delete_message(
+                chat_id=self._channel_for(entry),
+                message_id=message_id,
+            )
+        except Exception as exc:
+            logger.warning("Could not delete expired queue post %s either: %s",
+                           entry.get('queue_id'), exc)
+
     
     def is_user_in_queue(self, user_id: int) -> bool:
         """Check if user is already in queue - O(1) lookup"""

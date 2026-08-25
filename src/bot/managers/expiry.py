@@ -8,15 +8,13 @@ from config import (
     session_warnings,
     user_states,
     UserState,
-    SESSION_TIMEOUT_MINUTES,
-    SESSION_WARNING_MINUTES,
     SESSION_SWEEP_SECONDS,
     SERVICES,
     get_service,
     MESSAGES,
     is_heartfelt_member,
 )
-from src.timeutil import ensure_aware_utc, utcnow
+from src.timeutil import ensure_aware_utc, format_duration_minutes, utcnow
 from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
@@ -36,7 +34,7 @@ class SessionExpiryManager:
         
         while self.running:
             try:
-                await self._cleanup_expired_sessions()
+                await self.run_once()
             except Exception as e:
                 logger.error(f"Error during session cleanup: {e}")
             
@@ -48,43 +46,65 @@ class SessionExpiryManager:
         self.running = False
         logger.info("Stopping session expiry cleanup task")
     
+    async def run_once(self) -> None:
+        """One cleanup pass. Public wrapper for boot-time and test use."""
+        await self._cleanup_expired_sessions()
+
     async def _cleanup_expired_sessions(self):
-        """Check for expired sessions and handle warnings/cleanup"""
+        """Check for expired sessions and handle warnings/cleanup.
+
+        Timers are PER SERVICE, so there is no single global cutoff any more: each
+        session is measured against its own track's window.
+        """
         now = utcnow()
-        
-        # Calculate cutoff times
-        expiry_cutoff = now - datetime.timedelta(minutes=SESSION_TIMEOUT_MINUTES)
-        warning_cutoff = now - datetime.timedelta(minutes=SESSION_WARNING_MINUTES)
-        
+
         sessions_to_expire = []
         sessions_to_warn = []
-        
-        # Check in-memory sessions first (primary data source)
-        for session_id, session_data in active_sessions.items():
-            last_activity = session_data.get('last_activity_at', session_data.get('created_at'))
-            
-            if not last_activity:
+
+        # Check in-memory sessions first (primary data source).
+        # list(): _expire_session mutates active_sessions while we iterate.
+        for session_id, session_data in list(active_sessions.items()):
+            svc = get_service(session_data.get('service'))
+            last_activity = ensure_aware_utc(
+                session_data.get('last_activity_at') or session_data.get('created_at')
+            )
+            if last_activity is None:
+                logger.warning("Session %s has no usable activity timestamp; skipping", session_id)
                 continue
-                
-            # Check if session should be expired
-            if last_activity <= expiry_cutoff:
+
+            idle_minutes = (now - last_activity).total_seconds() / 60.0
+
+            if idle_minutes >= svc.session_timeout_minutes:
                 sessions_to_expire.append((session_id, session_data))
-            # Check if session needs warning (and hasn't been warned yet)
-            elif (last_activity <= warning_cutoff and 
-                  not session_warnings.get(session_id, False)):
+            elif (idle_minutes >= svc.session_timeout_minutes - svc.session_warning_minutes
+                  and not session_warnings.get(session_id, False)):
                 sessions_to_warn.append((session_id, session_data))
-        
-        # If database is available, also check for any sessions that might be missing from memory
+
+        # If the database is available, also catch sessions missing from memory (a
+        # restart mid-conversation, or a doc whose rehydration was deliberately
+        # skipped). Query at the LOOSEST cutoff and re-filter per service, so an HF
+        # session can never be expired against PSS's much longer window.
         if db_mgr.db_available:
             try:
-                db_expired = db_mgr.get_sessions_by_activity(expiry_cutoff)
-                for db_session in db_expired:
-                    session_id = db_session['session_id']
-                    # Only add if not already in memory (edge case for bot restarts)
-                    if session_id not in active_sessions:
-                        sessions_to_expire.append((session_id, db_session))
+                loosest = max(s.session_timeout_minutes for s in SERVICES.values())
+                cutoff = now - datetime.timedelta(minutes=loosest)
+                for doc in db_mgr.get_sessions_by_activity(cutoff):
+                    sid = doc.get('session_id')
+                    if not sid or sid in active_sessions:
+                        continue
+                    svc = get_service(doc.get('service'))
+                    last = ensure_aware_utc(
+                        doc.get('last_activity_at')
+                        or doc.get('claimed_at')
+                        or doc.get('created_at')
+                    )
+                    if last is None:
+                        continue
+                    if (now - last).total_seconds() / 60.0 >= svc.session_timeout_minutes:
+                        sessions_to_expire.append((sid, doc))
             except Exception as e:
                 logger.error(f"Error checking database for expired sessions: {e}")
+
         
         # Process warnings
         for session_id, session_data in sessions_to_warn:
@@ -108,20 +128,26 @@ class SessionExpiryManager:
             # Mark as warned to prevent spam
             session_warnings[session_id] = True
             
+            # Per-track lead time: HF renders "in 5 minutes", PSS "in 1 hour".
+            svc = get_service(session_data.get('service'))
+            text = MESSAGES["session_warning"].format(
+                duration=format_duration_minutes(svc.session_warning_minutes)
+            )
+
             # Send warning to user
             try:
                 await self.bot.send_message(
                     chat_id=user_id,
-                    text=MESSAGES["session_warning"]
+                    text=text
                 )
             except Exception as e:
                 logger.warning(f"Could not send warning to user {user_id}: {e}")
-            
+
             # Send warning to heartfelt member
             try:
                 await self.bot.send_message(
                     chat_id=heartfelt_member_id,
-                    text=MESSAGES["session_warning"]
+                    text=text
                 )
             except Exception as e:
                 logger.warning(f"Could not send warning to heartfelt member {heartfelt_member_id}: {e}")
@@ -165,7 +191,8 @@ class SessionExpiryManager:
                 # doc stays status='active' and this sweep re-expires and re-notifies the
                 # same pair every SESSION_SWEEP_SECONDS, forever.
                 if db_mgr.db_available:
-                    closed = db_mgr.end_session(session_id, user_id, system_end=True)
+                    closed = db_mgr.end_session(session_id, user_id, system_end=True,
+                                                end_reason='idle_expired')
                     if not closed:
                         logger.info(
                             "Session %s was already closed elsewhere; skipping notifications",

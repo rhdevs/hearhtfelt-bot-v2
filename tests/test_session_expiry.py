@@ -178,8 +178,10 @@ class TestSessionExpiry(unittest.TestCase):
             self.assertEqual(user_states[user_id], UserState.IDLE)
             self.assertEqual(user_states[heartfelt_id], UserState.IDLE)
             
-            # Verify database end_session was called with system_end=True
-            self.mock_db_mgr.end_session.assert_called_with(session_id, user_id, True)
+            # Verify database end_session was called with system_end=True and the
+            # additive end_reason tag introduced with restart durability.
+            self.mock_db_mgr.end_session.assert_called_with(
+                session_id, user_id, True, end_reason='idle_expired')
             
             # Verify both parties were notified
             self.assertEqual(self.mock_bot.send_message.call_count, 2)

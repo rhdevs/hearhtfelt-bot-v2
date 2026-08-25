@@ -285,7 +285,8 @@ class SessionManager:
             logger.error(f"Error forwarding photo in session {session_id}: {e}")
             return False
     
-    async def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False) -> Tuple[Optional[int], Optional[int]]:
+    async def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False,
+                          end_reason: str = None) -> Tuple[Optional[int], Optional[int]]:
         """End a session and return both user IDs"""
         session = active_sessions.get(session_id)
         if not session:
@@ -296,7 +297,9 @@ class SessionManager:
         
         # End session in database
         if db_mgr.db_available:
-            db_mgr.end_session(session_id, ended_by_user_id, system_end)
+            if end_reason is None:
+                end_reason = 'idle_expired' if system_end else 'user_ended'
+            db_mgr.end_session(session_id, ended_by_user_id, system_end, end_reason=end_reason)
         
         # Remove session and clean up indices
         del active_sessions[session_id]
