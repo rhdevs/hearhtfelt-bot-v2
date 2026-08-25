@@ -16,6 +16,19 @@ Because of that it refuses to run unless you opt in explicitly:
 Without the opt-in it exits NON-ZERO and connects to nothing -- a refusal must
 never be mistakable for a pass.
 
+That guard lives in main(), so it only covers `python tests/test_db_integration.py`.
+It does NOT cover a collector that calls the functions directly. This file is
+named test_*.py and used to define three module-level test_* functions, so
+`pytest` (or plain `pytest tests/`) collected and RAN all three without ever
+entering main() -- and since the file contains no `assert` at all, failures are
+only printed, so pytest reported "3 passed" while writing documents to whatever
+MONGODB_URI resolved to. A developer with a production URI in their local .env
+running the reflex command `pytest` would have inserted fabricated sessions and
+message bodies into a live helpline's database and seen a green run.
+
+Hence: the checks are named check_* rather than test_*, and __test__ = False is
+set below. Do not rename them back, and do not add a test_ prefixed name here.
+
 Until this commit the file could not be run at all: it was the only test file
 missing the `sys.path.insert` every other one has, so it died on
 `ModuleNotFoundError: No module named 'src'` at import time. Fixing that alone
@@ -34,7 +47,12 @@ from src.timeutil import utcnow
 
 OPT_IN_ENV = "ALLOW_DB_INTEGRATION_TEST"
 
-def test_fallback_mode():
+# Belt and braces for the same reason the functions above are named check_*
+# rather than test_*: pytest honours a module-level __test__ = False and will
+# collect nothing from this file even if someone later adds a test_ name.
+__test__ = False
+
+def check_fallback_mode():
     """Test that the system works without MongoDB"""
     print("🧪 Testing fallback mode (no MongoDB)...")
     
@@ -68,7 +86,7 @@ def test_fallback_mode():
         if original_uri:
             os.environ['MONGODB_URI'] = original_uri
 
-def test_database_operations():
+def check_database_operations():
     """Test basic database operations if MongoDB is available"""
     print("\n🧪 Testing database operations...")
     
@@ -137,7 +155,7 @@ def test_database_operations():
     else:
         print("❌ Failed to create session")
 
-def test_analytics_queries():
+def check_analytics_queries():
     """Test analytics queries"""
     print("\n🧪 Testing analytics queries...")
     
@@ -183,13 +201,13 @@ def main():
     print("=" * 50)
 
     # Test fallback mode
-    test_fallback_mode()
+    check_fallback_mode()
     
     # Test database operations
-    test_database_operations()
+    check_database_operations()
     
     # Test analytics
-    test_analytics_queries()
+    check_analytics_queries()
     
     print("\n✅ All tests completed!")
     print("\n📋 Usage examples:")
