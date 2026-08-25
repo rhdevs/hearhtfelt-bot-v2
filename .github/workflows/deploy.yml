@@ -11,12 +11,25 @@ on:
 # INVARIANT: two deploys must never run at once, and a PR run must never delay or
 # cancel an in-flight deploy.
 #
-# The group is ref-scoped so main-deploys serialise against each other while each
-# PR gets its own lane -- with a single shared group, a live deploy could queue
-# behind unrelated PR test runs. cancel-in-progress is true ONLY for pull_request,
-# so a superseded PR run is dropped but a deploy is never interrupted.
+# The group must be scoped by EVENT, not by ref. Scoping it by ref alone
+# (deploy-heartfelt-bot-${{ github.ref }}) breaks the first half of the invariant:
+# workflow_dispatch can be run on ANY branch and only pull_request is excluded from
+# build-and-push, so a dispatch on a feature branch reaches `deploy` in a different
+# concurrency group from a push to main, and the two deploy jobs run at the same
+# time against the same droplet. deploy/deploy.sh is not concurrency-safe -- it
+# renames the live container aside, `docker run --name heartfelt-bot`, and rm -f's
+# the rollback target, all under `set -euo pipefail`. Two overlapping runs can
+# delete each other's rollback container or leave the bot renamed and stopped, and
+# in the window where both containers are up, Telegram's single-poller rule means
+# getUpdates 409s and messages from people in distress are dropped.
+#
+# So: everything that can deploy (push to main, workflow_dispatch on any ref)
+# shares ONE lane and serialises, exactly as the pre-gate workflow did. Only
+# pull_request runs are per-ref, which is what stops a live deploy queueing behind
+# unrelated PR test runs. cancel-in-progress is true ONLY for pull_request, so a
+# superseded PR run is dropped and a deploy is never interrupted.
 concurrency:
-  group: deploy-heartfelt-bot-${{ github.ref }}
+  group: ${{ github.event_name == 'pull_request' && format('heartfelt-bot-pr-{0}', github.ref) || 'heartfelt-bot-deploy' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
