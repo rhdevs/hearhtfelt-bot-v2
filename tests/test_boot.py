@@ -487,6 +487,44 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
 
 # --------------------------------------------------------------- negative cases
 
+# Both negative cases assert that main() RETURNS. A bare asyncio.run(main.main())
+# cannot express that: if the guard under test regresses, main() does not return,
+# it falls through to `await asyncio.Event().wait()` in the `async with` block and
+# runs forever. Measured with main.py's BOT_TOKEN guard neutralised: the suite hung
+# until killed at 60s, exit 124, with no assertion message. In CI that consumes the
+# test job's whole `timeout-minutes: 10` budget and the run reports "cancelled"
+# rather than naming the broken invariant -- ten minutes of latency on every deploy
+# to a live helpline, and a failure nobody can read.
+#
+# 10s is ~1000x what these take with fakes (they finish in milliseconds) and is far
+# below the job timeout, so a slow runner cannot make this flaky. On a passing run
+# the timeout never engages and the suite still finishes in ~2s.
+#
+# How the failure actually surfaces: wait_for cancels main() on expiry, and main.py
+# CATCHES asyncio.CancelledError around `asyncio.Event().wait()`, so it unwinds
+# through its own `finally` and returns normally -- which means wait_for returns
+# rather than raising TimeoutError. So the timeout is what BOUNDS the hang; the
+# caller's existing `assert events == []` is what REPORTS it, and it reports well,
+# naming every boot step that should never have happened. The TimeoutError branch
+# below is defence for a future main() that does not swallow cancellation.
+_RETURN_TIMEOUT_SECONDS = 10
+
+
+def _run_main_expecting_return(why):
+    """Run main() under a time bound so a regressed guard fails instead of hanging."""
+    async def _drive():
+        try:
+            await asyncio.wait_for(main.main(), timeout=_RETURN_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            raise AssertionError(
+                f"main() did not return within {_RETURN_TIMEOUT_SECONDS}s. {why} "
+                "Instead it reached `await asyncio.Event().wait()` and would run "
+                "forever, so the guard that should have returned early is gone."
+            ) from None
+
+    asyncio.run(_drive())
+
+
 def test_no_token_returns_immediately():
     events = []
     fakes = _make_fakes(events)
@@ -494,7 +532,9 @@ def test_no_token_returns_immediately():
     svc_saved = _save_services()
     try:
         _enable_services()
-        asyncio.run(main.main())
+        _run_main_expecting_return(
+            "With no BOT_TOKEN it must return at main.py's `if not BOT_TOKEN` guard."
+        )
     finally:
         _restore(saved)
         _restore_services(svc_saved)
@@ -512,7 +552,10 @@ def test_no_runnable_service_returns_immediately():
         # HF has no channel, PSS disabled -> enabled_services() is empty.
         _enable_services(hf_channel=None, pss_channel=None)
         assert config.enabled_services() == [], "precondition: no service may be runnable"
-        asyncio.run(main.main())
+        _run_main_expecting_return(
+            "With no runnable service it must return at main.py's "
+            "'No runnable services configured' guard."
+        )
     finally:
         _restore(saved)
         _restore_services(svc_saved)
