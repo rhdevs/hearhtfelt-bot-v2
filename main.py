@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from telegram import BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from config import (
     BOT_TOKEN,
@@ -25,6 +26,28 @@ logging.basicConfig(
 # Quiet httpx: its INFO logs print full Telegram API URLs, which contain the bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+# The Telegram command menu. /help is a live handler but deliberately NOT listed:
+# showing both /chat and /help invites "what's the difference?" and undercuts /chat
+# as the primary entry point. /start is offered by Telegram itself in new chats.
+BOT_COMMANDS = [
+    BotCommand("chat", "Request support (start here)"),
+    BotCommand("status", "Check your queue or conversation status"),
+    BotCommand("cancel", "Leave the queue if you're waiting"),
+    BotCommand("end", "End your current conversation"),
+]
+
+
+async def register_bot_commands(bot) -> bool:
+    """Publish the Telegram command menu. Never fatal -- a failure here must not
+    abort boot, and re-running it every boot is idempotent and self-healing."""
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+        logger.info("✅ Command menu registered: %s", ", ".join("/" + c.command for c in BOT_COMMANDS))
+        return True
+    except Exception as exc:
+        logger.warning("Could not register command menu (continuing): %s", exc)
+        return False
 
 async def main():
     """Main function to start the bot"""
@@ -91,7 +114,8 @@ async def main():
     
     # Register handlers
     application.add_handler(CommandHandler("start", handlers.start_command))
-    application.add_handler(CommandHandler("help", handlers.help_command))
+    # One handler, two names: /help stays alive for posters and existing users.
+    application.add_handler(CommandHandler(["chat", "help"], handlers.chat_command))
     application.add_handler(CommandHandler("end", handlers.end_command))
     application.add_handler(CommandHandler("status", handlers.status_command))
     application.add_handler(CommandHandler("cancel", handlers.cancel_command))
@@ -112,7 +136,7 @@ async def main():
     application.add_error_handler(handlers.handle_error)
     
     # Start the bot
-    logger.info("Starting Heartfelt Anonymous Helpline Bot...")
+    logger.info("Starting Care Network Bot...")
 
     # Validate channel access for every enabled service
     logger.info("Validating channel access for enabled services...")

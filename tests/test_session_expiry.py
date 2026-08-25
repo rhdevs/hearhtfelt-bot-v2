@@ -133,8 +133,8 @@ class TestSessionExpiry(unittest.TestCase):
         
         self.session_manager.create_session(user_id, heartfelt_id, session_id)
         
-        # Simulate 6-minute old activity (should trigger warning)
-        old_time = utcnow() - datetime.timedelta(minutes=6)
+        # Simulate 26-minute old activity (HF warns from 25 min idle)
+        old_time = utcnow() - datetime.timedelta(minutes=26)
         active_sessions[session_id]['last_activity_at'] = old_time
         
         # Run warning check
@@ -164,8 +164,8 @@ class TestSessionExpiry(unittest.TestCase):
             user_states[user_id] = UserState.IN_CONVERSATION
             user_states[heartfelt_id] = UserState.IN_CONVERSATION
             
-            # Simulate 11-minute old activity (should trigger expiry)
-            old_time = utcnow() - datetime.timedelta(minutes=11)
+            # Simulate 31-minute old activity (HF expires at 30 min idle)
+            old_time = utcnow() - datetime.timedelta(minutes=31)
             active_sessions[session_id]['last_activity_at'] = old_time
             
             # Run expiry
@@ -188,8 +188,8 @@ class TestSessionExpiry(unittest.TestCase):
         """Test full cleanup cycle with multiple sessions"""
         # Create multiple sessions with different activity times
         sessions_data = [
-            ("session-1", 12345, 67890, 11),  # Should expire
-            ("session-2", 12346, 67891, 6),   # Should warn
+            ("session-1", 12345, 67890, 31),  # Should expire (>= 30)
+            ("session-2", 12346, 67891, 26),  # Should warn (>= 25, < 30)
             ("session-3", 12347, 67892, 2),   # Should do nothing
         ]
         
@@ -233,12 +233,15 @@ class TestSessionExpiry(unittest.TestCase):
         heartfelt_id = 67890
         self.session_manager.create_session(user_id, heartfelt_id, session_id)
         
-        old_time = utcnow() - datetime.timedelta(minutes=6)
+        old_time = utcnow() - datetime.timedelta(minutes=26)
         active_sessions[session_id]['last_activity_at'] = old_time
         
-        # Mock the cleanup to see if warning would be sent
+        # Mock the cleanup to see if warning would be sent. The warning band opens
+        # at (timeout - warning lead) = 30 - 5 = 25 minutes of idleness.
+        from config import SESSION_TIMEOUT_MINUTES, SESSION_WARNING_MINUTES
         now = utcnow()
-        warning_cutoff = now - datetime.timedelta(minutes=5)
+        warning_cutoff = now - datetime.timedelta(
+            minutes=SESSION_TIMEOUT_MINUTES - SESSION_WARNING_MINUTES)
         
         sessions_to_warn = []
         for sid, session_data in active_sessions.items():
@@ -256,13 +259,23 @@ class TestSessionExpiryIntegration(unittest.TestCase):
     def test_constants_configuration(self):
         """Test that all required constants are properly configured"""
         from config import (
-            SESSION_TIMEOUT_MINUTES, SESSION_WARNING_MINUTES, 
-            SESSION_SWEEP_SECONDS, MESSAGES
+            SESSION_TIMEOUT_MINUTES, SESSION_WARNING_MINUTES,
+            SESSION_SWEEP_SECONDS, QUEUE_EXPIRE_MINUTES, SERVICES, MESSAGES
         )
         
-        self.assertEqual(SESSION_TIMEOUT_MINUTES, 10)
+        # DELIBERATE Phase 2 change: the HF idle timeout moved 10 -> 30 minutes,
+        # so a conversation now warns at 25 min idle and closes at 30.
+        self.assertEqual(SESSION_TIMEOUT_MINUTES, 30)
         self.assertEqual(SESSION_WARNING_MINUTES, 5)
         self.assertEqual(SESSION_SWEEP_SECONDS, 180)
+        self.assertEqual(QUEUE_EXPIRE_MINUTES, 60)
+
+        # The module-level constants are only deprecated aliases now; the values
+        # that actually drive behaviour live on the HF Service.
+        hf = SERVICES['hf']
+        self.assertEqual(hf.session_timeout_minutes, SESSION_TIMEOUT_MINUTES)
+        self.assertEqual(hf.session_warning_minutes, SESSION_WARNING_MINUTES)
+        self.assertEqual(hf.queue_expire_minutes, QUEUE_EXPIRE_MINUTES)
         
         # Check required messages exist
         required_messages = [

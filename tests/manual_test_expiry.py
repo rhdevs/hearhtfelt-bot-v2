@@ -68,9 +68,9 @@ async def demonstrate_session_expiry():
     print(f"   ✅ Messages exchanged, activity updated")
     print(f"   🕐 Last activity: {active_sessions[session_id]['last_activity_at']}")
     
-    # Fast-forward time to trigger warning (simulate 6 minutes of inactivity)
-    print(f"\n3. Fast-forwarding 6 minutes (warning threshold)...")
-    old_time = utcnow() - datetime.timedelta(minutes=6)
+    # Fast-forward time to trigger warning (HF warns from 25 minutes of inactivity)
+    print(f"\n3. Fast-forwarding 26 minutes (warning threshold)...")
+    old_time = utcnow() - datetime.timedelta(minutes=26)
     active_sessions[session_id]['last_activity_at'] = old_time
     
     print(f"   🕐 Simulated last activity: {old_time}")
@@ -87,7 +87,7 @@ async def demonstrate_session_expiry():
     
     # Fast-forward time to trigger expiry (simulate 11 minutes total)
     print(f"\n5. Fast-forwarding 5 more minutes (expiry threshold)...")
-    old_time = utcnow() - datetime.timedelta(minutes=11)
+    old_time = utcnow() - datetime.timedelta(minutes=31)
     active_sessions[session_id]['last_activity_at'] = old_time
     
     print(f"   🕐 Simulated last activity: {old_time}")
@@ -111,8 +111,8 @@ async def demonstrate_session_expiry():
     print(f"\n🎉 Demonstration complete!")
     print(f"Summary:")
     print(f"  - Session created and messages exchanged")
-    print(f"  - Warning sent after 5+ minutes of inactivity") 
-    print(f"  - Session expired after 10+ minutes of inactivity")
+    print(f"  - Warning sent after 25+ minutes of inactivity")
+    print(f"  - Session expired after 30+ minutes of inactivity")
     print(f"  - Both parties notified appropriately")
     print(f"  - User states reset to IDLE")
 
@@ -136,11 +136,11 @@ async def demonstrate_activity_reset():
     user_id = 11111
     heartfelt_id = 22222
     
-    print(f"\n1. Creating session and simulating 6 minutes of inactivity...")
+    print(f"\n1. Creating session and simulating 26 minutes of inactivity...")
     session_manager.create_session(user_id, heartfelt_id, session_id)
     
     # Simulate inactivity to trigger warning
-    old_time = utcnow() - datetime.timedelta(minutes=6)
+    old_time = utcnow() - datetime.timedelta(minutes=26)
     active_sessions[session_id]['last_activity_at'] = old_time
     
     # Run cleanup to send warning

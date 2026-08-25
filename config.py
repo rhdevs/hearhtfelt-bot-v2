@@ -19,6 +19,15 @@ ADMIN_CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID")
 PSS_CHANNEL_ID = os.getenv("PSS_CHANNEL_ID")   # unset in Phase 1 -> None (PSS not runnable)
 MONGODB_URI = os.getenv("MONGODB_URI")
 
+# Public document links, not secrets. Env-overridable so a real PSS policy can be
+# swapped in without a code deploy; both default to today's umbrella document.
+PRIVACY_POLICY_URL = os.getenv(
+    "PRIVACY_POLICY_URL",
+    "https://docs.google.com/document/d/1pWvutw151h_sypdttkwEH7hDiBwBdX-qF_xJypffn7Y/edit?usp=sharing",
+)
+HF_PRIVACY_POLICY_URL = os.getenv("HF_PRIVACY_POLICY_URL", PRIVACY_POLICY_URL)
+PSS_PRIVACY_POLICY_URL = os.getenv("PSS_PRIVACY_POLICY_URL", PRIVACY_POLICY_URL)
+
 
 class AuthorizedMembersStore:
     """Thread-safe in-memory store for authorized heartfelt members."""
@@ -139,6 +148,21 @@ class Service:
     roster: "AuthorizedMembersStore"
     enabled: bool              # explicit on/off flag
 
+    # Everything below MUST carry a default and stay AFTER `enabled`: every field
+    # above is non-default, and a defaulted field before them is a TypeError.
+
+    # Requester-facing copy
+    sharing_clause: str = "shared anonymously with our support team"
+    privacy_policy_url: str = PRIVACY_POLICY_URL
+
+    # Per-track timers, all in minutes.
+    queue_expire_minutes: int = 60      # how long a pending request waits in the channel
+    session_timeout_minutes: int = 30   # idle timeout for a claimed conversation
+    session_warning_minutes: int = 5    # LEAD TIME before expiry at which we warn,
+                                        # i.e. the warning fires at
+                                        # (session_timeout_minutes - session_warning_minutes)
+                                        # of idleness, NOT at this much idleness.
+
     @property
     def runnable(self) -> bool:
         # A service is only offered/posted-to when enabled AND fully configured with a channel.
@@ -157,6 +181,11 @@ SERVICES: Dict[str, Service] = {
         default_members=DEFAULT_HEARTFELT_MEMBERS,
         roster=AuthorizedMembersStore(DEFAULT_HEARTFELT_MEMBERS),
         enabled=True,
+        sharing_clause="shared anonymously with our support team",
+        privacy_policy_url=HF_PRIVACY_POLICY_URL,
+        queue_expire_minutes=60,
+        session_timeout_minutes=30,
+        session_warning_minutes=5,     # warns at 25 min idle
     ),
     ServiceType.PSS.value: Service(
         key=ServiceType.PSS.value,
@@ -169,6 +198,12 @@ SERVICES: Dict[str, Service] = {
         default_members=DEFAULT_PSS_MEMBERS,
         roster=AuthorizedMembersStore(DEFAULT_PSS_MEMBERS),
         enabled=_env_bool("PSS_ENABLED", False),  # False in Phase 1
+        sharing_clause="shared with our peer student supporters",
+        privacy_policy_url=PSS_PRIVACY_POLICY_URL,
+        queue_expire_minutes=1440,     # 24h: peer supporters answer on a student timetable
+        session_timeout_minutes=1440,  # 24h
+        session_warning_minutes=60,    # warns at 23h idle; a 5-min lead on a 24h window
+                                       # is unactionable noise at 3am. See D4.
     ),
 }
 
@@ -219,13 +254,20 @@ user_to_service_map = {}  # user_id -> chosen service key (set at /chat or via t
 # from one set, or a session can be created with an id a queue entry already holds.
 used_anonymous_ids: Set[str] = set()
 
-QUEUE_EXPIRE_MINUTES = 60
 AUTHORIZED_MEMBER_REFRESH_SECONDS = 300  # Interval for refreshing Heartfelt members from DB
 
-# Session timeout settings
-SESSION_TIMEOUT_MINUTES = 10      # Auto-expire sessions after 10 minutes of inactivity
-SESSION_WARNING_MINUTES = 5       # Send warning 5 minutes before expiry
+# INVARIANT: SESSION_SWEEP_SECONDS must be < (min service_warning_minutes * 60),
+# or a session can expire without ever being warned. Currently 180 < 300 (HF).
+# The binding constraint is the SHORTEST warning band, not the longest timeout:
+# HF's band is [25 min, 30 min), five minutes wide, and a 180s sweep guarantees at
+# least one tick inside it. Lengthening this sweep breaks that guarantee.
 SESSION_SWEEP_SECONDS = 180       # Check for expired sessions every 3 minutes
+
+# Deprecated module-level aliases. Kept so external imports don't break; they mirror
+# the HF service. New code MUST read these values off a Service.
+QUEUE_EXPIRE_MINUTES = SERVICES[ServiceType.HF.value].queue_expire_minutes      # 60
+SESSION_TIMEOUT_MINUTES = SERVICES[ServiceType.HF.value].session_timeout_minutes  # 30
+SESSION_WARNING_MINUTES = SERVICES[ServiceType.HF.value].session_warning_minutes  # 5
 
 # Feature flags
 PHOTO_SHARING_ENABLED = True      # Allow users to send photos
@@ -236,31 +278,39 @@ session_warnings = {}             # session_id -> bool (has warning been sent?)
 
 MESSAGES = {
     "welcome": (
-        "Welcome to the HeaRHtfelt Companion Helpline! 🤗\n\n"
-        "This is a safe, anonymous space where you can speak with one of our companions.\n\n"
+        "Welcome to the Care Network Bot 🤗\n\n"
+        "This is a safe, anonymous space where you can talk things through with "
+        "someone from the Care Network.\n\n"
         "📋 How it works:\n"
-        "1️⃣ Use /help to request support\n"
-        "2️⃣ Describe what you need help with\n"
+        "1️⃣ Use /chat to request support\n"
+        "2️⃣ Describe what you'd like help with\n"
         "3️⃣ You'll be placed in a queue\n"
-        "4️⃣ One of our companions will connect with you anonymously\n"
+        "4️⃣ Someone from the Care Network will connect with you anonymously\n"
         "5️⃣ Chat freely - share text, photos, and stickers\n"
         "6️⃣ Use /end when you're ready to finish\n\n"
         "🔒 Complete anonymity guaranteed\n"
         "💚 Confidential and judgment-free\n"
         "📸 Photos and media supported\n\n"
         "Commands:\n"
-        "/help - Request support (start here!)\n"
+        "/chat - Request support (start here!)\n"
         "/status - Check your queue status\n"
         "/cancel - Leave the queue if you're waiting\n"
         "/end - End your current conversation\n\n"
+        "(/help still works and does exactly the same thing as /chat.)\n\n"
         "We value your privacy. Please review our full privacy policy here:\n"
-        "https://docs.google.com/document/d/1pWvutw151h_sypdttkwEH7hDiBwBdX-qF_xJypffn7Y/edit?usp=sharing"
+        f"{PRIVACY_POLICY_URL}"
     ),
     "choose_service": "Which kind of support would you like? Please choose below.",
-    "help_request": "Please describe what you'd like help with. Your message will be shared anonymously with our support team. You can use /cancel to cancel.",
+    # Template: rendered per-track by help_request_text(). Never send it raw.
+    "help_request": (
+        "Please describe what you'd like help with. "
+        "Your message will be {sharing_clause}. "
+        "You can use /cancel to cancel.\n\n"
+        "Privacy policy: {privacy_url}"
+    ),
     "queue_added": "Thank you. You've been added to the queue. A support member will be with you shortly.",
     "conversation_started": "A support member has joined the conversation. You can now chat anonymously.",
-    "conversation_ended": "The conversation has ended. Thank you for using our service. Take care! 💚",
+    "conversation_ended": "The conversation has ended. Thank you for using the Care Network. Take care! 💚",
     "conversation_ended_heartfelt": "This conversation has ended. Thank you for helping someone today! 💚",
     "no_active_conversation": "You don't have an active conversation to end.",
     "already_in_queue": "You're already in the queue. Please wait for a support member to connect with you.",
@@ -270,26 +320,40 @@ MESSAGES = {
         "You are currently in the queue. We'll notify you as soon as a {member} is available."
     ),
     "conversation_status": "You are currently in a conversation with a support member.",
-    "idle_status": "You are not currently in a queue or conversation. Use /help to start.",
+    "idle_status": "You are not currently in a queue or conversation. Use /chat to start.",
     "channel_error": "⚠️ Our support system is temporarily unavailable. Please try again in a few minutes. If this continues, our technical team has been notified.",
     "channel_access_denied": "Bot doesn't have permission to access the admin channel. Please contact the administrator.",
     "queue_system_offline": "The queue system is currently offline. Your request has been noted but may experience delays.",
-    "queue_cancelled": "✅ You have been removed from the queue. Thank you for considering our support service. You can use /help again anytime if you need assistance.",
+    "queue_cancelled": "✅ You have been removed from the queue. Thank you for considering our support service. You can use /chat again anytime if you need assistance.",
     "help_request_cancelled": (
-        "Your help request has been cancelled. You can use /help again anytime when you're ready."
+        "Your help request has been cancelled. You can use /chat again anytime when you're ready."
     ),
     "queue_expired": (
         "⏱️ Your place in the queue expired because no {member} was available in time. "
-        "You can use /help to join the queue again whenever you're ready."
+        "You can use /chat to join the queue again whenever you're ready."
     ),
-    "not_in_queue": "You are not currently in the queue. Use /help to request support or /status to check your current status.",
+    "not_in_queue": "You are not currently in the queue. Use /chat to request support or /status to check your current status.",
     "cancel_error": "There was an error removing you from the queue. Please try again or use /status to check your current status.",
-    "session_warning": "⏰ Are you still there? This conversation will automatically close in 5 minutes if there's no activity.",
-    "session_expired": "⏱️ This conversation has been automatically closed due to inactivity. You can start a new conversation anytime with /help. Take care! 💚",
+    # Template: rendered per-track by SessionExpiryManager._send_session_warning,
+    # which is the ONLY sender. Anything else sending it raw shows a literal {duration}.
+    "session_warning": (
+        "⏰ Are you still there? This conversation will automatically close in "
+        "{duration} if there's no activity."
+    ),
+    "session_expired": "⏱️ This conversation has been automatically closed due to inactivity. You can start a new conversation anytime with /chat. Take care! 💚",
     "session_expired_heartfelt": "⏱️ This conversation has been automatically closed due to inactivity. Thank you for your time helping someone today! 💚",
     "photo_size_limit": "⚠️ Photo is too large. Please send a smaller image (max 10MB).",
     "photo_error": "❌ Unable to send photo. Please try again or use text instead."
 }
+
+
+def help_request_text(service_key: Optional[str]) -> str:
+    """Per-track description prompt, including that track's privacy policy link."""
+    svc = get_service(service_key)
+    return MESSAGES["help_request"].format(
+        sharing_clause=svc.sharing_clause,
+        privacy_url=svc.privacy_policy_url,
+    )
 
 
 def is_heartfelt_member(user_id: int) -> bool:

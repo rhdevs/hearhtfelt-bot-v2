@@ -86,6 +86,8 @@ def reset_state():
               config.session_warnings):
         d.clear()
     config.queue_order.clear()
+    config.used_anonymous_ids.clear()
+    config.safety_logs.clear()
 
 
 def enable_both_services():
@@ -111,20 +113,24 @@ async def run():
     qm = QueueManager(bot)
     handlers = BotHandlers(sm, qm)
 
-    # 1. Requester runs /help -> chooser with two buttons
-    await handlers.help_command(make_text_update(REQUESTER_PSS, "/help", rec), ctx)
+    # 1. Requester runs /chat -> chooser with two buttons
+    await handlers.chat_command(make_text_update(REQUESTER_PSS, "/chat", rec), ctx)
     assert config.user_states[REQUESTER_PSS] == UserState.WAITING_FOR_SERVICE
     last_text, markup = rec.replies[-1]
     buttons = [b for row in markup.inline_keyboard for b in row]
     cbs = sorted(b.callback_data for b in buttons)
     assert cbs == ["svc_hf", "svc_pss"], f"expected two service buttons, got {cbs}"
-    print("OK  1. /help shows the two-service chooser")
+    print("OK  1. /chat shows the two-service chooser")
 
     # 2. Requester picks PSS
     await handlers.handle_callback_query(make_callback_update(REQUESTER_PSS, "svc_pss", rec), ctx)
     assert config.user_to_service_map[REQUESTER_PSS] == "pss"
     assert config.user_states[REQUESTER_PSS] == UserState.WAITING_FOR_DESCRIPTION
-    print("OK  2. Requester selects PSS")
+    prompt, _ = rec.replies[-1]
+    assert "peer student supporters" in prompt, prompt
+    assert config.PSS_PRIVACY_POLICY_URL in prompt, prompt
+    assert "our support team" not in prompt, "PSS must not use the HF sharing clause"
+    print("OK  2. Requester selects PSS and sees the PSS sharing clause + privacy link")
 
     # 3. Requester describes issue -> posts to the PSS channel with PSS title
     await handlers.handle_message(make_text_update(REQUESTER_PSS, "I need peer support", rec), ctx)
@@ -168,8 +174,12 @@ async def run():
     ctx2 = SimpleNamespace(bot=bot2)
     sm.bot = bot2  # relay uses the manager's bot
     qm.bot = bot2
+    # deliberately via the /help ALIAS, to prove it still reaches chat_command
     await handlers.help_command(make_text_update(REQUESTER_HF, "/help", rec2), ctx2)
     await handlers.handle_callback_query(make_callback_update(REQUESTER_HF, "svc_hf", rec2), ctx2)
+    hf_prompt, _ = rec2.replies[-1]
+    assert "our support team" in hf_prompt, hf_prompt
+    assert config.HF_PRIVACY_POLICY_URL in hf_prompt, hf_prompt
     await handlers.handle_message(make_text_update(REQUESTER_HF, "just need a listening ear", rec2), ctx2)
     hf_posts = [s for s in rec2.sent if s[0] == HF_CHANNEL]
     assert hf_posts and "New Help Request" in hf_posts[-1][1]
@@ -179,7 +189,7 @@ async def run():
     await handlers.handle_message(make_text_update(HF_MEMBER, "hello", rec2), ctx2)
     to_hf_requester = [s for s in rec2.sent if s[0] == str(REQUESTER_HF)]
     assert to_hf_requester and "Hearhtfelt Member:" in to_hf_requester[-1][1], "HF requester should see 'Hearhtfelt Member'"
-    print("OK  7. HF track runs in parallel with the 'Hearhtfelt Member' label")
+    print("OK  7. HF track runs in parallel via the /help alias, with the HF label and copy")
 
 
 if __name__ == "__main__":
