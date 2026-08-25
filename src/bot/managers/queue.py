@@ -186,6 +186,26 @@ class QueueManager:
                 logger.info("Queue %s already claimed (DB guard); ignoring duplicate claim by %s", queue_id, heartfelt_member_id)
                 return None
 
+        # Take the entry out of the queue NOW -- synchronously, before the first
+        # await -- so the in-memory claim is as atomic as the DB one above.
+        #
+        # This used to happen after `await self._edit_claimed_message(...)`. That
+        # await yields, and if the 5-minute queue_cleanup_loop resumes in the gap
+        # while the entry is past its window, cleanup_expired_queues still sees it,
+        # pops it, and sweep_expired_queues closes the row -- whose status the claim
+        # just flipped to 'active', which end_session's {pending, active} filter
+        # happily matches. The requester was DMed "your place in the queue expired"
+        # and then connected to a companion a moment later, with the conversation's
+        # Mongo row already ended as 'queue_expired': no transcript close, no
+        # activity updates, and nothing for rehydration to restore.
+        #
+        # `queue_entry` is a local reference, so the edit below still works.
+        queue_entries.pop(queue_id, None)
+        if user_id in user_to_queue_map:
+            del user_to_queue_map[user_id]
+        if queue_id in queue_order:
+            queue_order.remove(queue_id)
+
         # Edit the queue message to show it's been claimed instead of deleting it
         try:
             if message_id:
@@ -201,15 +221,6 @@ class QueueManager:
             except Exception as delete_error:
                 print(f"Error deleting queue message as fallback: {delete_error}")
 
-        # Remove from queue and clean up indices
-        queue_entries.pop(queue_id, None)
-        
-        # Clean up O(1) lookup indices
-        if user_id in user_to_queue_map:
-            del user_to_queue_map[user_id]
-        if queue_id in queue_order:
-            queue_order.remove(queue_id)
-        
         return user_id
     
     async def _edit_claimed_message(self, queue_entry: dict, heartfelt_member_name: str):

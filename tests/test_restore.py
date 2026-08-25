@@ -735,6 +735,45 @@ def case_v_end_session_return_is_a_commit_signal():
     print("OK  v. end_session returns True whenever the atomic close committed")
 
 
+async def case_w_claim_is_atomic_against_the_cleanup_loop():
+    """A member claiming a request that is just past its window must not have it
+    expired out from under them mid-claim.
+
+    claim_queue awaits on editing the channel post. If the 5-minute
+    queue_cleanup_loop resumes during that await while the entry is still in
+    queue_entries, cleanup_expired_queues pops it and sweep_expired_queues closes
+    the row -- which the claim has just flipped to 'active', and end_session's
+    {pending, active} filter matches it. The requester gets "your place in the queue
+    expired" and is then connected to a companion anyway, on a session whose Mongo
+    row is already ended.
+
+    The re-entrant sweep inside edit_message_text below is exactly that interleaving.
+    """
+    reset_state()
+    user_id = 7001
+    doc = pending_doc("q-race", user_id, 61)       # HF window is 60 min: just past it
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+    restore_state(qm, sm)
+    assert config.user_states[user_id] == UserState.IN_QUEUE
+
+    async def edit_then_yield_to_cleanup(*a, **kw):
+        await qm.sweep_expired_queues()
+        return None
+    bot.edit_message_text = edit_then_yield_to_cleanup
+
+    claimed = await qm.claim_queue("q-race", HF_MEMBER, "Companion")
+
+    assert claimed == user_id, f"the claim itself must still succeed, got {claimed!r}"
+    assert stub.end_reason_for("q-race") != 'queue_expired', (
+        "the sweep closed a conversation that had just been claimed; its row is now "
+        "ended, so activity updates and /end will silently no-op")
+    assert bot.texts_to(user_id) == [], (
+        f"the requester must never be told their request expired moments before "
+        f"being connected: {bot.texts_to(user_id)}")
+    print("OK  w. a claim cannot be expired out from under itself by the cleanup loop")
+
+
 # --------------------------------------------------------------------------- runner
 async def run():
     case_a_happy_pending()
@@ -759,6 +798,7 @@ async def run():
     await case_t_recently_dead_sessions_still_notify()
     await case_u_exactly_once_across_two_instances()
     case_v_end_session_return_is_a_commit_signal()
+    await case_w_claim_is_atomic_against_the_cleanup_loop()
 
 
 if __name__ == "__main__":
