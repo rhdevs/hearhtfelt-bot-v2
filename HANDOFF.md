@@ -31,9 +31,12 @@ made the bot survive a restart. See §5b for the runbook items that branch adds.
 - **Droplet:** `root@137.184.251.240` (DigitalOcean, Docker). Container name
   `heartfelt-bot`, `--restart unless-stopped`, env from
   `/root/heartfelt-bot/.env`.
-- **Pipeline:** `.github/workflows/deploy.yml` — on push to `main`: build → push
-  GHCR → SSH to droplet → `deploy/deploy.sh` (pull, swap container w/ health
-  check + auto-rollback). **To deploy: just push to `main`.**
+- **Pipeline:** `.github/workflows/deploy.yml` — on pull request: tests only; on
+  push to `main`: **tests →** build → push GHCR → SSH to droplet →
+  `deploy/deploy.sh` (pull, swap container w/ health check + auto-rollback).
+  **To deploy: just push to `main`.** A red test job blocks the deploy; there is
+  no way to deploy a commit whose tests failed except `workflow_dispatch`, which
+  also runs them.
   Watch: `gh run watch -R rhdevs/hearhtfelt-bot-v2`.
 - **GitHub secrets:** `DROPLET_HOST`, `DROPLET_USER`, `DROPLET_SSH_KEY`
   (dedicated ed25519 deploy key labelled `github-actions-deploy@heartfelt-bot`,
@@ -227,26 +230,50 @@ constraint is the shortest warning band (HF's 5 minutes), not the longest timeou
 A longer sweep could skip the band entirely and kill a conversation with no
 warning. `tests/test_service_config.py` asserts the invariant.
 
+**R6 — CI now gates deploys.**
+The `test` job in `.github/workflows/deploy.yml` runs first, and
+`build-and-push` (and therefore `deploy`) `needs: test`, so a red suite blocks
+the deploy. It runs the nine suites listed in §6 below, in that order.
+`tests/test_db_integration.py` is deliberately excluded: it needs a live Mongo
+and it **writes documents** — there must never be a `MONGODB_URI` secret in the
+test job. It also now refuses to run at all unless `ALLOW_DB_INTEGRATION_TEST=1`
+is set, exiting non-zero so a refusal cannot be mistaken for a pass.
+`tests/demo_session_expiry.py` is also excluded: it has zero
+assertions and always exits 0. By design, no secrets are available to the
+`test` job (`permissions: contents: read`, zero `secrets.` references in that
+job), so a fork PR can run the gate safely.
+
 ---
 
 ## 6. Tests
 
-Run from repo root (needs `python-dotenv`, `python-telegram-bot`, `pymongo`):
+Run from repo root (needs `python-dotenv`, `python-telegram-bot`, `pymongo`).
+This is exactly the set of files the CI `test` job runs, in the same order, so
+"run the tests locally" and "what the gate runs" can never diverge:
 ```bash
+python tests/test_dependency_pins.py     # installed versions == requirements.txt pins
+python tests/test_boot.py                # PTB API surface + main() boot ordering
 python tests/test_timeutil.py            # aware-UTC helpers
 python tests/test_service_config.py      # registry/parity + timer invariants
 python tests/test_copy.py                # requester-facing copy guards
 python tests/test_pss_flow.py            # full HF+PSS flow w/ fake bot (no DB)
 python tests/test_per_service_timers.py  # per-track queue/session expiry
 python tests/test_restore.py             # restart durability (the important one)
-ADMIN_CHANNEL_ID=-100 python tests/test_session_expiry.py
-python tests/manual_test_expiry.py       # narrated walkthrough
+python tests/test_session_expiry.py      # warn/expire lifecycle
 ```
+Not run by CI:
+```bash
+python tests/demo_session_expiry.py      # demo, no assertions, not in CI
+ALLOW_DB_INTEGRATION_TEST=1 python tests/test_db_integration.py   # needs a live MongoDB -- WRITES DOCUMENTS; never point it at production
+```
+Run these from a virtualenv built with `pip install -r requirements.txt`;
+`tests/test_dependency_pins.py` will tell you if you have not (it fails
+deliberately on a mismatched environment).
+
 On Windows set `PYTHONIOENCODING=utf-8` first, or the emoji in the output raise
-`UnicodeEncodeError` from the console codec.
+`UnicodeEncodeError` from the console codec. CI sets it too.
 `tests/test_pss_flow.py` proves: chooser, per-service channel routing,
 cross-roster claim rejection, correct labels, HF/PSS in parallel.
-`tests/test_db_integration.py` needs a live Mongo.
 
 ---
 

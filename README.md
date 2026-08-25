@@ -168,20 +168,34 @@ docker buildx build \
 
 No pytest required -- every suite is a standalone script.
 
+This is exactly the set of files the CI `test` job runs, in the same order, so
+"run the tests locally" and "what the gate runs" can never diverge:
+
 ```bash
+python tests/test_dependency_pins.py     # installed versions == requirements.txt pins
+python tests/test_boot.py                # PTB API surface + main() boot ordering
 python tests/test_timeutil.py            # aware-UTC helpers
 python tests/test_service_config.py      # service registry + timer invariants
 python tests/test_copy.py                # requester-facing copy guards
 python tests/test_pss_flow.py            # full HF+PSS flow with a fake bot
 python tests/test_per_service_timers.py  # per-track queue/session expiry
 python tests/test_restore.py             # restart durability
-ADMIN_CHANNEL_ID=-100 python tests/test_session_expiry.py
-python tests/manual_test_expiry.py       # narrated walkthrough
-python tests/test_db_integration.py      # needs a live MongoDB
+python tests/test_session_expiry.py      # warn/expire lifecycle
 ```
 
+Not run by CI:
+
+```bash
+python tests/demo_session_expiry.py      # demo, no assertions, not in CI
+ALLOW_DB_INTEGRATION_TEST=1 python tests/test_db_integration.py   # needs a live MongoDB -- WRITES DOCUMENTS; never point it at production
+```
+
+Run these from a virtualenv built with `pip install -r requirements.txt`;
+`tests/test_dependency_pins.py` will tell you if you have not (it fails
+deliberately on a mismatched environment).
+
 On Windows, set `PYTHONIOENCODING=utf-8` first or the emoji in the test output
-will raise `UnicodeEncodeError` from the console codec.
+will raise `UnicodeEncodeError` from the console codec. CI sets it too.
 
 Manual test flow: user sends `/chat` → describe issue → check the track's channel
 → claim → chat → `/end`
