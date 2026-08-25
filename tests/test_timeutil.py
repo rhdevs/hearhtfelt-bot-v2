@@ -87,6 +87,18 @@ def test_aware_and_naive_are_not_comparable():
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+
+    # A driver that discovers its own tests reports success when it discovers
+    # NOTHING. Verified: renaming the `test_` prefix in this file made it print
+    # "All 0 tests passed!" and exit 0 -- a fully green CI step, in front of a
+    # deploy to a live helpline, having run zero assertions. A refactor into a
+    # class, a rename, an import shadow or a bad merge all reach that state.
+    # Coverage here may grow; it may not silently shrink.
+    assert len(tests) >= 8, (
+        "expected at least 8 tests, collected %d (%s). Test discovery has "
+        "regressed -- fix the discovery, do not lower this number."
+        % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
+    )
     for t in tests:
         t()
         print(f"OK  {t.__name__}")
