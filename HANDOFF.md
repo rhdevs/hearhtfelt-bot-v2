@@ -145,6 +145,13 @@ The pending count is expected to be large: until this branch, neither queue expi
 nor `/cancel` ever closed its Mongo row, so the collection holds a long tail going
 back months. That is exactly what `STALE_NOTIFY_GRACE_MINUTES` protects against.
 
+You do NOT need to close the orphaned `active` rows by hand. The first boot closes
+them for you, and — since the stale-horizon fix — closes them **silently**: any
+session idle for longer than its own window plus `STALE_NOTIFY_GRACE_MINUTES`
+(HF: 30 + 120 = 150 min) is ended in Mongo with `end_reason:'idle_expired'` and
+neither party is messaged. Count them first anyway, so you can check the number
+against the boot log afterwards.
+
 **R3 — PSS has no privacy policy of its own yet.**
 `PSS_PRIVACY_POLICY_URL` falls back to the umbrella HF document. No URL was
 invented. When a real PSS policy exists, set `PSS_PRIVACY_POLICY_URL` in the
@@ -154,6 +161,21 @@ container recreate (see §5: `docker restart` does not reload `--env-file`).
 **R4 — the FIRST deploy of restart durability MUST be a dry run.**
 Rehydration reads every `pending` and `active` row at boot. On the first boot that
 set includes months of never-closed pending rows. Run it in a low-traffic window:
+
+> ⚠️ **`RESTORE_DRY_RUN=true` does not make the boot read-only.** It governs
+> rehydration only. The two expiry sweeps in step 4 of `main()` run on every boot
+> regardless of it, and the session sweep's DB-fallback branch still closes stale
+> `status:'active'` rows in Mongo. That is deliberate — it is what remediates R2 —
+> but do not read "dry run" as "touches nothing".
+>
+> The same caveat applies to the other two switches, and it used to be far worse:
+> `RESTORE_ENABLED=false` and a tripped `RESTORE_MAX_*` circuit breaker both leave
+> `active_sessions` empty, which makes *every* ancient row look like an orphan to
+> that fallback branch. Before the stale horizon existed, turning a safety switch
+> **on** strictly increased the number of people DMed — 60 orphaned rows and a
+> tripped circuit breaker sent 120 "your conversation has been closed" messages.
+> The horizon now caps all of these at zero, but the switches still are not a
+> global "do nothing" flag.
 
 ```bash
 ssh root@137.184.251.240
@@ -180,10 +202,15 @@ docker run -d --name heartfelt-bot --restart unless-stopped --env-file "$ENV" \
 ```
 
 Escape hatches, all env-only: `RESTORE_ENABLED=false` turns rehydration off
-entirely; `RESTORE_MAX_PENDING` / `RESTORE_MAX_ACTIVE` (default 50 each) abort it
+entirely (but see the warning above — it does not stop the expiry sweeps);
+`RESTORE_MAX_PENDING` / `RESTORE_MAX_ACTIVE` (default 50 each) abort rehydration
 if Mongo hands back more rows than expected; `STALE_NOTIFY_GRACE_MINUTES`
-(default 120) is the horizon past which a pending row is closed silently instead
-of notifying its requester.
+(default 120) is the horizon past which a row is closed silently instead of
+notifying anyone. That last one now applies to BOTH sides: a pending request older
+than `queue_expire_minutes + grace`, and a conversation idle longer than
+`session_timeout_minutes + grace`. It is the single knob governing "how long after
+the fact is a notification still kind rather than confusing", so raising it makes
+the bot chattier about old state and lowering it makes it quieter.
 
 **R5 — tell Ops and the HF leads about the timer change before it ships.**
 An HF conversation used to warn at 5 minutes idle and close at 10. It now warns at
