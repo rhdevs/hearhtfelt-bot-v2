@@ -42,6 +42,7 @@ class TestSessionExpiry(unittest.TestCase):
         self.mock_db_mgr.update_session_activity = Mock(return_value=True)
         self.mock_db_mgr.log_message = Mock(return_value=True)
         self.mock_db_mgr.end_session = Mock(return_value=True)
+        self.mock_db_mgr.get_sessions_by_activity = Mock(return_value=[])
     
     def reset_mocks(self):
         """Reset mock call counts"""
@@ -84,7 +85,14 @@ class TestSessionExpiry(unittest.TestCase):
         heartfelt_id = 67890
         
         # Mock database manager
-        with patch('src.bot.managers.session.db_mgr', self.mock_db_mgr):
+        # src.bot.managers.expiry.db_mgr must be patched too, not just the session
+        # manager's. It was left pointing at the real DBManager, so the mocked
+        # get_sessions_by_activity was never called and the sweep's DB-fallback
+        # branch ran against whatever db_mgr held -- the live production database,
+        # had anything in the same process called db_mgr.initialize() first
+        # (tests/test_db_integration.py does).
+        with (patch('src.bot.managers.session.db_mgr', self.mock_db_mgr),
+              patch('src.bot.managers.expiry.db_mgr', self.mock_db_mgr)):
             self.session_manager.create_session(user_id, heartfelt_id, session_id)
             
             old_activity = active_sessions[session_id]['last_activity_at']
@@ -109,7 +117,14 @@ class TestSessionExpiry(unittest.TestCase):
         user_id = 12345
         heartfelt_id = 67890
         
-        with patch('src.bot.managers.session.db_mgr', self.mock_db_mgr):
+        # src.bot.managers.expiry.db_mgr must be patched too, not just the session
+        # manager's. It was left pointing at the real DBManager, so the mocked
+        # get_sessions_by_activity was never called and the sweep's DB-fallback
+        # branch ran against whatever db_mgr held -- the live production database,
+        # had anything in the same process called db_mgr.initialize() first
+        # (tests/test_db_integration.py does).
+        with (patch('src.bot.managers.session.db_mgr', self.mock_db_mgr),
+              patch('src.bot.managers.expiry.db_mgr', self.mock_db_mgr)):
             self.session_manager.create_session(user_id, heartfelt_id, session_id)
             
             old_activity = active_sessions[session_id]['last_activity_at']
@@ -157,7 +172,14 @@ class TestSessionExpiry(unittest.TestCase):
         user_id = 12345
         heartfelt_id = 67890
         
-        with patch('src.bot.managers.session.db_mgr', self.mock_db_mgr):
+        # src.bot.managers.expiry.db_mgr must be patched too, not just the session
+        # manager's. It was left pointing at the real DBManager, so the mocked
+        # get_sessions_by_activity was never called and the sweep's DB-fallback
+        # branch ran against whatever db_mgr held -- the live production database,
+        # had anything in the same process called db_mgr.initialize() first
+        # (tests/test_db_integration.py does).
+        with (patch('src.bot.managers.session.db_mgr', self.mock_db_mgr),
+              patch('src.bot.managers.expiry.db_mgr', self.mock_db_mgr)):
             self.session_manager.create_session(user_id, heartfelt_id, session_id)
             
             # Set user states
@@ -195,7 +217,14 @@ class TestSessionExpiry(unittest.TestCase):
             ("session-3", 12347, 67892, 2),   # Should do nothing
         ]
         
-        with patch('src.bot.managers.session.db_mgr', self.mock_db_mgr):
+        # src.bot.managers.expiry.db_mgr must be patched too, not just the session
+        # manager's. It was left pointing at the real DBManager, so the mocked
+        # get_sessions_by_activity was never called and the sweep's DB-fallback
+        # branch ran against whatever db_mgr held -- the live production database,
+        # had anything in the same process called db_mgr.initialize() first
+        # (tests/test_db_integration.py does).
+        with (patch('src.bot.managers.session.db_mgr', self.mock_db_mgr),
+              patch('src.bot.managers.expiry.db_mgr', self.mock_db_mgr)):
             for session_id, user_id, heartfelt_id, minutes_ago in sessions_data:
                 self.session_manager.create_session(user_id, heartfelt_id, session_id)
                 user_states[user_id] = UserState.IN_CONVERSATION
@@ -223,7 +252,7 @@ class TestSessionExpiry(unittest.TestCase):
             self.assertEqual(user_states[12345], UserState.IDLE)  # Expired session user
             self.assertEqual(user_states[12346], UserState.IN_CONVERSATION)  # Warned session user
     
-    def test_warning_spam_prevention(self):
+    async def test_warning_spam_prevention(self):
         """Test that warnings are not sent repeatedly"""
         session_id = "test-session-6"
         
@@ -238,22 +267,18 @@ class TestSessionExpiry(unittest.TestCase):
         old_time = utcnow() - datetime.timedelta(minutes=26)
         active_sessions[session_id]['last_activity_at'] = old_time
         
-        # Mock the cleanup to see if warning would be sent. The warning band opens
-        # at (timeout - warning lead) = 30 - 5 = 25 minutes of idleness.
-        from config import SESSION_TIMEOUT_MINUTES, SESSION_WARNING_MINUTES
-        now = utcnow()
-        warning_cutoff = now - datetime.timedelta(
-            minutes=SESSION_TIMEOUT_MINUTES - SESSION_WARNING_MINUTES)
-        
-        sessions_to_warn = []
-        for sid, session_data in active_sessions.items():
-            last_activity = session_data.get('last_activity_at', session_data.get('created_at'))
-            if (last_activity <= warning_cutoff and 
-                not session_warnings.get(sid, False)):
-                sessions_to_warn.append((sid, session_data))
-        
-        # Should be empty because warning already sent
-        self.assertEqual(len(sessions_to_warn), 0)
+        # Drive the REAL sweep. This used to re-implement expiry.py's selection logic
+        # inline and then assert on the list the test itself had just built, so it
+        # passed whether or not the spam guard existed at all.
+        self.mock_bot.send_message.reset_mock()
+        with (patch('src.bot.managers.session.db_mgr', self.mock_db_mgr),
+              patch('src.bot.managers.expiry.db_mgr', self.mock_db_mgr)):
+            await self.expiry_manager._cleanup_expired_sessions()
+
+        self.assertEqual(
+            self.mock_bot.send_message.call_count, 0,
+            "session_warnings already marked this session warned; re-warning every "
+            "sweep is a nag loop aimed at someone in a support conversation")
 
 class TestSessionExpiryIntegration(unittest.TestCase):
     """Integration tests that can be run manually"""
@@ -337,7 +362,7 @@ def run_tests():
         
         print("\n📋 Testing warning spam prevention...")
         test_instance.setUp()
-        test_instance.test_warning_spam_prevention()
+        await test_instance.test_warning_spam_prevention()
         print("✅ Warning spam prevention works")
         
         print("\n📋 Testing configuration...")

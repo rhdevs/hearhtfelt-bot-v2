@@ -774,6 +774,120 @@ async def case_w_claim_is_atomic_against_the_cleanup_loop():
     print("OK  w. a claim cannot be expired out from under itself by the cleanup loop")
 
 
+async def case_x_expired_sweep_stays_quiet_if_row_closed_elsewhere():
+    """sweep_expired_queues gates the "your request expired" DM on winning the atomic
+    close. If another actor already moved the row -- the other instance during a
+    rollback, or the user's own /cancel -- telling them it expired is a lie."""
+    reset_state()
+    user_id = 7101
+    doc = pending_doc("q-x", user_id, 61)
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+    restore_state(qm, sm)
+    assert "q-x" in config.queue_entries
+
+    doc['status'] = 'ended'          # somebody else got there first
+
+    await qm.sweep_expired_queues()
+
+    assert bot.texts_to(user_id) == [], (
+        f"the row was already closed, so this DM is false: {bot.texts_to(user_id)}")
+    print("OK  x. an expiry whose row was closed elsewhere notifies nobody")
+
+
+async def case_y_only_users_still_in_queue_are_told():
+    """cleanup_expired_queues only sets notify for a user whose state is still
+    IN_QUEUE. Someone who has since been connected must not get a queue-expiry DM
+    in the middle of their conversation."""
+    reset_state()
+    user_id = 7201
+    doc = pending_doc("q-y", user_id, 61)
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+    restore_state(qm, sm)
+
+    # They have moved on since the entry was queued.
+    config.user_states[user_id] = UserState.IN_CONVERSATION
+
+    await qm.sweep_expired_queues()
+
+    assert "q-y" not in config.queue_entries, "the stale entry is still retired"
+    assert bot.texts_to(user_id) == [], (
+        f"a user who is no longer queued must not be told their place expired: "
+        f"{bot.texts_to(user_id)}")
+    assert config.user_states[user_id] == UserState.IN_CONVERSATION, (
+        "and their state must not be trampled back to IDLE")
+    print("OK  y. only a user still in the queue is told their place expired")
+
+
+async def case_z_inactivity_warning_fires_once_not_every_sweep():
+    """session_warnings is the spam guard. Without it the warning goes out on EVERY
+    sweep for the whole band -- for HF that is the same nag every 3 minutes from 25
+    to 30 minutes idle, to someone in a mental-health conversation."""
+    reset_state()
+    doc = active_doc("a-z", 7301, HF_MEMBER, 26)     # HF warns at 25, expires at 30
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+    restore_state(qm, sm)
+
+    await em.run_once()
+    after_first = len(bot.sent)
+    assert after_first == 2, f"both parties warned once: {bot.sent}"
+
+    await em.run_once()
+    await em.run_once()
+    assert len(bot.sent) == after_first, (
+        f"the warning repeated on later sweeps; this is a nag loop: {bot.sent}")
+    print("OK  z. the inactivity warning is sent once, not on every sweep")
+
+
+async def case_aa_activity_rearms_the_warning():
+    """The flip side of the spam guard: once someone speaks again, the flag must
+    reset, or a conversation that goes quiet a second time is killed with no warning
+    at all."""
+    reset_state()
+    doc = active_doc("a-aa", 7401, HF_MEMBER, 26)
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+    restore_state(qm, sm)
+
+    await em.run_once()
+    assert len(bot.sent) == 2 and config.session_warnings.get("a-aa") is True
+
+    sm.update_session_activity("a-aa")               # somebody replies
+    assert config.session_warnings.get("a-aa") is False, (
+        "activity must re-arm the warning flag")
+
+    # It goes quiet again.
+    config.active_sessions["a-aa"]['last_activity_at'] = utcnow() - datetime.timedelta(minutes=26)
+    await em.run_once()
+    assert len(bot.sent) == 4, (
+        f"a second quiet spell must warn again before the session is killed: {bot.sent}")
+    print("OK  aa. activity re-arms the warning, so a second quiet spell warns again")
+
+
+def case_ab_restore_enabled_false_is_a_true_no_op():
+    """RESTORE_ENABLED=false is documented as the kill switch. It must touch neither
+    memory nor Mongo -- case_s only proves it sends no DMs, which stays true even if
+    the flag is ignored entirely."""
+    reset_state()
+    stub = StubDB([pending_doc("p-ab", 7501, 5), active_doc("a-ab", 7502, HF_MEMBER, 5)])
+    bot, sm, qm, em, _ = build(stub)
+
+    saved = config.RESTORE_ENABLED
+    config.RESTORE_ENABLED = False
+    try:
+        stats = restore_state(qm, sm)
+    finally:
+        config.RESTORE_ENABLED = saved
+
+    assert stats['enabled'] is False, stats
+    assert config.queue_entries == {} and config.active_sessions == {}, "memory untouched"
+    assert config.user_to_queue_map == {} and config.user_to_session_map == {}
+    assert stub.calls == [], f"Mongo must not be read or written at all: {stub.calls}"
+    print("OK  ab. RESTORE_ENABLED=false reads nothing and restores nothing")
+
+
 # --------------------------------------------------------------------------- runner
 async def run():
     case_a_happy_pending()
@@ -799,6 +913,11 @@ async def run():
     await case_u_exactly_once_across_two_instances()
     case_v_end_session_return_is_a_commit_signal()
     await case_w_claim_is_atomic_against_the_cleanup_loop()
+    await case_x_expired_sweep_stays_quiet_if_row_closed_elsewhere()
+    await case_y_only_users_still_in_queue_are_told()
+    await case_z_inactivity_warning_fires_once_not_every_sweep()
+    await case_aa_activity_rearms_the_warning()
+    case_ab_restore_enabled_false_is_a_true_no_op()
 
 
 if __name__ == "__main__":

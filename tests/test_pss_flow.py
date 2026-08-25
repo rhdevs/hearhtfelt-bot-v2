@@ -193,12 +193,23 @@ async def run():
 
 
 if __name__ == "__main__":
+    # enable_both_services() rewrites BOTH services, so BOTH must be captured and put
+    # back. The old teardown restored only PSS, which left the HF channel pointing at
+    # the fake and -- far worse -- replaced the real 14-member HF roster with the one
+    # test member. Nothing else in config was cleared either. Harmless while every
+    # suite runs in its own process, but the moment these files are collected into one
+    # (pytest, `unittest discover`), this file poisons every authorization check that
+    # runs after it.
+    _hf = config.SERVICES[ServiceType.HF.value]
+    _pss = config.SERVICES[ServiceType.PSS.value]
+    _saved = (_hf.channel_id, _hf.enabled, list(_hf.roster),
+              _pss.channel_id, _pss.enabled, list(_pss.roster))
     try:
         asyncio.run(run())
         print("\nAll PSS end-to-end flow assertions passed!")
     finally:
-        # Restore PSS to its inert default so importing this test can't leak state.
-        pss = config.SERVICES[ServiceType.PSS.value]
-        pss.channel_id = config.PSS_CHANNEL_ID
-        pss.enabled = False
-        pss.roster.replace([])
+        (_hf.channel_id, _hf.enabled, _hf_roster,
+         _pss.channel_id, _pss.enabled, _pss_roster) = _saved
+        _hf.roster.replace(_hf_roster)
+        _pss.roster.replace(_pss_roster)
+        reset_state()
