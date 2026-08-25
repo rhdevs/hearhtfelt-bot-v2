@@ -133,7 +133,13 @@ class SessionExpiryManager:
         try:
             user_id = session_data['user_id']
             heartfelt_member_id = session_data['heartfelt_member_id']
-            
+
+            # Was this session ever in memory? The DB-fallback branch of the sweep feeds
+            # us documents that are NOT in active_sessions (skipped rehydration, or a
+            # restart mid-conversation). SessionManager.end_session returns early for
+            # those WITHOUT touching Mongo, so we have to close them ourselves below.
+            in_memory = session_id in active_sessions
+
             # Log system message to transcript if database available
             if db_mgr.db_available:
                 try:
@@ -149,7 +155,25 @@ class SessionExpiryManager:
             
             # End the session (this handles database updates and cleanup)
             await self.session_manager.end_session(session_id, user_id, system_end=True)
-            
+
+            if not in_memory:
+                # The row exists in Mongo but not in memory. SessionManager.end_session
+                # returned early WITHOUT touching Mongo, so close it here -- otherwise the
+                # doc stays status='active' and this sweep re-expires and re-notifies the
+                # same pair every SESSION_SWEEP_SECONDS, forever.
+                if db_mgr.db_available:
+                    closed = db_mgr.end_session(session_id, user_id, system_end=True)
+                    if not closed:
+                        logger.info(
+                            "Session %s was already closed elsewhere; skipping notifications",
+                            session_id,
+                        )
+                        return
+                else:
+                    logger.warning(
+                        "Orphan session %s expired with no DB to close it against", session_id
+                    )
+
             # Update user states
             if user_id:
                 user_states[user_id] = UserState.IDLE
