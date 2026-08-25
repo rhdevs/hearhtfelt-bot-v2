@@ -99,52 +99,63 @@ class DBManager:
         if not self.db_available:
             return False
             
-        try:
-            ended_at = utcnow()
-            
-            updates = {
-                'status': 'ended',
-                'ended_at': ended_at,
-                'ended_by_user_id': ended_by_user_id if not system_end else None,
-                'ended_by_system': system_end,
-            }
-            if end_reason is not None:
-                updates['end_reason'] = end_reason
+        ended_at = utcnow()
 
-            # Use atomic operation to prevent double-termination
+        updates = {
+            'status': 'ended',
+            'ended_at': ended_at,
+            'ended_by_user_id': ended_by_user_id if not system_end else None,
+            'ended_by_system': system_end,
+        }
+        if end_reason is not None:
+            updates['end_reason'] = end_reason
+
+        # Use atomic operation to prevent double-termination
+        try:
             result = db_manager.db.sessions.find_one_and_update(
                 {'session_id': session_id, 'status': {'$in': ['pending', 'active']}},
                 {'$set': updates},
                 return_document=True
             )
-            
-            if not result:
-                return False  # Session already ended or doesn't exist
-            
-            # Calculate duration from claimed_at if available, otherwise from created_at.
-            # Both are normalised to aware UTC: a legacy naive value would otherwise
-            # raise TypeError against the aware `ended_at` and lose the whole close.
+        except Exception as e:
+            logger.error(f"Error ending session {session_id}: {e}")
+            return False
+
+        if not result:
+            return False  # Session already ended or doesn't exist
+
+        # PAST THIS POINT THE TRANSITION IS COMMITTED, so nothing below may turn a
+        # successful close into a False return. Callers use that return value as the
+        # exactly-once gate on messaging real people (queue.sweep_expired_queues,
+        # expiry._expire_session): a False here means "someone else already closed
+        # it, stay quiet". If bookkeeping could produce the same False, we would end
+        # the row in Mongo and then never tell the requester anything -- which is
+        # exactly what used to happen, because the old duration math raised on every
+        # pending row (`result.get('claimed_at', ...)` returns a present-but-None
+        # value) AFTER find_one_and_update had already committed.
+        duration_minutes = 0
+        try:
+            # Duration from claimed_at if available, otherwise created_at. Both are
+            # normalised to aware UTC: a legacy naive value would otherwise raise
+            # TypeError against the aware `ended_at`.
             start_time = ensure_aware_utc(result.get('claimed_at') or result.get('created_at'))
-            if start_time is None:
-                duration_minutes = 0
-            else:
+            if start_time is not None:
                 duration_minutes = int((ended_at - start_time).total_seconds() / 60)
-            
-            # Update with calculated duration
+
             db_manager.db.sessions.update_one(
                 {'session_id': session_id},
                 {'$set': {'duration_minutes': duration_minutes}}
             )
-
-            ended_by = "system auto-expiry" if system_end else f"user {ended_by_user_id}"
-            logger.info(f"Session {session_id} ended by {ended_by}"
-                        f"{' (' + end_reason + ')' if end_reason else ''}, "
-                        f"duration: {duration_minutes}m")
-            return True
-            
         except Exception as e:
-            logger.error(f"Error ending session {session_id}: {e}")
-            return False
+            logger.warning(
+                "Session %s was closed but its duration could not be recorded: %s",
+                session_id, e)
+
+        ended_by = "system auto-expiry" if system_end else f"user {ended_by_user_id}"
+        logger.info(f"Session {session_id} ended by {ended_by}"
+                    f"{' (' + end_reason + ')' if end_reason else ''}, "
+                    f"duration: {duration_minutes}m")
+        return True
     
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get session by session_id"""

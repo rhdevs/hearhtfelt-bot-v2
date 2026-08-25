@@ -685,6 +685,56 @@ async def case_u_exactly_once_across_two_instances():
     print("OK  u. a second instance that loses the atomic close never re-notifies")
 
 
+def case_v_end_session_return_is_a_commit_signal():
+    """db_mgr.end_session's return value is the exactly-once gate on messaging real
+    people, so it must mean "did the atomic transition commit?" and nothing else.
+
+    Once find_one_and_update has committed, the row IS closed. If a later bookkeeping
+    step could still make the function return False, callers
+    (queue.sweep_expired_queues, expiry._expire_session) would read that as "someone
+    else closed it, stay quiet" -- ending the row in Mongo and then telling the
+    requester nothing at all. That is precisely what the pre-branch code did: its
+    duration math raised on every pending row, after the commit.
+    """
+    import datetime as _dt
+    from types import SimpleNamespace as _NS
+    import src.database.manager as M
+    from src.timeutil import UTC as _UTC
+
+    class Coll:
+        def __init__(self, boom):
+            self.boom = boom
+            self.updated = []
+
+        def find_one_and_update(self, filt, upd, **kw):
+            # A PENDING row, exactly as create_session writes it: claimed_at is
+            # PRESENT and None, which is what broke the old `.get(k, default)`.
+            return {'session_id': 's1', 'claimed_at': None,
+                    'created_at': _dt.datetime(2026, 1, 1, tzinfo=_UTC)}
+
+        def update_one(self, filt, upd):
+            if self.boom:
+                raise RuntimeError("mongo blip on the duration write")
+            self.updated.append(upd)
+            return _NS(matched_count=1)
+
+    real_conn, real_avail = M.db_manager, M.db_mgr.db_available
+    try:
+        for boom in (False, True):
+            M.db_manager = _NS(db=_NS(sessions=Coll(boom)))
+            M.db_mgr.db_available = True
+            got = M.db_mgr.end_session('s1', None, system_end=True,
+                                       end_reason='queue_expired')
+            assert got is True, (
+                f"the row was committed as ended but end_session returned {got!r} "
+                f"(duration write raising={boom}); every caller would silently skip "
+                f"the user's notification")
+    finally:
+        M.db_manager, M.db_mgr.db_available = real_conn, real_avail
+
+    print("OK  v. end_session returns True whenever the atomic close committed")
+
+
 # --------------------------------------------------------------------------- runner
 async def run():
     case_a_happy_pending()
@@ -708,6 +758,7 @@ async def run():
     await case_s_ancient_active_sessions_are_closed_silently()
     await case_t_recently_dead_sessions_still_notify()
     await case_u_exactly_once_across_two_instances()
+    case_v_end_session_return_is_a_commit_signal()
 
 
 if __name__ == "__main__":
