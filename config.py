@@ -1,8 +1,9 @@
+import dataclasses
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,6 +29,37 @@ PRIVACY_POLICY_URL = os.getenv(
 HF_PRIVACY_POLICY_URL = os.getenv("HF_PRIVACY_POLICY_URL", PRIVACY_POLICY_URL)
 PSS_PRIVACY_POLICY_URL = os.getenv("PSS_PRIVACY_POLICY_URL", PRIVACY_POLICY_URL)
 
+# Per-track follow-up wording, appended to the CLOSING message of a PSS conversation.
+# Deliberately EMPTY by default and deliberately NOT written in this repo: inventing
+# clinical follow-up instructions for a mental-health service is not a coding
+# decision. Empty => today's closing messages are byte-identical. See D30 / runbook R8.
+PSS_FOLLOWUP_NOTE = os.getenv("PSS_FOLLOWUP_NOTE", "")   # -> the SUPPORTER's closing
+PSS_CLOSING_NOTE  = os.getenv("PSS_CLOSING_NOTE", "")    # -> the REQUESTER's closing
+
+
+@dataclass
+class MemberProfile:
+    """SHAPE-STABLE ON PURPOSE. The stakeholder has NOT decided what appears next to
+    a supporter's name or who curates it. `blurb` is the one free-text line the picker
+    renders today; `fields` carries every OTHER key on the Mongo doc verbatim. When the
+    answer arrives it either fills `blurb` or names a key already in `fields` -- one line
+    in the renderer, no migration, no backfill. DO NOT invent profile content here."""
+    telegram_id: int
+    display_name: str = ""            # picker label. EMPTY => not pickable.
+    blurb: str = ""
+    available: bool = True
+    has_started_bot: bool = False     # False => the bot may NOT DM them
+    username: Optional[str] = None
+    fields: Dict[str, Any] = field(default_factory=dict)
+
+
+# Keys MemberProfile already accounts for, either as a typed attribute or as Mongo
+# bookkeeping nobody renders. Everything else on the document lands in `fields`
+# verbatim, which is the whole point of D14.
+_PROFILE_KEYS = ("telegram_id", "display_name", "blurb", "available",
+                 "has_started_bot", "username", "active", "_id",
+                 "created_at", "updated_at", "started_bot_at")
+
 
 class AuthorizedMembersStore:
     """Thread-safe in-memory store for authorized heartfelt members."""
@@ -35,6 +67,10 @@ class AuthorizedMembersStore:
     def __init__(self, initial_members: Iterable[int] = None):
         self._lock = threading.RLock()
         self._members: Set[int] = set()
+        # member_id -> MemberProfile. A SUBSET of _members: a member added via
+        # add(), or arriving on a bare-id roster, is authorized but has no
+        # profile and is therefore invisible in the picker. That is correct.
+        self._profiles: Dict[int, MemberProfile] = {}
         self._last_synced_at: Optional[float] = None
         if initial_members:
             self.replace(initial_members)
@@ -51,12 +87,115 @@ class AuthorizedMembersStore:
         return normalized
 
     def replace(self, member_ids: Iterable[int]) -> bool:
-        """Replace the member set, returning True if the contents changed."""
+        """Replace the member set from BARE IDS, returning True if the contents changed.
+
+        A bare-id roster carries no profile data, so every profile for a departed
+        member is dropped and no new one is created. Members who arrive this way have
+        `display_name == ""`: authorized to claim, invisible in the picker. That is
+        what keeps the pre-Phase-4 suites driving today's un-forked code path.
+        """
         new_members = self._normalize(member_ids)
         with self._lock:
             if new_members == self._members:
                 return False
             self._members = new_members
+            self._profiles = {k: v for k, v in self._profiles.items() if k in new_members}
+            return True
+
+    @staticmethod
+    def _profile_from_doc(doc) -> Optional["MemberProfile"]:
+        """Build a MemberProfile from a raw Mongo document, or None if unusable."""
+        if not isinstance(doc, dict):
+            return None
+        try:
+            member_int = int(doc.get('telegram_id'))
+        except (TypeError, ValueError):
+            return None
+        return MemberProfile(
+            telegram_id=member_int,
+            display_name=str(doc.get('display_name') or "").strip(),
+            blurb=str(doc.get('blurb') or "").strip(),
+            # ABSENT means available: today's profile-less documents must not all
+            # read as offline the moment this ships.
+            available=bool(doc.get('available', True)),
+            # ABSENT means NOT started -- fail closed. Telegram forbids the bot
+            # messaging first, so guessing True here strands a real request.
+            has_started_bot=bool(doc.get('has_started_bot', False)),
+            username=doc.get('username'),
+            fields={k: v for k, v in doc.items() if k not in _PROFILE_KEYS},
+        )
+
+    def replace_records(self, docs: Iterable[Dict[str, Any]]) -> bool:
+        """Replace ids AND profiles from raw Mongo documents.
+
+        An empty list is a legitimate empty roster. Records whose telegram_id will
+        not coerce are dropped entirely, so they are not authorized either.
+        Duplicate telegram_ids: last wins.
+        """
+        new_members: Set[int] = set()
+        new_profiles: Dict[int, MemberProfile] = {}
+        for doc in docs or []:
+            profile = self._profile_from_doc(doc)
+            if profile is None:
+                continue
+            new_members.add(profile.telegram_id)
+            new_profiles[profile.telegram_id] = profile
+        with self._lock:
+            if new_members == self._members and new_profiles == self._profiles:
+                return False
+            self._members = new_members
+            self._profiles = new_profiles
+            return True
+
+    def profile(self, member_id) -> Optional["MemberProfile"]:
+        """A COPY of the stored profile, never the stored object."""
+        try:
+            member_int = int(member_id)
+        except (TypeError, ValueError):
+            return None
+        with self._lock:
+            stored = self._profiles.get(member_int)
+            if stored is None:
+                return None
+            return dataclasses.replace(stored, fields=dict(stored.fields))
+
+    def profiles(self) -> List["MemberProfile"]:
+        """Copies of every stored profile, in a DETERMINISTIC, STABLE order.
+
+        The picker is paginated and a tap arrives seconds after the render; dict
+        insertion order or set iteration would page-shift a supporter between the
+        two, and a typed number would then select the wrong person.
+        """
+        with self._lock:
+            out = [dataclasses.replace(p, fields=dict(p.fields))
+                   for p in self._profiles.values()]
+        out.sort(key=lambda p: (p.display_name.casefold(), p.telegram_id))
+        return out
+
+    def set_available(self, member_id, available: bool) -> bool:
+        """In-memory only. False when this member has no profile."""
+        try:
+            member_int = int(member_id)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            stored = self._profiles.get(member_int)
+            if stored is None:
+                return False
+            stored.available = bool(available)
+            return True
+
+    def mark_started(self, member_id, started: bool = True) -> bool:
+        """In-memory only. False when this member has no profile."""
+        try:
+            member_int = int(member_id)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            stored = self._profiles.get(member_int)
+            if stored is None:
+                return False
+            stored.has_started_bot = bool(started)
             return True
 
     def update_last_synced(self, timestamp: float) -> None:
@@ -186,6 +325,16 @@ class Service:
                                         # (session_timeout_minutes - session_warning_minutes)
                                         # of idleness, NOT at this much idleness.
 
+    # Phase 4/5/6: the directed-support sub-branch. Every one of these carries a
+    # default and stays AFTER session_warning_minutes, or a bare Service(...) --
+    # which test_service_config.py::test_service_runnable_requires_channel builds --
+    # becomes a TypeError.
+    directed_enabled: bool = False          # OFF for HF: directed is a PSS feature
+    directed_response_minutes: int = 1440   # how long ONE supporter has to answer
+    picker_page_size: int = 8
+    closing_extra: str = ""                 # appended to the REQUESTER's closing msg
+    closing_extra_member: str = ""          # appended to the MEMBER's closing msg
+
     @property
     def runnable(self) -> bool:
         # A service is only offered/posted-to when enabled AND fully configured with a channel.
@@ -227,6 +376,13 @@ SERVICES: Dict[str, Service] = {
         session_timeout_minutes=1440,  # 24h
         session_warning_minutes=60,    # warns at 23h idle; a 5-min lead on a 24h window
                                        # is unactionable noise at 3am. See D4.
+        # Directed support is a PSS feature. HF leaves every one of these at its
+        # default, so HF's behaviour is provably unchanged.
+        directed_enabled=_env_bool("PSS_DIRECTED_ENABLED", True),
+        directed_response_minutes=1440,
+        picker_page_size=8,
+        closing_extra=PSS_CLOSING_NOTE,
+        closing_extra_member=PSS_FOLLOWUP_NOTE,
     ),
 }
 
