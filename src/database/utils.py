@@ -6,6 +6,7 @@ Usage: python db_utils.py [command]
 
 import datetime
 import argparse
+from typing import Optional
 from src.database.manager import db_mgr
 from src.timeutil import UTC, ensure_aware_utc, utcnow
 from config import get_service
@@ -125,7 +126,11 @@ def show_session_stats():
         completion_rate = (ended / total) * 100
         print(f"Completion Rate: {completion_rate:.1f}%")
 
-def manage_authorized_members(action: str, telegram_id: int = None, username: str = None, include_inactive: bool = False, service: str = 'hf', display_name: str = None, blurb: str = None):
+def manage_authorized_members(action: str, telegram_id: Optional[int] = None,
+                              username: Optional[str] = None,
+                              include_inactive: bool = False, service: str = 'hf',
+                              display_name: Optional[str] = None,
+                              blurb: Optional[str] = None):
     """CLI helper to manage authorized members for a given service (hf/pss)."""
     if not db_mgr.initialize():
         print("❌ Database not available")

@@ -529,7 +529,9 @@ class DBManager:
         """Return raw authorized member documents from a service's MongoDB collection."""
         return self._fetch_authorized_member_docs(include_inactive=include_inactive, collection=collection)
 
-    def add_authorized_member(self, member_id: int, username: str = None, active: bool = True, collection: str = None) -> bool:
+    def add_authorized_member(self, member_id: int, username: Optional[str] = None,
+                              active: bool = True,
+                              collection: Optional[str] = None) -> bool:
         """Upsert an authorized member record in a service's collection."""
         if not self.db_available:
             return False
@@ -586,8 +588,9 @@ class DBManager:
     # add_authorized_member: a typo in --telegram-id here must fail loudly, not
     # quietly authorize a stranger's Telegram id to claim conversations.
 
-    def set_member_profile(self, member_id: int, collection: str = None,
-                           display_name: str = None, blurb: str = None) -> bool:
+    def set_member_profile(self, member_id: int, collection: Optional[str] = None,
+                           display_name: Optional[str] = None,
+                           blurb: Optional[str] = None) -> bool:
         """Set the picker label and/or the one free-text line, leaving the other alone."""
         if not self.db_available:
             return False
