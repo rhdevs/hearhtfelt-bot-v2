@@ -6,6 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CallbackContext
 from config import (
     CB_DIRECT_ACCEPT,
+    closing_text,
     CB_DIRECT_DECLINE,
     CB_PICK_CANCEL,
     CB_PICK_LIST,
@@ -195,55 +196,168 @@ class BotHandlers:
         await self.chat_command(update, context)
     
     async def end_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /end command to end conversation"""
+        """Handle /end. REQUESTER-ONLY: a supporter hands back with /release instead.
+
+        Ending is the requester's decision. A supporter who has to stop should not be
+        able to close the conversation out from under someone who is still talking --
+        /release keeps their request alive and finds them somebody else.
+        """
         user_id = update.effective_user.id
-        current_state = user_states.get(user_id, UserState.IDLE)
-        
-        # Check if user has an active session
+
         session_id = self.session_manager.get_session_by_user(user_id)
         if not session_id:
             await update.message.reply_text(MESSAGES["no_active_conversation"])
             return
-        
-        # End the session
-        user_id_session, heartfelt_id_session = await self.session_manager.end_session(session_id, user_id)
-        
-        # Update states
-        if user_id_session:
-            user_states[user_id_session] = UserState.IDLE
-        if heartfelt_id_session:
-            user_states[heartfelt_id_session] = UserState.IDLE
-        
-        # Notify both parties with appropriate messages
-        if user_id_session:
+
+        # Capture the roles NOW: end_session deletes the in-memory session, and after
+        # that there is nothing left to ask who was who. `info` can legitimately be
+        # None -- an orphan whose rehydration was skipped but whose index survived --
+        # in which case there is no conversation to end.
+        info = self.session_manager.get_session_info(session_id)
+        if info is None:
+            await update.message.reply_text(MESSAGES["no_active_conversation"])
+            return
+        service_key = info.get('service')
+        requester_id = info.get('user_id')
+        member_id = info.get('heartfelt_member_id')
+
+        if user_id != requester_id:
+            # Refused WITHOUT ending: the session survives untouched.
+            await update.message.reply_text(MESSAGES["end_is_requester_only"])
+            return
+
+        await self.session_manager.end_session(session_id, user_id)
+
+        if requester_id:
+            user_states[requester_id] = UserState.IDLE
+        if member_id:
+            user_states[member_id] = UserState.IDLE
+
+        # Copy chosen by SESSION ROLE, not by roster lookup. A roster lookup gets this
+        # wrong for a supporter who is themselves the requester in this conversation,
+        # and it is one dict read away from being right.
+        #
+        # DELIBERATELY SCOPED TO /end. SessionExpiryManager._expire_session keeps its
+        # is_heartfelt_member() check: expiry copy is a different message with a
+        # different brief, and changing it here would churn test_session_expiry.py for
+        # no behavioural gain. The two differ on purpose.
+        if requester_id:
             try:
-                # Send user message to user, heartfelt message to heartfelt member
-                message = (
-                    MESSAGES["conversation_ended_heartfelt"]
-                    if is_heartfelt_member(user_id_session)
-                    else MESSAGES["conversation_ended"]
-                )
                 await context.bot.send_message(
-                    chat_id=user_id_session,
-                    text=message
+                    chat_id=requester_id,
+                    text=closing_text(service_key, for_member=False),
                 )
             except:
                 pass
-        
-        if heartfelt_id_session and heartfelt_id_session != user_id:
+
+        if member_id and member_id != requester_id:
             try:
-                # Send user message to user, heartfelt message to heartfelt member
-                message = (
-                    MESSAGES["conversation_ended_heartfelt"]
-                    if is_heartfelt_member(heartfelt_id_session)
-                    else MESSAGES["conversation_ended"]
-                )
                 await context.bot.send_message(
-                    chat_id=heartfelt_id_session,
-                    text=message
+                    chat_id=member_id,
+                    text=closing_text(service_key, for_member=True),
                 )
             except:
                 pass
+
+    async def release_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /release: the SUPPORTER hands a live conversation back.
+
+        Not end_session. The request is not over, so the row goes active -> pending
+        and keeps its session_id and its anonymous id.
+        """
+        user_id = update.effective_user.id
+
+        session_id = self.session_manager.get_session_by_user(user_id)
+        if not session_id:
+            await update.message.reply_text(MESSAGES["no_active_conversation"])
+            return
+
+        info = self.session_manager.get_session_info(session_id)
+        if info is None:
+            await update.message.reply_text(MESSAGES["no_active_conversation"])
+            return
+        requester_id = info.get('user_id')
+        member_id = info.get('heartfelt_member_id')
+
+        if user_id != member_id:
+            await update.message.reply_text(MESSAGES["release_is_member_only"])
+            return
+
+        if not db_mgr.db_available:
+            # The DESCRIPTION lives only on the document; active_sessions has never
+            # carried one. Without Mongo the request could be handed back to nobody,
+            # because there would be nothing to show them. Runbook R12.
+            await update.message.reply_text(MESSAGES["release_unavailable"])
+            return
+
+        # Atomic active -> pending, synchronously, before the first await. None means
+        # somebody already ended or moved this conversation, and the requester -- who
+        # did not ask for any of this -- must hear nothing at all.
+        doc = db_mgr.release_session(session_id, user_id)
+        if doc is None:
+            await update.message.reply_text(MESSAGES["no_active_conversation"])
+            return
+
+        self.session_manager.release_session(session_id)
+        user_states[member_id] = UserState.IDLE
+
+        # PROVENANCE, not routing. `routing` is never cleared on claim precisely so
+        # this question can be asked: a requester who deliberately kept their message
+        # OFF the channel does not consent to it going there because the supporter
+        # they chose had to step away. See D28.
+        provenance = doc.get('routing') or 'open'
+        new_routing = 'open' if provenance == 'open' else 'choosing'
+
+        queue_id = self.queue_manager.rebuild_released_entry(doc, new_routing)
+        picker_views.pop(requester_id, None)
+
+        if new_routing == 'open':
+            posted, _error = await self.queue_manager.post_queue_to_channel(queue_id)
+            user_states[requester_id] = UserState.IN_QUEUE
+            try:
+                await context.bot.send_message(chat_id=requester_id,
+                                               text=MESSAGES["released_to_queue"])
+            except Exception as exc:
+                logger.warning("Could not tell %s their request went back to the "
+                               "queue: %s", requester_id, exc)
+            if not posted:
+                # The row is 'pending', so the next boot rehydrates and re-posts it.
+                # The requester is still correctly told they are waiting; the person
+                # who needs to know the channel is broken is the member.
+                logger.error("Released request %s could not be posted to the channel",
+                             queue_id)
+                await update.message.reply_text(MESSAGES["channel_error"])
+                return
+        else:
+            # Persist the lane change too, or a restart rehydrates this as still
+            # sitting with the supporter who just walked away.
+            try:
+                if db_mgr.undirect_session(queue_id, user_id, reason='released') is None:
+                    logger.warning("Released request %s could not be moved back to "
+                                   "'choosing' in Mongo", queue_id)
+            except Exception as exc:
+                logger.warning("Error moving released request %s back to 'choosing': "
+                               "%s", queue_id, exc)
+            user_states[requester_id] = UserState.CHOOSING_SUPPORTER
+            try:
+                await context.bot.send_message(
+                    chat_id=requester_id,
+                    text=(MESSAGES["released_choose_again"] + "\n\n"
+                          + MESSAGES["next_step_question"]),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(MESSAGES["picker_choose_else_button"],
+                                              callback_data=f"{CB_PICK_LIST}:0")],
+                        [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
+                                              callback_data=CB_PICK_OPEN)],
+                        [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
+                                              callback_data=CB_PICK_CANCEL)],
+                    ]),
+                )
+            except Exception as exc:
+                logger.warning("Could not offer %s the choice again: %s",
+                               requester_id, exc)
+
+        await update.message.reply_text(MESSAGES["released_member"])
     
     def _open_request_status_text(self, user_id: int) -> str:
         """One description of an existing open request, shared by /status and /chat.

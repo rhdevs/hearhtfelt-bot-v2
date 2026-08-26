@@ -55,7 +55,7 @@ PSS_CHANNEL = "-1009000000002"
 HANDLER_CALLBACKS = (
     "start_command", "chat_command", "end_command", "status_command",
     "cancel_command", "available_command", "unavailable_command",
-    "handle_message", "handle_sticker", "handle_photo",
+    "release_command", "handle_message", "handle_sticker", "handle_photo",
     "handle_callback_query", "handle_error",
 )
 
@@ -489,10 +489,10 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
 
     app = app_holder.get("app")
     assert app is not None, "the fake Application was never built"
-    # 7 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
-    assert len(app.handlers) == 11, (
-        f"main() registered {len(app.handlers)} handlers, expected 11 "
-        f"(7 command, 3 message, 1 callback): {app.handlers!r}"
+    # 8 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
+    assert len(app.handlers) == 12, (
+        f"main() registered {len(app.handlers)} handlers, expected 12 "
+        f"(8 command, 3 message, 1 callback): {app.handlers!r}"
     )
     assert len(app.error_handlers) == 1, f"expected one error handler, got {app.error_handlers!r}"
 
@@ -512,6 +512,7 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
         ("CommandHandler", "cancel_command"),
         ("CommandHandler", "available_command"),
         ("CommandHandler", "unavailable_command"),
+        ("CommandHandler", "release_command"),
         ("MessageHandler", "handle_message"),
         ("MessageHandler", "handle_sticker"),
         ("MessageHandler", "handle_photo"),
@@ -529,7 +530,7 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
     # and a stale index still resolves to SOME handler, so the two asserts below
     # would keep passing while testing the wrong objects. The ordered-pair list
     # above is what pins them: keep the two in step.
-    sticker_h, photo_h = app.handlers[8], app.handlers[9]
+    sticker_h, photo_h = app.handlers[9], app.handlers[10]
     assert sticker_h.filters is filters.Sticker.ALL, (
         f"handle_sticker must be filtered on filters.Sticker.ALL, got {sticker_h.filters!r}"
     )
@@ -541,7 +542,7 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
     for h in app.handlers:
         commands |= set(getattr(h, "commands", ()) or ())
     assert commands == {"start", "chat", "help", "end", "status", "cancel",
-                        "available", "unavailable"}, (
+                        "available", "unavailable", "release"}, (
         f"registered commands are {sorted(commands)}; /chat and its /help alias must "
         "both survive (main.py:117)"
     )

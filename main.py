@@ -140,6 +140,7 @@ async def main():
     # publishes ONE menu to every chat, and that menu is the requester's surface.
     application.add_handler(CommandHandler("available", handlers.available_command))
     application.add_handler(CommandHandler("unavailable", handlers.unavailable_command))
+    application.add_handler(CommandHandler("release", handlers.release_command))
     
     # Message handler for regular messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))

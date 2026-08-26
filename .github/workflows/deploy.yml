@@ -121,6 +121,9 @@ jobs:
       - name: tests/test_directed_requests.py
         run: python tests/test_directed_requests.py
 
+      - name: tests/test_release_and_end.py
+        run: python tests/test_release_and_end.py
+
       - name: tests/test_per_service_timers.py
         run: python tests/test_per_service_timers.py
 

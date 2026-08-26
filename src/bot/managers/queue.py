@@ -869,6 +869,46 @@ class QueueManager:
 
         return acted
 
+    def rebuild_released_entry(self, doc: dict, routing: str) -> str:
+        """Rebuild the in-memory queue entry for a request handed back by its member.
+
+        The SAME session_id and the SAME anonymous_user_id: the channel must see the
+        RHesident #NNNN it already knows, or a released request reads as a brand new
+        person asking for help.
+        """
+        session_id = doc['session_id']
+        svc = get_service(doc.get('service'))
+        anon = (doc.get('anonymous_user_id')
+                or self._generate_anonymous_id(svc.anon_prefix))
+        used_anonymous_ids.add(anon)
+        user_id = doc.get('user_id')
+
+        queue_entries[session_id] = {
+            'user_id': user_id,
+            # The description exists ONLY on the document -- active_sessions has never
+            # carried one -- which is why /release requires Mongo at all.
+            'description': doc.get('description') or '',
+            'created_at': ensure_aware_utc(doc.get('created_at')) or utcnow(),
+            'waiting_since': ensure_aware_utc(doc.get('waiting_since')) or utcnow(),
+            'anonymous_id': anon,
+            'message_id': None,
+            'channel_id': None,
+            'service': svc.key,
+            'routing': routing,
+            'target_member_id': None,
+            'directed_at': None,
+            'directed_message_id': None,
+            'notice_channel_id': None,
+            'notice_message_id': None,
+            'declined_by': list(doc.get('declined_by') or []),
+            'released': True,
+        }
+        if user_id is not None:
+            user_to_queue_map[user_id] = session_id
+        if routing == 'open' and session_id not in queue_order:
+            queue_order.append(session_id)
+        return session_id
+
     async def route_to_open_queue(self, queue_id: str) -> bool:
         """The requester chose to ask anyone who's free.
 

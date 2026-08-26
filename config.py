@@ -685,7 +685,53 @@ MESSAGES = {
         "You can use /chat to start again whenever you're ready."
     ),
     "directed_gone": "This request is no longer waiting.",
+
+    # --- Phase 6: ending and handing back -----------------------------------
+    "end_is_requester_only": (
+        "Only the person who asked for support can end this conversation.\n\n"
+        "If you can't carry on right now, use /release instead. Their request goes "
+        "back so someone else can pick it up, and they aren't left waiting on a "
+        "conversation that has gone quiet."
+    ),
+    "release_is_member_only": (
+        "/release is for supporters handing a conversation back. If you'd like to "
+        "finish this conversation, use /end."
+    ),
+    "release_unavailable": (
+        "⚠️ Sorry, /release isn't available right now because our records are "
+        "offline, and handing a conversation back needs them. Please try again in a "
+        "few minutes, and let the team know if it keeps failing."
+    ),
+    # Requester-facing. NEVER "you were dropped", NEVER "they left". Nothing was
+    # done TO this person; their request simply went back to where it came from.
+    "released_to_queue": (
+        "This conversation has ended, and your request has gone back to the team. "
+        "Someone will be with you as soon as they can. 💚"
+    ),
+    "released_choose_again": (
+        "This conversation has ended, and your request is back with you so you can "
+        "choose who to talk to next."
+    ),
+    "released_member": (
+        "Thank you for letting us know - the conversation has been handed back and "
+        "you're free again. Passing something on when you can't carry it is the "
+        "right call, not a failure. 💚"
+    ),
 }
+
+
+def closing_text(service_key: Optional[str], for_member: bool) -> str:
+    """The closing message for one side of a conversation, per track.
+
+    The per-track extra is env-supplied and EMPTY by default, deliberately:
+    inventing clinical follow-up wording for a mental-health service is not a coding
+    decision. Empty => this returns today's message byte-identical. See D30 / R8.
+    """
+    svc = get_service(service_key)
+    base = (MESSAGES["conversation_ended_heartfelt"] if for_member
+            else MESSAGES["conversation_ended"])
+    extra = svc.closing_extra_member if for_member else svc.closing_extra
+    return base + ("\n\n" + extra if extra else "")
 
 
 def is_supporter_available(service_key: str, member_id: int) -> bool:
