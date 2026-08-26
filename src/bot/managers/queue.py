@@ -582,6 +582,14 @@ class QueueManager:
         entry['directed_at'] = utcnow()
         entry['directed_message_id'] = None
         directed_by_member[member_int] = queue_id
+        # IN_QUEUE, not CHOOSING_SUPPORTER: the choosing is over and they ARE now
+        # waiting, on one named person. This MUST match what restore._restore_pending
+        # sets for a 'directed' row, or the requester's state silently changes across
+        # a restart -- and while it is CHOOSING_SUPPORTER, anything they type is read
+        # as a picker number against a view that no longer exists.
+        requester_id = entry.get('user_id')
+        if requester_id:
+            user_states[requester_id] = UserState.IN_QUEUE
         # ------------------------------------------------------------------------
 
         profile = svc.roster.profile(member_int)

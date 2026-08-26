@@ -21,7 +21,6 @@ from config import (
     user_to_service_map,
     MESSAGES,
     PHOTO_SHARING_ENABLED,
-    is_heartfelt_member,
     is_any_member,
     is_member_of_service,
     enabled_services,
@@ -935,8 +934,15 @@ class BotHandlers:
                                       MESSAGES["picker_unreachable"])
             return
 
-        # 'gone': the request itself has moved on. Say nothing about supporters.
+        # 'gone'. Two very different situations reach here, and directed_gone --
+        # "This request is no longer waiting." -- is a LIE in the second one: a stale
+        # picker button tapped while the request is already sitting with somebody.
+        # Say which it is, and never name a supporter the requester did not choose.
         picker_views.pop(user_id, None)
+        if self.queue_manager.get_queue_entry(queue_id) is not None:
+            await self._send_or_edit(query, context, user_id,
+                                     self._open_request_status_text(user_id))
+            return
         await self._send_or_edit(query, context, user_id, MESSAGES["directed_gone"])
 
     async def _handle_directed_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

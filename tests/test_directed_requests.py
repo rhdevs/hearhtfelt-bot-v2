@@ -557,6 +557,19 @@ async def case_h_a_tap_sends_one_dm_and_one_contentless_note():
     assert entry['routing'] == 'directed'
     assert entry['target_member_id'] == supporter_id(0)
     assert config.directed_by_member[supporter_id(0)] == queue_id
+    assert config.user_states[REQUESTER] == UserState.IN_QUEUE, (
+        "the choosing is over and they ARE waiting; this must match what "
+        "restore._restore_pending sets for a 'directed' row, or the state silently "
+        "changes across a restart")
+
+    # ... so anything they type now is an ordinary message, NOT a picker number read
+    # against a view that no longer exists.
+    before = len(rec.replies)
+    await handlers.handle_message(text_update(REQUESTER, "2", rec), ctx)
+    assert rec.replies[-1][0] == config.MESSAGES["unknown_command"], rec.replies[-1]
+    assert len(rec.replies) == before + 1
+    assert stub.count('direct_session') == 1, (
+        "and it certainly must not select a second supporter", stub.calls)
     print("OK  h. one tap => one DM, one note with no description, no id and no button")
 
 
