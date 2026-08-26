@@ -4,7 +4,15 @@ import random
 import logging
 from typing import Optional, Tuple
 from telegram import Bot
-from config import active_sessions, safety_logs, user_to_session_map, session_warnings, get_service
+from config import (
+    active_sessions,
+    safety_logs,
+    user_to_session_map,
+    session_warnings,
+    get_service,
+    used_anonymous_ids,
+)
+from src.timeutil import utcnow
 from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
@@ -12,7 +20,8 @@ logger = logging.getLogger(__name__)
 class SessionManager:
     def __init__(self, bot: Bot):
         self.bot = bot
-        self.used_anonymous_ids = set()  # Track used IDs to avoid duplicates
+        # Shared with QueueManager via config so the two never collide.
+        self.used_anonymous_ids = used_anonymous_ids
     
     def _generate_anonymous_id(self, prefix: str = "RHesident") -> str:
         """Generate a unique anonymous ID using the given prefix"""
@@ -52,7 +61,7 @@ class SessionManager:
         if not anonymous_user_id:
             anonymous_user_id = self._generate_anonymous_id(get_service(service).anon_prefix)
 
-        now = datetime.datetime.now()
+        now = utcnow()
         active_sessions[session_id] = {
             'user_id': user_id,
             'heartfelt_member_id': heartfelt_member_id,
@@ -76,7 +85,7 @@ class SessionManager:
             'session_id': session_id,
             'user_id': user_id,
             'heartfelt_member_id': heartfelt_member_id,
-            'timestamp': datetime.datetime.now(),
+            'timestamp': utcnow(),
             'action': 'session_created'
         })
         
@@ -123,7 +132,7 @@ class SessionManager:
     
     def update_session_activity(self, session_id: str) -> None:
         """Update session activity timestamp in both memory and database"""
-        now = datetime.datetime.now()
+        now = utcnow()
         
         # Update in-memory session
         if session_id in active_sessions:
@@ -170,7 +179,7 @@ class SessionManager:
                 'session_id': session_id,
                 'from_user_id': from_user_id,
                 'to_user_id': other_party_id,
-                'timestamp': datetime.datetime.now(),
+                'timestamp': utcnow(),
                 'action': 'message_forwarded'
             })
             
@@ -219,7 +228,7 @@ class SessionManager:
                 'session_id': session_id,
                 'from_user_id': from_user_id,
                 'to_user_id': other_party_id,
-                'timestamp': datetime.datetime.now(),
+                'timestamp': utcnow(),
                 'action': 'sticker_forwarded'
             })
             
@@ -263,7 +272,7 @@ class SessionManager:
                 'session_id': session_id,
                 'from_user_id': from_user_id,
                 'to_user_id': other_party_id,
-                'timestamp': datetime.datetime.now(),
+                'timestamp': utcnow(),
                 'action': 'photo_forwarded',
                 'file_id': photo_file_id,
                 'file_size': file_size,
@@ -276,7 +285,8 @@ class SessionManager:
             logger.error(f"Error forwarding photo in session {session_id}: {e}")
             return False
     
-    async def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False) -> Tuple[Optional[int], Optional[int]]:
+    async def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False,
+                          end_reason: str = None) -> Tuple[Optional[int], Optional[int]]:
         """End a session and return both user IDs"""
         session = active_sessions.get(session_id)
         if not session:
@@ -287,7 +297,9 @@ class SessionManager:
         
         # End session in database
         if db_mgr.db_available:
-            db_mgr.end_session(session_id, ended_by_user_id, system_end)
+            if end_reason is None:
+                end_reason = 'idle_expired' if system_end else 'user_ended'
+            db_mgr.end_session(session_id, ended_by_user_id, system_end, end_reason=end_reason)
         
         # Remove session and clean up indices
         del active_sessions[session_id]
@@ -306,7 +318,7 @@ class SessionManager:
         safety_logs.append({
             'session_id': session_id,
             'ended_by_user_id': ended_by_user_id,
-            'timestamp': datetime.datetime.now(),
+            'timestamp': utcnow(),
             'action': 'session_ended'
         })
         

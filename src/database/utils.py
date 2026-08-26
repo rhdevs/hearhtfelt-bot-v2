@@ -7,6 +7,7 @@ Usage: python db_utils.py [command]
 import datetime
 import argparse
 from src.database.manager import db_mgr
+from src.timeutil import UTC, ensure_aware_utc, utcnow
 from config import get_service
 
 def get_anonymous_name(session_doc, for_user_type='user'):
@@ -50,7 +51,11 @@ def format_session_transcript(session_id):
         return
     
     for msg in messages:
-        timestamp = msg['timestamp'].strftime('%H:%M:%S')
+        # Legacy transcripts predate several schema additions, and a document can
+        # reach here with no timestamp at all. A bare msg['timestamp'].strftime()
+        # raises KeyError/AttributeError and kills the whole transcript dump.
+        ts = ensure_aware_utc(msg.get('timestamp'))
+        timestamp = ts.strftime('%H:%M:%S') if ts else '--:--:--'
         
         # Determine sender display name
         if msg['from_user_id'] == session['user_id']:
@@ -71,8 +76,8 @@ def show_sessions_this_month():
         return
     
     # Get start of current month
-    now = datetime.datetime.utcnow()
-    start_of_month = datetime.datetime(now.year, now.month, 1)
+    now = utcnow()
+    start_of_month = datetime.datetime(now.year, now.month, 1, tzinfo=UTC)
     
     sessions = db_mgr.get_sessions_in_date_range(start_of_month, now)
     
@@ -85,7 +90,8 @@ def show_sessions_this_month():
     
     for session in sessions:
         status_emoji = {"pending": "⏳", "active": "🟢", "ended": "✅"}.get(session['status'], "❓")
-        created = session['created_at'].strftime('%m/%d %H:%M')
+        created_dt = ensure_aware_utc(session.get('created_at'))
+        created = created_dt.strftime('%m/%d %H:%M') if created_dt else '--/-- --:--'
         duration = f"{session.get('duration_minutes', 0)}m" if session['status'] == 'ended' else 'N/A'
         
         print(f"{status_emoji} {session['session_id'][:8]}... | {created} | {duration} | {session['status']}")

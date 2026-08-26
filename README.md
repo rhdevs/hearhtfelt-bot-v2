@@ -1,12 +1,15 @@
-# Heartfelt Anonymous Support Bot
+# Care Network Bot
 
-Anonymous Telegram bot connecting users with support members. Complete anonymity maintained - users see "HeaRHtfelt Member", support members see "RHesident #1234".eaRHtfelt Companion Bot
-
-Anonymous Telegram bot connecting users with support members. Complete anonymity maintained - users see "Heartfelt Member", support members see "Anonymous User #1234".
+Anonymous Telegram bot connecting people who want to talk with members of the
+Care Network. Anonymity is maintained in both directions: the requester sees
+their helper's track label ("Hearhtfelt Member" or "Peer Supporter"), and the
+helper sees only "RHesident #1234".
 
 ## Features
 
-- Anonymous queue system with admin channel management
+- Anonymous queue system with per-track channel management (HF and PSS)
+- Per-track timers: how long a request waits, and how long an idle conversation lives
+- Restart durability: queued requests and in-flight conversations survive a redeploy
 - Optional MongoDB storage for conversation history
 - Queue cancellation and session management
 - Graceful fallback to memory-only mode
@@ -37,10 +40,21 @@ Anonymous Telegram bot connecting users with support members. Complete anonymity
 
 ## How It Works
 
-**Users:** `/help` → describe issue → wait in queue → anonymous chat → `/end`  
-**Support Members:** Monitor admin channel → click "Claim" → anonymous chat → `/end`
+**Users:** `/chat` → describe issue → wait in queue → anonymous chat → `/end`  
+**Support Members:** Monitor the track's channel → click "Claim" → anonymous chat → `/end`
 
-**Commands:** `/start` `/help` `/status` `/cancel` `/end`
+**Commands:** `/start` `/chat` `/status` `/cancel` `/end`
+
+`/help` is kept alive as an alias for `/chat` (posters and existing users still
+reach for it), but `/chat` is the primary command and the only one advertised in
+the Telegram command menu.
+
+### Timers
+
+| Track | Request waits in channel | Idle conversation closes | Warning sent |
+|---|---|---|---|
+| HF | 60 min | 30 min idle | 25 min idle (5 min lead) |
+| PSS | 24 h | 24 h idle | 23 h idle (60 min lead) |
 
 ## Configuration
 
@@ -152,12 +166,42 @@ docker buildx build \
 
 ## Testing
 
+No pytest required -- every suite is a standalone script.
+
+This is exactly the set of files the CI `test` job runs, in the same order, so
+"run the tests locally" and "what the gate runs" can never diverge:
+
 ```bash
-python3 test_db_integration.py  # Test MongoDB integration
-python3 main.py                 # Start bot and test user flow
+python tests/test_dependency_pins.py     # installed versions == requirements.txt pins
+python tests/test_boot.py                # PTB API surface + main() boot ordering
+python tests/test_timeutil.py            # aware-UTC helpers
+python tests/test_service_config.py      # service registry + timer invariants
+python tests/test_copy.py                # requester-facing copy guards
+python tests/test_pss_flow.py            # full HF+PSS flow with a fake bot
+python tests/test_per_service_timers.py  # per-track queue/session expiry
+python tests/test_restore.py             # restart durability
+python tests/test_session_expiry.py      # warn/expire lifecycle
 ```
 
-Test flow: User sends `/help` → describe issue → check admin channel → claim → chat → `/end`
+Not run by CI:
+
+```bash
+python tests/demo_session_expiry.py      # demo, no assertions, not in CI
+# WRITES DOCUMENTS. Set MONGODB_URI explicitly on the command line: without it
+# config.py's load_dotenv() supplies whatever is in your .env, which on a
+# maintainer's machine is usually PRODUCTION. Never omit it, never point it at prod.
+ALLOW_DB_INTEGRATION_TEST=1 MONGODB_URI=mongodb://localhost:27017 python tests/test_db_integration.py
+```
+
+Run these from a virtualenv built with `pip install -r requirements.txt`;
+`tests/test_dependency_pins.py` will tell you if you have not (it fails
+deliberately on a mismatched environment).
+
+On Windows, set `PYTHONIOENCODING=utf-8` first or the emoji in the test output
+will raise `UnicodeEncodeError` from the console codec. CI sets it too.
+
+Manual test flow: user sends `/chat` → describe issue → check the track's channel
+→ claim → chat → `/end`
 
 ## Privacy Policy
 

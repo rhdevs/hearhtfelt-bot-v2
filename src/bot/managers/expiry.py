@@ -3,17 +3,19 @@ import datetime
 import logging
 from typing import Dict, Any
 from telegram import Bot
+import config
 from config import (
     active_sessions,
     session_warnings,
     user_states,
     UserState,
-    SESSION_TIMEOUT_MINUTES,
-    SESSION_WARNING_MINUTES,
     SESSION_SWEEP_SECONDS,
+    SERVICES,
+    get_service,
     MESSAGES,
     is_heartfelt_member,
 )
+from src.timeutil import ensure_aware_utc, format_duration_minutes, utcnow
 from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
@@ -33,7 +35,7 @@ class SessionExpiryManager:
         
         while self.running:
             try:
-                await self._cleanup_expired_sessions()
+                await self.run_once()
             except Exception as e:
                 logger.error(f"Error during session cleanup: {e}")
             
@@ -45,43 +47,73 @@ class SessionExpiryManager:
         self.running = False
         logger.info("Stopping session expiry cleanup task")
     
+    async def run_once(self) -> None:
+        """One cleanup pass. Public wrapper for boot-time and test use."""
+        await self._cleanup_expired_sessions()
+
     async def _cleanup_expired_sessions(self):
-        """Check for expired sessions and handle warnings/cleanup"""
-        now = datetime.datetime.now()
-        
-        # Calculate cutoff times
-        expiry_cutoff = now - datetime.timedelta(minutes=SESSION_TIMEOUT_MINUTES)
-        warning_cutoff = now - datetime.timedelta(minutes=SESSION_WARNING_MINUTES)
-        
+        """Check for expired sessions and handle warnings/cleanup.
+
+        Timers are PER SERVICE, so there is no single global cutoff any more: each
+        session is measured against its own track's window.
+        """
+        now = utcnow()
+
         sessions_to_expire = []
         sessions_to_warn = []
-        
-        # Check in-memory sessions first (primary data source)
-        for session_id, session_data in active_sessions.items():
-            last_activity = session_data.get('last_activity_at', session_data.get('created_at'))
-            
-            if not last_activity:
+
+        # Check in-memory sessions first (primary data source).
+        # list(): _expire_session mutates active_sessions while we iterate.
+        for session_id, session_data in list(active_sessions.items()):
+            svc = get_service(session_data.get('service'))
+            last_activity = ensure_aware_utc(
+                session_data.get('last_activity_at') or session_data.get('created_at')
+            )
+            if last_activity is None:
+                logger.warning("Session %s has no usable activity timestamp; skipping", session_id)
                 continue
-                
-            # Check if session should be expired
-            if last_activity <= expiry_cutoff:
+
+            idle_minutes = (now - last_activity).total_seconds() / 60.0
+
+            if idle_minutes >= svc.session_timeout_minutes:
                 sessions_to_expire.append((session_id, session_data))
-            # Check if session needs warning (and hasn't been warned yet)
-            elif (last_activity <= warning_cutoff and 
-                  not session_warnings.get(session_id, False)):
+            elif (idle_minutes >= svc.session_timeout_minutes - svc.session_warning_minutes
+                  and not session_warnings.get(session_id, False)):
                 sessions_to_warn.append((session_id, session_data))
-        
-        # If database is available, also check for any sessions that might be missing from memory
+
+        # If the database is available, also catch sessions missing from memory (a
+        # restart mid-conversation, or a doc whose rehydration was deliberately
+        # skipped).
+        #
+        # The cutoff uses the SHORTEST timeout across services, because
+        # get_sessions_by_activity returns rows with last_activity <= cutoff: the
+        # shortest timeout puts the cutoff nearest to now and so returns the widest
+        # superset -- every session that could possibly be expired by ANY service's
+        # rule. Using the longest timeout here would make the query narrower instead,
+        # and an orphaned HF conversation would go unclosed for a full 24 hours.
+        # The per-service re-filter below is what stops a PSS session from being
+        # expired against HF's much shorter window.
         if db_mgr.db_available:
             try:
-                db_expired = db_mgr.get_sessions_by_activity(expiry_cutoff)
-                for db_session in db_expired:
-                    session_id = db_session['session_id']
-                    # Only add if not already in memory (edge case for bot restarts)
-                    if session_id not in active_sessions:
-                        sessions_to_expire.append((session_id, db_session))
+                widest = min(s.session_timeout_minutes for s in SERVICES.values())
+                cutoff = now - datetime.timedelta(minutes=widest)
+                for doc in db_mgr.get_sessions_by_activity(cutoff):
+                    sid = doc.get('session_id')
+                    if not sid or sid in active_sessions:
+                        continue
+                    svc = get_service(doc.get('service'))
+                    last = ensure_aware_utc(
+                        doc.get('last_activity_at')
+                        or doc.get('claimed_at')
+                        or doc.get('created_at')
+                    )
+                    if last is None:
+                        continue
+                    if (now - last).total_seconds() / 60.0 >= svc.session_timeout_minutes:
+                        sessions_to_expire.append((sid, doc))
             except Exception as e:
                 logger.error(f"Error checking database for expired sessions: {e}")
+
         
         # Process warnings
         for session_id, session_data in sessions_to_warn:
@@ -105,20 +137,26 @@ class SessionExpiryManager:
             # Mark as warned to prevent spam
             session_warnings[session_id] = True
             
+            # Per-track lead time: HF renders "in 5 minutes", PSS "in 1 hour".
+            svc = get_service(session_data.get('service'))
+            text = MESSAGES["session_warning"].format(
+                duration=format_duration_minutes(svc.session_warning_minutes)
+            )
+
             # Send warning to user
             try:
                 await self.bot.send_message(
                     chat_id=user_id,
-                    text=MESSAGES["session_warning"]
+                    text=text
                 )
             except Exception as e:
                 logger.warning(f"Could not send warning to user {user_id}: {e}")
-            
+
             # Send warning to heartfelt member
             try:
                 await self.bot.send_message(
                     chat_id=heartfelt_member_id,
-                    text=MESSAGES["session_warning"]
+                    text=text
                 )
             except Exception as e:
                 logger.warning(f"Could not send warning to heartfelt member {heartfelt_member_id}: {e}")
@@ -133,7 +171,37 @@ class SessionExpiryManager:
         try:
             user_id = session_data['user_id']
             heartfelt_member_id = session_data['heartfelt_member_id']
-            
+
+            # Was this session ever in memory? The DB-fallback branch of the sweep feeds
+            # us documents that are NOT in active_sessions (skipped rehydration, or a
+            # restart mid-conversation). SessionManager.end_session returns early for
+            # those WITHOUT touching Mongo, so we have to close them ourselves below.
+            in_memory = session_id in active_sessions
+
+            # How stale is this? A conversation whose last activity is further in the
+            # past than its own window PLUS the stale-notify grace period is not one
+            # anybody is still waiting on: either the bot was down for hours, or this
+            # is an orphaned row left by an earlier deploy. Close it -- but tell NOBODY.
+            #
+            # Without this, the boot-time run_once() in main() reaches back over every
+            # status='active' document in the collection and DMs both parties of each,
+            # months after the fact. RESTORE_DRY_RUN, RESTORE_ENABLED=false and the
+            # RESTORE_MAX_* circuit breaker all make that WORSE, not better: each of
+            # them leaves active_sessions empty, so every ancient row looks like an
+            # orphan to the DB-fallback branch below. This is the session-side twin of
+            # the pending horizon in restore._restore_pending.
+            svc = get_service(session_data.get('service'))
+            last_activity = ensure_aware_utc(
+                session_data.get('last_activity_at')
+                or session_data.get('claimed_at')
+                or session_data.get('created_at')
+            )
+            horizon = svc.session_timeout_minutes + config.STALE_NOTIFY_GRACE_MINUTES
+            stale = (
+                last_activity is not None
+                and (utcnow() - last_activity).total_seconds() / 60.0 > horizon
+            )
+
             # Log system message to transcript if database available
             if db_mgr.db_available:
                 try:
@@ -147,15 +215,52 @@ class SessionExpiryManager:
                 except Exception as e:
                     logger.warning(f"Could not log system message for session {session_id}: {e}")
             
-            # End the session (this handles database updates and cleanup)
-            await self.session_manager.end_session(session_id, user_id, system_end=True)
-            
+            # Close the Mongo row FIRST, and gate every notification on winning that
+            # atomic find_one_and_update -- for the in-memory case as well as the orphan
+            # case. SessionManager.end_session also calls db_mgr.end_session, but it
+            # DISCARDS the return value, so it cannot be the gate: during a deploy
+            # rollback two instances briefly run, both rehydrate the same document into
+            # their own memory, both expire it, and both would DM the same two people.
+            # The redundant close inside session_manager.end_session below is a no-op --
+            # the row is no longer pending/active, so its filter matches nothing.
+            won = True
+            if db_mgr.db_available:
+                won = db_mgr.end_session(session_id, user_id, system_end=True,
+                                         end_reason='idle_expired')
+            elif not in_memory:
+                logger.warning(
+                    "Orphan session %s expired with no DB to close it against", session_id
+                )
+
+            # Clean up memory regardless of who won: the row is closed either way, so
+            # the in-memory copy is stale. (A no-op when the session was never in memory.)
+            await self.session_manager.end_session(session_id, user_id, system_end=True,
+                                                   end_reason='idle_expired')
+
             # Update user states
             if user_id:
                 user_states[user_id] = UserState.IDLE
             if heartfelt_member_id:
                 user_states[heartfelt_member_id] = UserState.IDLE
-            
+
+            if not won:
+                logger.info(
+                    "Session %s was already closed elsewhere; skipping notifications",
+                    session_id,
+                )
+                return
+
+            if stale:
+                logger.info(
+                    "Session %s was idle %.0f min (> %d min horizon) -- closing it "
+                    "silently; notifying anyone this long after the fact would only "
+                    "confuse them",
+                    session_id,
+                    (utcnow() - last_activity).total_seconds() / 60.0,
+                    horizon,
+                )
+                return
+
             # Send expiry notifications
             if user_id:
                 try:

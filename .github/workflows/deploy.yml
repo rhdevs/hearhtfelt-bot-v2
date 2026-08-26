@@ -3,18 +3,133 @@ name: Build and Deploy heartfelt-bot
 on:
   push:
     branches: [main]
+  # Pull requests are what make the gate useful: the tests run BEFORE the merge
+  # that deploys. A PR run never builds, never pushes to GHCR and never SSHes.
+  pull_request:
   workflow_dispatch:
 
-# Never let two deploys run at once; don't cancel an in-flight deploy.
+# INVARIANT: two deploys must never run at once, and a PR run must never delay or
+# cancel an in-flight deploy.
+#
+# The group must be scoped by EVENT, not by ref. Scoping it by ref alone
+# (deploy-heartfelt-bot-${{ github.ref }}) breaks the first half of the invariant:
+# workflow_dispatch can be run on ANY branch and only pull_request is excluded from
+# build-and-push, so a dispatch on a feature branch reaches `deploy` in a different
+# concurrency group from a push to main, and the two deploy jobs run at the same
+# time against the same droplet. deploy/deploy.sh is not concurrency-safe -- it
+# renames the live container aside, `docker run --name heartfelt-bot`, and rm -f's
+# the rollback target, all under `set -euo pipefail`. Two overlapping runs can
+# delete each other's rollback container or leave the bot renamed and stopped, and
+# in the window where both containers are up, Telegram's single-poller rule means
+# getUpdates 409s and messages from people in distress are dropped.
+#
+# So: everything that can deploy (push to main, workflow_dispatch on any ref)
+# shares ONE lane and serialises, exactly as the pre-gate workflow did. Only
+# pull_request runs are per-ref, which is what stops a live deploy queueing behind
+# unrelated PR test runs. cancel-in-progress is true ONLY for pull_request, so a
+# superseded PR run is dropped and a deploy is never interrupted.
 concurrency:
-  group: deploy-heartfelt-bot
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('heartfelt-bot-pr-{0}', github.ref) || 'heartfelt-bot-deploy' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE: ghcr.io/rhdevs/heartfelt-bot
 
 jobs:
+  # This job gates deploys to a live mental-health helpline. It must have NO
+  # access to secrets: no MONGODB_URI, no BOT_TOKEN, no droplet key. Every suite
+  # runs against fakes. Do not add a `secrets.` reference to this job.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      # Every suite prints emoji. On a non-UTF-8 stdio this raises
+      # UnicodeEncodeError, which reads like a test failure. Ubuntu almost
+      # certainly does not need this (PEP 538/540), but it is free and makes the
+      # CI invocation byte-identical to the documented local one.
+      PYTHONIOENCODING: utf-8
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Dockerfile's `FROM python:3.12-slim`.
+          # No `cache: pip`: three small wheels, and the cache is one more thing
+          # that can flake in front of a deploy gate.
+          python-version: '3.12'
+
+      - name: Install pinned dependencies
+        run: python -m pip install --upgrade pip
+
+      # Installs exactly python-telegram-bot==22.2, python-dotenv==1.0.0 and
+      # pymongo==4.6.0 -- the same set the image gets. No pytest, no extras.
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Resolved dependency versions
+        run: pip freeze
+
+      # Catches syntax errors in modules no test imports (e.g. src/database/utils.py).
+      - name: Byte-compile every module
+        run: python -m compileall -q -x '_deployed_reference|[.]venv|venv' .
+
+      # One step per file: the Actions UI then names the broken suite, and there
+      # are no shell exit-code semantics to get wrong. Do NOT collapse into a loop.
+      #
+      # Do NOT add `-W error`: tests/test_restore.py deliberately calls the
+      # deprecated datetime.datetime.utcnow() to build a legacy naive timestamp,
+      # and -W error would turn that into a false failure.
+      #
+      # ADMIN_CHANNEL_ID is deliberately NOT set. All suites pass with and without
+      # it; setting it makes enabled_services() non-empty and silently changes
+      # default_service_key() for every suite.
+      #
+      # There is no .env in the repo and none may ever be created here. config.py
+      # calls load_dotenv(), which reads ./.env only; .env.production is local and
+      # gitignored, and nothing in this job may reference it.
+      #
+      # Deliberately excluded:
+      #   tests/test_db_integration.py  -- needs a live Mongo and WRITES DOCUMENTS.
+      #                                    There must never be a MONGODB_URI secret
+      #                                    in this job.
+      #   tests/demo_session_expiry.py  -- a demonstration script with zero
+      #                                    assertions; it always exits 0.
+      - name: tests/test_dependency_pins.py
+        run: python tests/test_dependency_pins.py
+
+      - name: tests/test_boot.py
+        run: python tests/test_boot.py
+
+      - name: tests/test_timeutil.py
+        run: python tests/test_timeutil.py
+
+      - name: tests/test_service_config.py
+        run: python tests/test_service_config.py
+
+      - name: tests/test_copy.py
+        run: python tests/test_copy.py
+
+      - name: tests/test_pss_flow.py
+        run: python tests/test_pss_flow.py
+
+      - name: tests/test_per_service_timers.py
+        run: python tests/test_per_service_timers.py
+
+      - name: tests/test_restore.py
+        run: python tests/test_restore.py
+
+      - name: tests/test_session_expiry.py
+        run: python tests/test_session_expiry.py
+
   build-and-push:
+    # A red test job blocks the build, and therefore the deploy.
+    needs: test
+    # A pull request runs the tests and stops there: no GHCR write, no SSH, no
+    # secrets. Only push-to-main and workflow_dispatch continue past here.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -43,6 +158,8 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy:
+    # No `if:` needed and none wanted: a skipped dependency skips the dependent,
+    # so a pull request never reaches this job. Never add `if: always()` here.
     needs: build-and-push
     runs-on: ubuntu-latest
     permissions:

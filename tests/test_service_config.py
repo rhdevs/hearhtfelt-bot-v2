@@ -68,8 +68,54 @@ def test_service_runnable_requires_channel():
     assert s.runnable is True
 
 
+def test_per_service_timers():
+    hf, pss = SERVICES["hf"], SERVICES["pss"]
+    assert (hf.queue_expire_minutes, hf.session_timeout_minutes,
+            hf.session_warning_minutes) == (60, 30, 5)
+    assert (pss.queue_expire_minutes, pss.session_timeout_minutes,
+            pss.session_warning_minutes) == (1440, 1440, 60)
+    # session_warning_minutes is a LEAD TIME, so it must be smaller than the timeout
+    # or every session would be born already inside its warning band.
+    for svc in SERVICES.values():
+        assert 0 < svc.session_warning_minutes < svc.session_timeout_minutes, svc.key
+
+
+def test_back_compat_aliases_mirror_hf():
+    hf = SERVICES["hf"]
+    assert config.QUEUE_EXPIRE_MINUTES == hf.queue_expire_minutes
+    assert config.SESSION_TIMEOUT_MINUTES == hf.session_timeout_minutes
+    assert config.SESSION_WARNING_MINUTES == hf.session_warning_minutes
+
+
+def test_sweep_fits_inside_the_shortest_warning_band():
+    """A sweep longer than the narrowest warning band can skip it entirely,
+    letting a conversation die with no warning at all."""
+    shortest_band = min(s.session_warning_minutes for s in SERVICES.values()) * 60
+    assert config.SESSION_SWEEP_SECONDS < shortest_band, (
+        config.SESSION_SWEEP_SECONDS, shortest_band)
+
+
+def test_sharing_clauses_and_privacy_urls():
+    assert SERVICES["hf"].sharing_clause == "shared anonymously with our support team"
+    assert SERVICES["pss"].sharing_clause == "shared with our peer student supporters"
+    for svc in SERVICES.values():
+        assert svc.privacy_policy_url and svc.privacy_policy_url.startswith("https://"), svc.key
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+
+    # A driver that discovers its own tests reports success when it discovers
+    # NOTHING. Verified: renaming the `test_` prefix in this file made it print
+    # "All 0 tests passed!" and exit 0 -- a fully green CI step, in front of a
+    # deploy to a live helpline, having run zero assertions. A refactor into a
+    # class, a rename, an import shadow or a bad merge all reach that state.
+    # Coverage here may grow; it may not silently shrink.
+    assert len(tests) >= 11, (
+        "expected at least 11 tests, collected %d (%s). Test discovery has "
+        "regressed -- fix the discovery, do not lower this number."
+        % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
+    )
     for t in tests:
         t()
         print(f"OK  {t.__name__}")

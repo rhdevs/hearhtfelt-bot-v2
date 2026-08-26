@@ -25,3 +25,5 @@ _deployed_reference/
 # Operating System files
 .DS_Store
 Thumbs.db
+# Local memory-plugin data (not part of the project)
+.memsearch/

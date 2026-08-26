@@ -15,6 +15,7 @@ from config import (
     enabled_services,
     default_service_key,
     get_service,
+    help_request_text,
 )
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager, SelfClaimError
@@ -33,8 +34,8 @@ class BotHandlers:
         
         await update.message.reply_text(MESSAGES["welcome"])
     
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command to start help request"""
+    async def chat_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /chat (and its /help alias) to start a support request."""
         user_id = update.effective_user.id
         current_state = user_states.get(user_id, UserState.IDLE)
         
@@ -58,9 +59,12 @@ class BotHandlers:
         # chooser entirely so behaviour is identical to before.
         svcs = enabled_services()
         if len(svcs) <= 1:
-            user_to_service_map[user_id] = default_service_key()
+            # Resolve the key ONCE: the prompt must describe the same track we just
+            # recorded against this user.
+            key = default_service_key()
+            user_to_service_map[user_id] = key
             user_states[user_id] = UserState.WAITING_FOR_DESCRIPTION
-            await update.message.reply_text(MESSAGES["help_request"])
+            await update.message.reply_text(help_request_text(key))
             return
 
         user_states[user_id] = UserState.WAITING_FOR_SERVICE
@@ -72,6 +76,10 @@ class BotHandlers:
             MESSAGES["choose_service"],
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Back-compat alias: /help is kept alive for posters and existing users."""
+        await self.chat_command(update, context)
     
     async def end_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /end command to end conversation"""
@@ -197,7 +205,7 @@ class BotHandlers:
         
         # Default response for messages when not in conversation or waiting for input
         await update.message.reply_text(
-            "I'm not sure what you mean. Use /help to start a conversation with a support member."
+            "I'm not sure what you mean. Use /chat to start a conversation with a support member."
         )
     
     async def handle_sticker(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -215,7 +223,7 @@ class BotHandlers:
                 await update.message.reply_text("Sorry, there was an error sending your sticker. Please try again.")
         else:
             # If no session, inform the user
-            await update.message.reply_text("You can only send stickers during an active conversation. Use /help to start.")
+            await update.message.reply_text("You can only send stickers during an active conversation. Use /chat to start.")
     
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle and relay photos during an active conversation with size validation"""
@@ -241,7 +249,7 @@ class BotHandlers:
         else:
             # If no session, inform the user
             await update.message.reply_text(
-                "You can only send photos during an active conversation. Use /help to start."
+                "You can only send photos during an active conversation. Use /chat to start."
             )
     
     async def _handle_help_description(self, update: Update, context: ContextTypes.DEFAULT_TYPE, description: str):
@@ -378,7 +386,7 @@ class BotHandlers:
         user_id = query.from_user.id
 
         if user_states.get(user_id) != UserState.WAITING_FOR_SERVICE:
-            await query.answer("This choice is no longer valid. Use /help to start.", show_alert=True)
+            await query.answer("This choice is no longer valid. Use /chat to start.", show_alert=True)
             return
 
         key = (query.data or "")[len("svc_"):]
@@ -389,11 +397,12 @@ class BotHandlers:
 
         user_to_service_map[user_id] = svc.key
         user_states[user_id] = UserState.WAITING_FOR_DESCRIPTION
+        prompt = help_request_text(svc.key)
         try:
-            await query.edit_message_text(MESSAGES["help_request"])
+            await query.edit_message_text(prompt)
         except Exception:
             # If the message can't be edited, fall back to a fresh prompt
-            await context.bot.send_message(chat_id=user_id, text=MESSAGES["help_request"])
+            await context.bot.send_message(chat_id=user_id, text=prompt)
         await query.answer()
 
     async def handle_error(self, update: Update, context: CallbackContext):

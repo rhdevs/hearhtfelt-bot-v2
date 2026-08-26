@@ -3,10 +3,11 @@ import html
 import logging
 import random
 import uuid
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from config import (
-    QUEUE_EXPIRE_MINUTES,
+    MESSAGES,
+    used_anonymous_ids,
     ServiceType,
     UserState,
     get_service,
@@ -15,6 +16,7 @@ from config import (
     user_states,
     user_to_queue_map,
 )
+from src.timeutil import ensure_aware_utc, format_hhmm, utcnow
 from src.database.manager import db_mgr
 
 
@@ -30,11 +32,15 @@ class QueueManager:
     def __init__(self, bot: Bot):
         self.bot = bot
         self.channel_accessible = {}  # service_key -> bool (per-service channel reachability)
-        self.used_anonymous_ids = set()  # Track used IDs to avoid duplicates
+        # Shared with SessionManager via config so the two never collide.
+        self.used_anonymous_ids = used_anonymous_ids
 
     def _channel_for(self, entry: dict):
-        """Resolve the queue channel for a given queue entry's service."""
-        return get_service(entry.get('service')).channel_id
+        """Channel this entry's post actually lives in.
+
+        The recorded value wins over current config, because a service's channel_id
+        can change between restarts and the post does not move with it."""
+        return entry.get('channel_id') or get_service(entry.get('service')).channel_id
 
     def get_queue_entry(self, queue_id: str) -> Optional[dict]:
         """Return the in-memory queue entry (or None) without mutating it."""
@@ -71,9 +77,10 @@ class QueueManager:
         queue_entries[queue_id] = {
             'user_id': user_id,
             'description': description,
-            'created_at': datetime.datetime.now(),
+            'created_at': utcnow(),
             'anonymous_id': anonymous_id,
             'message_id': None,  # Will be set after posting to channel
+            'channel_id': None,  # ditto -- the channel the post actually landed in
             'service': service_key,
         }
 
@@ -104,7 +111,7 @@ class QueueManager:
             message_text = (
                 f"{svc.request_title}\n\n"
                 f"From: {queue_entry['anonymous_id']}\n"
-                f"Time: {queue_entry['created_at'].strftime('%H:%M')}\n\n"
+                f"Time: {format_hhmm(queue_entry['created_at'])}\n\n"
                 f"Description: {queue_entry['description'][:200]}{'...' if len(queue_entry['description']) > 200 else ''}"
             )
 
@@ -121,7 +128,18 @@ class QueueManager:
 
             # Store message ID for later deletion
             queue_entries[queue_id]['message_id'] = message.message_id
+            queue_entries[queue_id]['channel_id'] = svc.channel_id
             self.channel_accessible[svc.key] = True  # Mark as accessible on success
+
+            # Persist it so a restarted bot can still edit or delete this post. A DB
+            # hiccup here must NOT fail the post: the requester is already queued and
+            # the in-memory entry is complete. The only cost is losing edit/delete
+            # ability across a restart.
+            if db_mgr.db_available:
+                try:
+                    db_mgr.set_queue_message(queue_id, svc.channel_id, message.message_id)
+                except Exception as exc:
+                    logger.warning("Could not persist queue message id for %s: %s", queue_id, exc)
 
             return True, "success"
 
@@ -150,7 +168,11 @@ class QueueManager:
             return None
 
         user_id = queue_entry['user_id']
-        message_id = queue_entry['message_id']
+        message_id = queue_entry.get('message_id')
+        if not message_id and queue_entry.get('restored'):
+            logger.warning(
+                "Claimed restored entry %s with no recorded message_id; channel post "
+                "left unedited", queue_id)
 
         if user_id == heartfelt_member_id:
             raise SelfClaimError("Claimant cannot take their own queue entry")
@@ -163,6 +185,26 @@ class QueueManager:
             if not claimed:
                 logger.info("Queue %s already claimed (DB guard); ignoring duplicate claim by %s", queue_id, heartfelt_member_id)
                 return None
+
+        # Take the entry out of the queue NOW -- synchronously, before the first
+        # await -- so the in-memory claim is as atomic as the DB one above.
+        #
+        # This used to happen after `await self._edit_claimed_message(...)`. That
+        # await yields, and if the 5-minute queue_cleanup_loop resumes in the gap
+        # while the entry is past its window, cleanup_expired_queues still sees it,
+        # pops it, and sweep_expired_queues closes the row -- whose status the claim
+        # just flipped to 'active', which end_session's {pending, active} filter
+        # happily matches. The requester was DMed "your place in the queue expired"
+        # and then connected to a companion a moment later, with the conversation's
+        # Mongo row already ended as 'queue_expired': no transcript close, no
+        # activity updates, and nothing for rehydration to restore.
+        #
+        # `queue_entry` is a local reference, so the edit below still works.
+        queue_entries.pop(queue_id, None)
+        if user_id in user_to_queue_map:
+            del user_to_queue_map[user_id]
+        if queue_id in queue_order:
+            queue_order.remove(queue_id)
 
         # Edit the queue message to show it's been claimed instead of deleting it
         try:
@@ -179,20 +221,11 @@ class QueueManager:
             except Exception as delete_error:
                 print(f"Error deleting queue message as fallback: {delete_error}")
 
-        # Remove from queue and clean up indices
-        queue_entries.pop(queue_id, None)
-        
-        # Clean up O(1) lookup indices
-        if user_id in user_to_queue_map:
-            del user_to_queue_map[user_id]
-        if queue_id in queue_order:
-            queue_order.remove(queue_id)
-        
         return user_id
     
     async def _edit_claimed_message(self, queue_entry: dict, heartfelt_member_name: str):
         """Edit the queue message to show it's been claimed"""
-        claimed_time = datetime.datetime.now()
+        claimed_time = utcnow()
         
         # Create the claimed message text with HTML formatting
         # Escape user-provided content to prevent HTML injection
@@ -203,9 +236,9 @@ class QueueManager:
         claimed_message_text = (
             f"✅ <b>CLAIMED</b> - Help Request\n\n"
             f"From: {queue_entry['anonymous_id']}\n"
-            f"Requested: {queue_entry['created_at'].strftime('%H:%M')}\n"
+            f"Requested: {format_hhmm(queue_entry['created_at'])}\n"
             f"Claimed by: {safe_member_name}\n"
-            f"Claimed at: {claimed_time.strftime('%H:%M')}\n\n"
+            f"Claimed at: {format_hhmm(claimed_time)}\n\n"
             f"Description: {safe_description}{description_suffix}"
         )
 
@@ -240,47 +273,135 @@ class QueueManager:
         # Simple estimation: 5 minutes per person ahead
         return position * 5
     
-    def cleanup_expired_queues(self):
-        """Remove expired queue entries and reset user state when needed"""
-        now = datetime.datetime.now()
+    def cleanup_expired_queues(self) -> List[dict]:
+        """Remove expired queue entries. Returns the popped entries (sync, no Telegram I/O).
+
+        Each returned entry is the popped entry plus 'queue_id' and 'notify', where
+        notify is True iff the user was still IN_QUEUE at cleanup time -- the same
+        gate the old code used before messaging anyone.
+        """
+        now = utcnow()
         expired_queue_ids = []
 
         for queue_id, entry in list(queue_entries.items()):
-            time_diff = now - entry['created_at']
-            if time_diff.total_seconds() > (QUEUE_EXPIRE_MINUTES * 60):
+            created = ensure_aware_utc(entry.get('created_at'))
+            window_seconds = get_service(entry.get('service')).queue_expire_minutes * 60
+            if created is None:
+                # Unusable timestamp: we cannot tell how long this has waited, and
+                # leaving it queued forever is worse than retiring it.
+                logger.warning("Queue entry %s has no usable created_at; expiring it", queue_id)
+                expired = True
+            else:
+                expired = (now - created).total_seconds() > window_seconds
+            if expired:
                 expired_queue_ids.append(queue_id)
 
-        expired_users = []
+        expired_entries = []
         for queue_id in expired_queue_ids:
-            # Try to delete the message from admin channel
-            try:
-                entry = queue_entries[queue_id]
-                if entry.get('message_id'):
-                    # Note: This should be called with await in an async context
-                    pass  # Will be handled by the main bot loop
-            except:
-                pass
-            
-            # Clean up all data structures
             entry = queue_entries.get(queue_id)
-            if entry:
-                user_id = entry.get('user_id')
-                if user_id:
-                    current_state = user_states.get(user_id)
-                    if current_state == UserState.IN_QUEUE:
-                        user_states[user_id] = UserState.IDLE
-                        expired_users.append({"user_id": user_id, "service": entry.get('service')})
+            if not entry:
+                continue
 
-                if user_id and user_id in user_to_queue_map:
+            notify = False
+            user_id = entry.get('user_id')
+            if user_id:
+                if user_states.get(user_id) == UserState.IN_QUEUE:
+                    user_states[user_id] = UserState.IDLE
+                    notify = True
+                if user_id in user_to_queue_map:
                     del user_to_queue_map[user_id]
 
             queue_entries.pop(queue_id, None)
-
-            # Remove from queue order
             if queue_id in queue_order:
                 queue_order.remove(queue_id)
 
-        return expired_users
+            expired_entries.append({**entry, 'queue_id': queue_id, 'notify': notify})
+
+        return expired_entries
+
+    async def sweep_expired_queues(self) -> List[dict]:
+        """Expire stale queue entries: close the DB row, retire the channel post,
+        notify the requester. Returns the entries actually acted on."""
+        acted = []
+        for entry in self.cleanup_expired_queues():
+            queue_id = entry['queue_id']
+            svc = get_service(entry.get('service'))
+
+            # 1. Close the Mongo row FIRST. end_session is an atomic
+            #    find_one_and_update filtered on status in {pending, active}, so a False
+            #    return means another actor already moved this row -- possibly a member
+            #    claiming it a moment ago. Telling that requester it expired would be a
+            #    lie, so we skip the notification entirely.
+            won = True
+            if db_mgr.db_available:
+                try:
+                    won = db_mgr.end_session(queue_id, None, system_end=True,
+                                             end_reason='queue_expired')
+                except Exception as exc:
+                    logger.warning("Could not close expired queue row %s: %s", queue_id, exc)
+                    won = False
+            if not won:
+                logger.info("Queue %s was already claimed or closed elsewhere; not notifying",
+                            queue_id)
+                continue
+
+            # 2. Retire the channel post so its Claim button stops being live.
+            await self._retire_channel_post(entry, svc)
+
+            # 3. Notify the requester.
+            if entry.get('notify') and entry.get('user_id'):
+                try:
+                    await self.bot.send_message(
+                        chat_id=entry['user_id'],
+                        text=MESSAGES["queue_expired"].format(member=svc.member_label),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to notify user %s about queue expiry: %s",
+                                   entry['user_id'], exc)
+
+            acted.append(entry)
+
+        return acted
+
+    async def _retire_channel_post(self, entry: dict, svc) -> None:
+        """Edit an expired request's channel post into an EXPIRED card and strip the
+        Claim button, falling back to deleting it. NEVER raises."""
+        message_id = entry.get('message_id')
+        if not message_id or not self.channel_accessible.get(svc.key, True):
+            return
+
+        description = entry.get('description') or ''
+        safe_description = html.escape(description[:200])
+        suffix = '...' if len(description) > 200 else ''
+        text = (
+            f"⌛ <b>EXPIRED</b> - Help Request\n\n"
+            f"From: {entry.get('anonymous_id', 'Unknown')}\n"
+            f"Requested: {format_hhmm(entry.get('created_at'))}\n"
+            f"Expired at: {format_hhmm(utcnow())}\n\n"
+            f"Description: {safe_description}{suffix}"
+        )
+
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self._channel_for(entry),
+                message_id=message_id,
+                text=text,
+                reply_markup=None,
+                parse_mode='HTML',
+            )
+            return
+        except Exception as exc:
+            logger.warning("Could not edit expired queue post %s: %s", entry.get('queue_id'), exc)
+
+        try:
+            await self.bot.delete_message(
+                chat_id=self._channel_for(entry),
+                message_id=message_id,
+            )
+        except Exception as exc:
+            logger.warning("Could not delete expired queue post %s either: %s",
+                           entry.get('queue_id'), exc)
+
     
     def is_user_in_queue(self, user_id: int) -> bool:
         """Check if user is already in queue - O(1) lookup"""
@@ -306,7 +427,7 @@ class QueueManager:
         if queue_entry.get('message_id') and self.channel_accessible.get(svc.key, True):
             try:
                 await self.bot.delete_message(
-                    chat_id=svc.channel_id,
+                    chat_id=self._channel_for(queue_entry),
                     message_id=queue_entry['message_id']
                 )
             except Exception as e:
@@ -321,5 +442,15 @@ class QueueManager:
             del user_to_queue_map[user_id]
         if queue_id_to_remove in queue_order:
             queue_order.remove(queue_id_to_remove)
-        
+
+        # Close the Mongo row. Without this a cancelled request stays status='pending'
+        # forever and would be resurrected by rehydration on the next restart.
+        if db_mgr.db_available:
+            try:
+                db_mgr.end_session(queue_id_to_remove, user_id, system_end=False,
+                                   end_reason='user_cancelled')
+            except Exception as exc:
+                logger.warning("Could not close cancelled queue row %s: %s",
+                               queue_id_to_remove, exc)
+
         return True, "success"

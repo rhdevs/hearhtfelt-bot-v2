@@ -1,14 +1,58 @@
 #!/usr/bin/env python3
 """
-Test script to verify MongoDB integration works correctly
+MongoDB integration check. NEEDS A LIVE MONGO, AND IT WRITES DOCUMENTS.
+
+This is the only file under tests/ that talks to a real database. It calls
+create_session / claim_session / log_message / end_session against whatever
+`MONGODB_URI` resolves to, so pointing it at production inserts real rows into
+`sessions` and `messages`. It NEVER runs in CI and there must never be a
+`MONGODB_URI` secret in the CI test job.
+
+Because of that it refuses to run unless you opt in explicitly:
+
+    ALLOW_DB_INTEGRATION_TEST=1 MONGODB_URI=mongodb://localhost:27017 \
+        python tests/test_db_integration.py
+
+Without the opt-in it exits NON-ZERO and connects to nothing -- a refusal must
+never be mistakable for a pass.
+
+That guard lives in main(), so it only covers `python tests/test_db_integration.py`.
+It does NOT cover a collector that calls the functions directly. This file is
+named test_*.py and used to define three module-level test_* functions, so
+`pytest` (or plain `pytest tests/`) collected and RAN all three without ever
+entering main() -- and since the file contains no `assert` at all, failures are
+only printed, so pytest reported "3 passed" while writing documents to whatever
+MONGODB_URI resolved to. A developer with a production URI in their local .env
+running the reflex command `pytest` would have inserted fabricated sessions and
+message bodies into a live helpline's database and seen a green run.
+
+Hence: the checks are named check_* rather than test_*, and __test__ = False is
+set below. Do not rename them back, and do not add a test_ prefixed name here.
+
+Until this commit the file could not be run at all: it was the only test file
+missing the `sys.path.insert` every other one has, so it died on
+`ModuleNotFoundError: No module named 'src'` at import time. Fixing that alone
+would have made a script that writes to $MONGODB_URI runnable for the first
+time, so the guard below lands in the same change.
 """
 
 import os
 import sys
 import datetime
-from src.database.manager import db_mgr
 
-def test_fallback_mode():
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.database.manager import db_mgr
+from src.timeutil import utcnow
+
+OPT_IN_ENV = "ALLOW_DB_INTEGRATION_TEST"
+
+# Belt and braces for the same reason the functions above are named check_*
+# rather than test_*: pytest honours a module-level __test__ = False and will
+# collect nothing from this file even if someone later adds a test_ name.
+__test__ = False
+
+def check_fallback_mode():
     """Test that the system works without MongoDB"""
     print("🧪 Testing fallback mode (no MongoDB)...")
     
@@ -42,7 +86,7 @@ def test_fallback_mode():
         if original_uri:
             os.environ['MONGODB_URI'] = original_uri
 
-def test_database_operations():
+def check_database_operations():
     """Test basic database operations if MongoDB is available"""
     print("\n🧪 Testing database operations...")
     
@@ -111,7 +155,7 @@ def test_database_operations():
     else:
         print("❌ Failed to create session")
 
-def test_analytics_queries():
+def check_analytics_queries():
     """Test analytics queries"""
     print("\n🧪 Testing analytics queries...")
     
@@ -124,29 +168,53 @@ def test_analytics_queries():
     print(f"✅ Session stats: {stats}")
     
     # Test date range query
-    end_date = datetime.datetime.utcnow()
+    end_date = utcnow()
     start_date = end_date - datetime.timedelta(days=30)
     sessions = db_mgr.get_sessions_in_date_range(start_date, end_date)
     print(f"✅ Found {len(sessions)} sessions in last 30 days")
 
 def main():
+    # Opt-in guard. Nothing above this line has opened a connection: importing
+    # src.database.manager only constructs the db_mgr singleton, and every
+    # connection happens inside db_mgr.initialize(), which is called by the test
+    # functions below.
+    if os.environ.get(OPT_IN_ENV) != "1":
+        print("❌ REFUSING TO RUN.")
+        print()
+        print("  This script is not a unit test. It connects to whatever MONGODB_URI")
+        print("  resolves to and WRITES DOCUMENTS: it creates a session, claims it,")
+        print("  logs a message and ends it, in the `sessions` and `messages`")
+        print("  collections. Aimed at production it inserts real rows into a live")
+        print("  mental-health helpline's database.")
+        print()
+        print(f"  Set {OPT_IN_ENV}=1 to confirm you know that, and point")
+        print("  MONGODB_URI at a scratch database -- never at production:")
+        print()
+        print(f"    {OPT_IN_ENV}=1 MONGODB_URI=mongodb://localhost:27017 \\")
+        print("        python tests/test_db_integration.py")
+        print()
+        print("  No connection was made. Exiting non-zero so this refusal cannot be")
+        print("  mistaken for a pass.")
+        return 2
+
     print("🚀 Starting MongoDB Integration Tests")
     print("=" * 50)
-    
+
     # Test fallback mode
-    test_fallback_mode()
+    check_fallback_mode()
     
     # Test database operations
-    test_database_operations()
+    check_database_operations()
     
     # Test analytics
-    test_analytics_queries()
+    check_analytics_queries()
     
     print("\n✅ All tests completed!")
     print("\n📋 Usage examples:")
     print("  python db_utils.py stats")
     print("  python db_utils.py monthly")
     print("  python db_utils.py transcript --session-id <session_id>")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

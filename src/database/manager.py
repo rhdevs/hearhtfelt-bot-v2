@@ -3,6 +3,7 @@ import uuid
 import logging
 from typing import Iterable, Optional, List, Dict, Any
 from src.database.connection import db_manager
+from src.timeutil import ensure_aware_utc, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class DBManager:
             if session_id is None:
                 session_id = str(uuid.uuid4())
 
-            now = datetime.datetime.utcnow()
+            now = utcnow()
             session_doc = {
                 'session_id': session_id,
                 'service': service,
@@ -43,6 +44,10 @@ class DBManager:
                 'claimed_at': None,
                 'ended_at': None,
                 'ended_by_user_id': None,
+                # Where this request's channel post lives, so a restarted bot can
+                # still edit or delete it. Filled in by set_queue_message.
+                'queue_channel_id': None,
+                'queue_message_id': None,
             }
             
             db_manager.db.sessions.insert_one(session_doc)
@@ -66,7 +71,7 @@ class DBManager:
                         'heartfelt_member_id': heartfelt_member_id,
                         'heartfelt_member_telehandle': heartfelt_member_telehandle,
                         'status': 'active',
-                        'claimed_at': datetime.datetime.utcnow()
+                        'claimed_at': utcnow()
                     },
                     '$currentDate': {
                         'last_activity_at': True  # Atomic timestamp update
@@ -83,48 +88,74 @@ class DBManager:
             logger.error(f"Error claiming session {session_id}: {e}")
             return False
     
-    def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False) -> bool:
-        """End an active session and calculate duration"""
+    def end_session(self, session_id: str, ended_by_user_id: int, system_end: bool = False,
+                    end_reason: str = None) -> bool:
+        """End an active session and calculate duration.
+
+        end_reason is purely additive metadata ('user_ended', 'queue_expired',
+        'idle_expired', 'user_cancelled', 'stale_startup_sweep', 'duplicate_pending',
+        'superseded_by_active'). status still becomes 'ended', so get_session_stats
+        and src/database/utils.py are unaffected."""
         if not self.db_available:
             return False
             
+        ended_at = utcnow()
+
+        updates = {
+            'status': 'ended',
+            'ended_at': ended_at,
+            'ended_by_user_id': ended_by_user_id if not system_end else None,
+            'ended_by_system': system_end,
+        }
+        if end_reason is not None:
+            updates['end_reason'] = end_reason
+
+        # Use atomic operation to prevent double-termination
         try:
-            ended_at = datetime.datetime.utcnow()
-            
-            # Use atomic operation to prevent double-termination
             result = db_manager.db.sessions.find_one_and_update(
                 {'session_id': session_id, 'status': {'$in': ['pending', 'active']}},
-                {
-                    '$set': {
-                        'status': 'ended',
-                        'ended_at': ended_at,
-                        'ended_by_user_id': ended_by_user_id if not system_end else None,
-                        'ended_by_system': system_end
-                    }
-                },
+                {'$set': updates},
                 return_document=True
             )
-            
-            if not result:
-                return False  # Session already ended or doesn't exist
-            
-            # Calculate duration from claimed_at if available, otherwise from created_at
-            start_time = result.get('claimed_at', result['created_at'])
-            duration_minutes = int((ended_at - start_time).total_seconds() / 60)
-            
-            # Update with calculated duration
+        except Exception as e:
+            logger.error(f"Error ending session {session_id}: {e}")
+            return False
+
+        if not result:
+            return False  # Session already ended or doesn't exist
+
+        # PAST THIS POINT THE TRANSITION IS COMMITTED, so nothing below may turn a
+        # successful close into a False return. Callers use that return value as the
+        # exactly-once gate on messaging real people (queue.sweep_expired_queues,
+        # expiry._expire_session): a False here means "someone else already closed
+        # it, stay quiet". If bookkeeping could produce the same False, we would end
+        # the row in Mongo and then never tell the requester anything -- which is
+        # exactly what used to happen, because the old duration math raised on every
+        # pending row (`result.get('claimed_at', ...)` returns a present-but-None
+        # value) AFTER find_one_and_update had already committed.
+        duration_minutes = 0
+        try:
+            # Duration from claimed_at if available, otherwise created_at. Both are
+            # normalised to aware UTC: a legacy naive value would otherwise raise
+            # TypeError against the aware `ended_at`.
+            start_time = ensure_aware_utc(result.get('claimed_at') or result.get('created_at'))
+            if start_time is not None:
+                duration_minutes = int((ended_at - start_time).total_seconds() / 60)
+
             db_manager.db.sessions.update_one(
                 {'session_id': session_id},
                 {'$set': {'duration_minutes': duration_minutes}}
             )
-
-            end_reason = "system auto-expiry" if system_end else f"user {ended_by_user_id}"
-            logger.info(f"Session {session_id} ended by {end_reason}, duration: {duration_minutes}m")
-            return True
-            
         except Exception as e:
-            logger.error(f"Error ending session {session_id}: {e}")
-            return False
+            logger.warning(
+                "Session %s was closed but its duration could not be recorded: %s",
+                session_id, e)
+
+        ended_by = "system auto-expiry" if system_end else f"user {ended_by_user_id}"
+        logger.info(f"Session {session_id} ended by {ended_by}"
+                    f"{' (' + end_reason + ')' if end_reason else ''}, "
+                    f"duration: {duration_minutes}m")
+        return True
     
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get session by session_id"""
@@ -165,6 +196,47 @@ class DBManager:
             logger.error(f"Error getting pending sessions: {e}")
             return []
     
+    def set_queue_message(self, session_id: str, channel_id, message_id: int) -> bool:
+        """Record where this request's channel post lives, so a restarted bot can
+        edit or delete it.
+
+        Deliberately NOT filtered on status: the post physically exists whether or
+        not a member claimed it in the microsecond between send_message returning
+        and this write. channel_id is stored as a string to match the env form used
+        everywhere else."""
+        if not self.db_available:
+            return False
+
+        try:
+            result = db_manager.db.sessions.update_one(
+                {'session_id': session_id},
+                {'$set': {
+                    'queue_channel_id': str(channel_id) if channel_id is not None else None,
+                    'queue_message_id': int(message_id),
+                }}
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error recording queue message for session {session_id}: {e}")
+            return False
+
+    def get_active_sessions(self) -> List[Dict[str, Any]]:
+        """Get all active (claimed, unended) sessions, oldest first.
+
+        Sorted on created_at rather than claimed_at so it reuses the existing
+        (status, created_at) index."""
+        if not self.db_available:
+            return []
+
+        try:
+            return list(db_manager.db.sessions.find(
+                {'status': 'active'},
+                sort=[('created_at', 1)]
+            ))
+        except Exception as e:
+            logger.error(f"Error getting active sessions: {e}")
+            return []
+
     def update_session_activity(self, session_id: str) -> bool:
         """Update last_activity_at timestamp for a session"""
         if not self.db_available:
@@ -207,7 +279,7 @@ class DBManager:
             if coll_obj.estimated_document_count() > 0:
                 return
 
-            now = datetime.datetime.utcnow()
+            now = utcnow()
             docs = []
             for member_id in default_members:
                 try:
@@ -271,7 +343,7 @@ class DBManager:
 
         try:
             coll = collection or self._authorized_collection
-            now = datetime.datetime.utcnow()
+            now = utcnow()
             update = {
                 '$set': {
                     'active': active,
@@ -306,7 +378,7 @@ class DBManager:
                 {
                     '$set': {
                         'active': False,
-                        'updated_at': datetime.datetime.utcnow()
+                        'updated_at': utcnow()
                     }
                 }
             )
@@ -346,7 +418,7 @@ class DBManager:
                 'content': content,
                 'file_id': file_id,
                 'file_type': file_type,
-                'timestamp': datetime.datetime.utcnow()
+                'timestamp': utcnow()
             }
             
             db_manager.db.messages.insert_one(message_doc)
