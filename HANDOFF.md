@@ -236,7 +236,7 @@ warning. `tests/test_service_config.py` asserts the invariant.
 **R6 — CI now gates deploys.**
 The `test` job in `.github/workflows/deploy.yml` runs first, and
 `build-and-push` (and therefore `deploy`) `needs: test`, so a red suite blocks
-the deploy. It runs the twelve suites listed in §6 below, in that order.
+the deploy. It runs the thirteen suites listed in §6 below, in that order.
 `tests/test_db_integration.py` is deliberately excluded: it needs a live Mongo
 and it **writes documents** — there must never be a `MONGODB_URI` secret in the
 test job. It also now refuses to run at all unless `ALLOW_DB_INTEGRATION_TEST=1`
@@ -320,6 +320,45 @@ session document; `active_sessions` has never carried one. With Mongo down,
 could be shown. If Mongo is down and a supporter genuinely cannot continue, the
 conversation will idle-expire on its own timer.
 
+**R13 — `/register` is inert until `REGISTRATION_ADMIN_IDS` is set, and every id on
+it must have pressed /start.** The env var is a comma-separated list of positive
+Telegram **user** ids; a negative id is a channel id, is rejected, and is logged at
+boot as an unusable entry (a channel would have been DMed the applicant's real name,
+id and username). While it is unset the feature is completely inert: `/register`
+answers with the same neutral string the bot sends for any unknown command, and every
+approval button is refused. Telegram forbids a bot messaging a user who has never
+messaged it, and unlike supporters there is **no `has_started_bot` record for admins**
+— the send attempt *is* the check, which is why it can never go stale. Before
+switching it on: have each admin send the bot any private message, then run one
+`/register` from a throwaway account and confirm **both** admins receive the card. If
+nobody is reachable the applicant is told honestly that it was not submitted, and an
+ERROR naming the ids appears in `docker logs`. Env-only, read at import → **recreate**
+the container, do not just restart it.
+
+**R14 — first tap wins, and it is Mongo-atomic.** `decide_registration` is a single
+`find_one_and_update` filtered on `status: 'pending'`, so of two simultaneous taps
+exactly one gets a document back and only that one writes a roster or messages the
+applicant. A second tap is answered "already handled" and the applicant is never
+messaged twice — including the Approve-then-Reject case, where the loser would
+otherwise send a rejection to somebody who had just been approved. Every admin's card
+is then rewritten to a settled state with its buttons stripped, from the
+`(admin_id, message_id)` pairs stored on the row, so this still works after a
+redeploy. With Mongo down nothing is decided and the buttons are deliberately left
+live, so the same tap works once it is back.
+
+**R15 — approval is only half the job.** An approved supporter can claim from their
+track's channel immediately, but has **no display name**, so they are invisible in the
+picker (R11 is unchanged). Finish the job with
+`python -m src.database.utils admins --action set-profile --service pss --telegram-id <id> --display-name "<name>"`.
+Registration deliberately does not invent a display name from the Telegram profile:
+that would put an unvetted, self-chosen, potentially de-anonymising string in front of
+people in distress, and would destroy the "no display name ⇒ invisible" rollout lever.
+Audit with `registrations --action list --status approved` (the row shows
+`decided_by`). Clear a row nobody can act on with `registrations --action close`.
+There is deliberately **no CLI approve**: it would bypass the atomic gate and the
+applicant notification. To add somebody out-of-band use `admins --action add`, then
+`registrations --action close`.
+
 ---
 
 ## 6. Tests
@@ -337,6 +376,7 @@ python tests/test_pss_flow.py            # full HF+PSS flow w/ fake bot (no DB)
 python tests/test_member_profiles.py     # supporter profiles + availability rules
 python tests/test_directed_requests.py   # the PSS directed-support flow
 python tests/test_release_and_end.py     # requester-only /end, and /release
+python tests/test_registration.py        # self-service /register + admin approval
 python tests/test_per_service_timers.py  # per-track queue/session expiry
 python tests/test_restore.py             # restart durability (the important one)
 python tests/test_session_expiry.py      # warn/expire lifecycle

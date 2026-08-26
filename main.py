@@ -3,6 +3,7 @@ import logging
 import time
 from telegram import BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+import config
 from config import (
     BOT_TOKEN,
     AUTHORIZED_MEMBER_REFRESH_SECONDS,
@@ -105,6 +106,15 @@ async def main():
         if not svc.roster:
             logger.warning("No members configured for service '%s'", svc.key)
 
+    # A typo'd registration admin id must be visible in `docker logs`, or "why did
+    # only one of us get the DM?" is an unanswerable question. warning, not error:
+    # test_boot.py's _ErrorCatcher watches the ERROR level and a boot that logs one
+    # is treated as a swallowed failure.
+    for bad in config.REGISTRATION_ADMIN_ID_ERRORS:
+        logger.warning("REGISTRATION_ADMIN_IDS contains an unusable entry %r (ids "
+                       "must be positive Telegram user ids); it has been ignored",
+                       bad)
+
     # Initialize database
     logger.info("Initializing database connection...")
     db_available = db_mgr.initialize()
@@ -141,6 +151,14 @@ async def main():
     application.add_handler(CommandHandler("available", handlers.available_command))
     application.add_handler(CommandHandler("unavailable", handlers.unavailable_command))
     application.add_handler(CommandHandler("release", handlers.release_command))
+    # Registered UNCONDITIONALLY, so the deployed handler set never depends on the
+    # environment. The feature is switched off INSIDE register_command and
+    # _handle_registration_callback, both reading the same empty
+    # REGISTRATION_ADMINS. Conditional registration would make test_boot.py's
+    # exact ordered-pair assertion env-dependent, which is strictly worse for a
+    # boot gate. Deliberately absent from BOT_COMMANDS: that menu is the
+    # requester's surface. See D41/D42.
+    application.add_handler(CommandHandler("register", handlers.register_command))
     
     # Message handler for regular messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))

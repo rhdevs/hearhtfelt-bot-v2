@@ -87,6 +87,14 @@ jobs:
       # it; setting it makes enabled_services() non-empty and silently changes
       # default_service_key() for every suite.
       #
+      # REGISTRATION_ADMIN_IDS is deliberately NOT set either, for a sharper
+      # reason: it is the ENTIRE authorization surface for a command that grants
+      # somebody the ability to read messages from students in crisis. Unset means
+      # /register is inert, which is the state every suite must be able to assume.
+      # tests/test_registration.py sets config.REGISTRATION_ADMINS itself, per
+      # case, and every other suite blanks it in reset_state(). Putting real ids
+      # here would also put two people's Telegram ids in a public repo.
+      #
       # There is no .env in the repo and none may ever be created here. config.py
       # calls load_dotenv(), which reads ./.env only; .env.production is local and
       # gitignored, and nothing in this job may reference it.
@@ -123,6 +131,9 @@ jobs:
 
       - name: tests/test_release_and_end.py
         run: python tests/test_release_and_end.py
+
+      - name: tests/test_registration.py
+        run: python tests/test_registration.py
 
       - name: tests/test_per_service_timers.py
         run: python tests/test_per_service_timers.py

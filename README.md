@@ -63,7 +63,13 @@ the Telegram command menu.
 BOT_TOKEN=your_bot_token_here
 ADMIN_CHANNEL_ID=-1001234567890
 MONGODB_URI=mongodb://localhost:27017/heartfelt_bot  # Optional
+REGISTRATION_ADMIN_IDS=111111111,222222222  # optional; unset = /register disabled
 ```
+
+`REGISTRATION_ADMIN_IDS` is a comma-separated list of Telegram **user** ids (positive
+numbers; a negative id is a channel id and is rejected and logged at boot). Unset means
+the `/register` feature is completely inert. Read once at import, so changing it needs a
+container **recreate**, not a restart. See "Joining the support team" below.
 
 **config.py:**
 ```python
@@ -81,6 +87,7 @@ python3 -m src.database.utils stats                    # Session statistics
 python3 -m src.database.utils monthly                  # This month's sessions  
 python3 -m src.database.utils transcript --session-id  # Full conversation
 python3 -m src.database.utils admins --action list     # View Heartfelt admins
+python3 -m src.database.utils registrations --action list --status pending   # /register requests
 python3 -m src.database.utils admins --action add --telegram-id 123456789
 python3 -m src.database.utils admins --action remove --telegram-id 123456789
 ```
@@ -94,6 +101,30 @@ docker exec heartfelt-bot python3 -m src.database.utils admins --action remove -
 ```
 
 Replace `heartfelt-bot` with your container name if it differs. Changes propagate automatically within the refresh interval configured by `AUTHORIZED_MEMBER_REFRESH_SECONDS` (default 60 seconds).
+
+## Joining the support team
+
+Prospective supporters send `/register` to the bot in a private chat. The bot DMs
+every id on `REGISTRATION_ADMIN_IDS` a card with the applicant's name, username and
+Telegram id, and one Approve button per track plus "Not now". The first tap wins;
+the others are told it has already been handled.
+
+`/register` is deliberately **not** in the bot's command menu. That menu is the
+surface a person in distress sees, and a recruitment command does not belong on it,
+so discovery is out-of-band (a poster, a briefing, a committee handover).
+
+Two things to know before switching it on:
+
+- **Every admin id must have sent the bot a private message first.** Telegram
+  forbids a bot messaging a user who has never messaged it, and there is no stored
+  flag for admins -- the send attempt IS the check. If nobody can be reached the
+  applicant is told honestly that the request was not submitted, and an ERROR naming
+  the ids appears in `docker logs`.
+- **Approval is only half the job.** An approved supporter can claim from their
+  channel immediately, but has no display name, so they are invisible in the picker
+  until somebody runs
+  `admins --action set-profile --service pss --telegram-id <id> --display-name "<name>"`.
+  That is deliberate, and it is the staged-rollout lever for the whole picker feature.
 
 ## Deployment
 
@@ -181,6 +212,7 @@ python tests/test_pss_flow.py            # full HF+PSS flow with a fake bot
 python tests/test_member_profiles.py     # supporter profiles + availability rules
 python tests/test_directed_requests.py   # the PSS directed-support flow
 python tests/test_release_and_end.py     # requester-only /end, and /release
+python tests/test_registration.py        # self-service /register + admin approval
 python tests/test_per_service_timers.py  # per-track queue/session expiry
 python tests/test_restore.py             # restart durability
 python tests/test_session_expiry.py      # warn/expire lifecycle

@@ -243,15 +243,77 @@ def manage_authorized_members(action: str, telegram_id: Optional[int] = None,
         print(f"❌ Unsupported action: {action}")
 
 
+def manage_registrations(action: str, registration_id: Optional[str] = None,
+                         status: str = 'pending', limit: int = 50):
+    """CLI helper to inspect/close supporter registrations.
+
+    Deliberately has no 'approve' action. Approval has to go through
+    decide_registration's atomic {'status': 'pending'} gate and the applicant
+    notification, both of which live in the bot process, not this CLI. A CLI
+    approve would bypass both: nobody would ever tell the applicant, and the
+    row would be left carrying live Approve/Reject buttons in two admins' chats
+    pointing at an already-settled decision. (Those buttons stay SAFE -- the
+    gate refuses them -- but an admin tapping one would be told "already
+    handled" with no idea why.) The supported out-of-band path is
+    `admins --action add` to grant the roster slot directly, followed by
+    `registrations --action close` to retire the now-redundant pending row.
+    """
+    if not db_mgr.initialize():
+        print("❌ Database not available")
+        return
+
+    if action == 'list':
+        records = db_mgr.list_registrations(status=status, limit=limit)
+        if not records:
+            print(f"No registrations found for status '{status}'.")
+            return
+
+        print(f"\n📝 Registrations — status={status}")
+        print("-" * 40)
+        for doc in records:
+            # A single malformed created_at must not kill the whole dump --
+            # same fallback pattern as show_sessions_this_month.
+            created_dt = ensure_aware_utc(doc.get('created_at'))
+            created = created_dt.strftime('%m/%d %H:%M') if created_dt else '--/-- --:--'
+            row_status = doc.get('status') or '-'
+            telegram_id = doc.get('telegram_id')
+            name = ' '.join(part for part in [doc.get('first_name'), doc.get('last_name')] if part).strip() or '-'
+            username_val = doc.get('username')
+            # Same '@'-normalisation as manage_authorized_members: username_display
+            # already carries its own '@' (or is a bare '-'), so it is not preceded
+            # by a separate literal '@' in the f-string below.
+            if username_val:
+                username_display = username_val if str(username_val).startswith('@') else f"@{username_val}"
+            else:
+                username_display = '-'
+            decided_by = doc.get('decided_by') or '-'
+            registration_id_val = doc.get('registration_id')
+            print(f"{created} | {row_status:8} | {telegram_id} | {name} | {username_display} | {decided_by} | {registration_id_val}")
+        return
+
+    if action == 'close':
+        if registration_id is None:
+            print("❌ --registration-id is required for this action")
+            return
+        result = db_mgr.close_registration(registration_id, 'closed_by_admin')
+        if result:
+            print(f"✅ Closed registration {registration_id}")
+        else:
+            print(f"❌ Failed to close registration {registration_id}")
+    else:
+        print(f"❌ Unsupported action: {action}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Database utility for Heartfelt Bot')
-    parser.add_argument('command', choices=['transcript', 'monthly', 'stats', 'admins'],
+    parser.add_argument('command', choices=['transcript', 'monthly', 'stats', 'admins', 'registrations'],
                        help='Command to execute')
     parser.add_argument('--session-id', help='Session ID for transcript command')
     parser.add_argument('--action', choices=['list', 'add', 'deactivate', 'remove',
                                               'available', 'unavailable',
-                                              'set-profile', 'set-started', 'clear-started'],
-                        help='Action for admins command')
+                                              'set-profile', 'set-started', 'clear-started',
+                                              'close'],
+                        help='Action for admins/registrations command')
     parser.add_argument('--telegram-id', type=int, help='Telegram ID for admins command')
     parser.add_argument('--username', help='Optional username when adding an admin')
     parser.add_argument('--include-inactive', action='store_true',
@@ -260,6 +322,9 @@ def main():
                         help='Which service roster to manage (default: hf)')
     parser.add_argument('--display-name', help='Picker display name to set for set-profile')
     parser.add_argument('--blurb', help='One-line free-text blurb to set for set-profile')
+    parser.add_argument('--registration-id', help='Registration ID for registrations command')
+    parser.add_argument('--status', choices=['pending', 'approved', 'rejected', 'closed'], default='pending',
+                        help='Status filter for registrations --action list (default: pending)')
 
     args = parser.parse_args()
 
@@ -284,6 +349,15 @@ def main():
             service=args.service,
             display_name=args.display_name,
             blurb=args.blurb,
+        )
+    elif args.command == 'registrations':
+        if not args.action:
+            print("❌ --action required for registrations command")
+            return
+        manage_registrations(
+            action=args.action,
+            registration_id=args.registration_id,
+            status=args.status,
         )
 
 if __name__ == "__main__":

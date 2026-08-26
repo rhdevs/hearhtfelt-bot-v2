@@ -56,7 +56,8 @@ PSS_CHANNEL = "-1009000000002"
 HANDLER_CALLBACKS = (
     "start_command", "chat_command", "end_command", "status_command",
     "cancel_command", "available_command", "unavailable_command",
-    "release_command", "handle_message", "handle_sticker", "handle_photo",
+    "release_command", "register_command", "handle_message", "handle_sticker",
+    "handle_photo",
     "handle_callback_query", "handle_error",
 )
 
@@ -490,10 +491,10 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
 
     app = app_holder.get("app")
     assert app is not None, "the fake Application was never built"
-    # 8 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
-    assert len(app.handlers) == 12, (
-        f"main() registered {len(app.handlers)} handlers, expected 12 "
-        f"(8 command, 3 message, 1 callback): {app.handlers!r}"
+    # 9 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
+    assert len(app.handlers) == 13, (
+        f"main() registered {len(app.handlers)} handlers, expected 13 "
+        f"(9 command, 3 message, 1 callback): {app.handlers!r}"
     )
     assert len(app.error_handlers) == 1, f"expected one error handler, got {app.error_handlers!r}"
 
@@ -514,6 +515,9 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
         ("CommandHandler", "available_command"),
         ("CommandHandler", "unavailable_command"),
         ("CommandHandler", "release_command"),
+        # Registered unconditionally, so this list stays env-independent even
+        # though the feature itself is inert without REGISTRATION_ADMIN_IDS. D41.
+        ("CommandHandler", "register_command"),
         ("MessageHandler", "handle_message"),
         ("MessageHandler", "handle_sticker"),
         ("MessageHandler", "handle_photo"),
@@ -531,7 +535,7 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
     # and a stale index still resolves to SOME handler, so the two asserts below
     # would keep passing while testing the wrong objects. The ordered-pair list
     # above is what pins them: keep the two in step.
-    sticker_h, photo_h = app.handlers[9], app.handlers[10]
+    sticker_h, photo_h = app.handlers[10], app.handlers[11]
     assert sticker_h.filters is filters.Sticker.ALL, (
         f"handle_sticker must be filtered on filters.Sticker.ALL, got {sticker_h.filters!r}"
     )
@@ -543,7 +547,7 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
     for h in app.handlers:
         commands |= set(getattr(h, "commands", ()) or ())
     assert commands == {"start", "chat", "help", "end", "status", "cancel",
-                        "available", "unavailable", "release"}, (
+                        "available", "unavailable", "release", "register"}, (
         f"registered commands are {sorted(commands)}; /chat and its /help alias must "
         "both survive (main.py:117)"
     )
@@ -634,8 +638,19 @@ def test_no_runnable_service_returns_immediately():
 def _save_services():
     hf = config.SERVICES[ServiceType.HF.value]
     pss = config.SERVICES[ServiceType.PSS.value]
-    return (hf.channel_id, hf.enabled, list(hf.roster),
-            pss.channel_id, pss.enabled, list(pss.roster))
+    saved = (hf.channel_id, hf.enabled, list(hf.roster),
+             pss.channel_id, pss.enabled, list(pss.roster),
+             config.REGISTRATION_ADMINS)
+    # This file has no reset_state(), so the registration allowlist is blanked
+    # here. Every boot assertion must run with /register OFF, or a maintainer's
+    # local .env (config.py calls load_dotenv() at import) changes what main()
+    # logs. A REBIND, not a .clear(): REGISTRATION_ADMINS is a frozenset, and a
+    # by-value importer would never see it -- which is why the production code
+    # goes through config.is_registration_admin(). The handler itself is
+    # registered UNCONDITIONALLY (D41), so the ordered-pair assertion below is
+    # deliberately unaffected by this.
+    config.REGISTRATION_ADMINS = frozenset()
+    return saved
 
 
 def _restore_services(saved):
@@ -644,7 +659,8 @@ def _restore_services(saved):
     hf = config.SERVICES[ServiceType.HF.value]
     pss = config.SERVICES[ServiceType.PSS.value]
     (hf.channel_id, hf.enabled, hf_roster,
-     pss.channel_id, pss.enabled, pss_roster) = saved
+     pss.channel_id, pss.enabled, pss_roster,
+     config.REGISTRATION_ADMINS) = saved
     hf.roster.replace(hf_roster)
     pss.roster.replace(pss_roster)
 
