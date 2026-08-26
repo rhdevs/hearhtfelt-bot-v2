@@ -634,8 +634,19 @@ def test_no_runnable_service_returns_immediately():
 def _save_services():
     hf = config.SERVICES[ServiceType.HF.value]
     pss = config.SERVICES[ServiceType.PSS.value]
-    return (hf.channel_id, hf.enabled, list(hf.roster),
-            pss.channel_id, pss.enabled, list(pss.roster))
+    saved = (hf.channel_id, hf.enabled, list(hf.roster),
+             pss.channel_id, pss.enabled, list(pss.roster),
+             config.REGISTRATION_ADMINS)
+    # This file has no reset_state(), so the registration allowlist is blanked
+    # here. Every boot assertion must run with /register OFF, or a maintainer's
+    # local .env (config.py calls load_dotenv() at import) changes what main()
+    # logs. A REBIND, not a .clear(): REGISTRATION_ADMINS is a frozenset, and a
+    # by-value importer would never see it -- which is why the production code
+    # goes through config.is_registration_admin(). The handler itself is
+    # registered UNCONDITIONALLY (D41), so the ordered-pair assertion below is
+    # deliberately unaffected by this.
+    config.REGISTRATION_ADMINS = frozenset()
+    return saved
 
 
 def _restore_services(saved):
@@ -644,7 +655,8 @@ def _restore_services(saved):
     hf = config.SERVICES[ServiceType.HF.value]
     pss = config.SERVICES[ServiceType.PSS.value]
     (hf.channel_id, hf.enabled, hf_roster,
-     pss.channel_id, pss.enabled, pss_roster) = saved
+     pss.channel_id, pss.enabled, pss_roster,
+     config.REGISTRATION_ADMINS) = saved
     hf.roster.replace(hf_roster)
     pss.roster.replace(pss_roster)
 

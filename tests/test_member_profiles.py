@@ -62,6 +62,13 @@ def reset_state():
     # next.
     config.SERVICES[ServiceType.HF.value].roster.replace_records([])
     config.SERVICES[ServiceType.PSS.value].roster.replace_records([])
+    # Registration is OFF by default and every pre-existing suite must run with it
+    # off. This is a REBIND, not a .clear(): REGISTRATION_ADMINS is a frozenset, so
+    # any consumer that imported it by value would not see this -- which is exactly
+    # why handlers.py goes through config.is_registration_admin() instead. It also
+    # makes this suite deterministic regardless of a maintainer's local .env, which
+    # config.py reads via load_dotenv() at import.
+    config.REGISTRATION_ADMINS = frozenset()
 
 
 # --------------------------------------------------------------------------- (a)

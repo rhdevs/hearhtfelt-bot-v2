@@ -183,6 +183,13 @@ def reset_state():
     # silently starts hiding people.
     config.directed_by_member.clear()
     config.picker_views.clear()
+    # Registration is OFF by default and every pre-existing suite must run with it
+    # off. This is a REBIND, not a .clear(): REGISTRATION_ADMINS is a frozenset, so
+    # any consumer that imported it by value would not see this -- which is exactly
+    # why handlers.py goes through config.is_registration_admin() instead. It also
+    # makes this suite deterministic regardless of a maintainer's local .env, which
+    # config.py reads via load_dotenv() at import.
+    config.REGISTRATION_ADMINS = frozenset()
 
 
 def install(stub):

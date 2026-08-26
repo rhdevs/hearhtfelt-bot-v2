@@ -3,7 +3,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -300,6 +300,84 @@ RESTORE_MAX_ACTIVE = _env_int("RESTORE_MAX_ACTIVE", 50)
 STALE_NOTIFY_GRACE_MINUTES = _env_int("STALE_NOTIFY_GRACE_MINUTES", 120)
 
 
+# --- Self-service supporter registration (/register) ---------------------------
+# REGISTRATION_ADMIN_IDS is the ENTIRE authorization surface for a feature that
+# grants strangers the ability to read messages from students in crisis. Unset =>
+# empty frozenset => the feature is COMPLETELY INERT: /register answers with the
+# same neutral string handle_message sends for gibberish, and every rg_* callback
+# is refused. Same staged-rollout property as the picker's display_name (D38/R11):
+# the code ships, the behaviour does not, until somebody deliberately sets an env
+# var and RECREATES the container (this is read once, at import). See runbook R13.
+#
+# REGISTRATION_ADMINS is a frozenset REBOUND on this module, never mutated. A
+# consumer that did `from config import REGISTRATION_ADMINS` would hold the old
+# object forever and never see a rebind -- which is exactly why the three
+# accessors below exist and why handlers.py imports THEM and not the value. Same
+# trick src/bot/restore.py uses with `import config` + config.RESTORE_*.
+def _env_admin_ids(name: str) -> Tuple[FrozenSet[int], Tuple[str, ...]]:
+    """Parse a comma-separated list of Telegram user ids from the environment.
+
+    Returns (ids, rejected_tokens). Every token must parse as an int AND be
+    strictly positive: Telegram USER ids are positive, channel/group ids are
+    negative. A negative id here would make the bot DM a CHANNEL the applicant's
+    real name, id and username -- precisely the audience this design exists to
+    avoid (D33). A bad token is dropped and RETURNED, never silently ignored;
+    main.py logs each one at boot, or "why did only one of us get the DM?" is an
+    unanswerable question.
+    """
+    ids = set()
+    rejected = []
+    for token in os.getenv(name, "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except (TypeError, ValueError):
+            rejected.append(token)
+            continue
+        if value <= 0:
+            rejected.append(token)
+            continue
+        ids.add(value)
+    return frozenset(ids), tuple(rejected)
+
+
+REGISTRATION_ADMINS, REGISTRATION_ADMIN_ID_ERRORS = _env_admin_ids("REGISTRATION_ADMIN_IDS")
+
+# How long after a decision somebody must wait before /register works again.
+REGISTRATION_REAPPLY_HOURS = _env_int("REGISTRATION_REAPPLY_HOURS", 168)   # 7 days
+
+
+def registration_is_enabled() -> bool:
+    """False whenever the allowlist is empty. Inertness gate #1 (D41)."""
+    return bool(REGISTRATION_ADMINS)
+
+
+def is_registration_admin(user_id) -> bool:
+    """The ENTIRE authorization check for approving a supporter.
+
+    Reads the module global at CALL time, so a rebind of REGISTRATION_ADMINS is
+    seen by handlers.py even though it imported this function by value. Coerces
+    with int() in try/except -- the same shape as
+    AuthorizedMembersStore.__contains__ -- so a str or None id can never raise
+    out of an auth check. An empty allowlist refuses everyone: gate #2 (D40).
+    """
+    try:
+        return int(user_id) in REGISTRATION_ADMINS
+    except (TypeError, ValueError):
+        return False
+
+
+def registration_admin_ids() -> List[int]:
+    """The fan-out targets, in a DETERMINISTIC order.
+
+    sorted(), never set iteration: the order decides which admin is DMed first,
+    and a non-deterministic fan-out makes an intermittent test the only symptom.
+    """
+    return sorted(REGISTRATION_ADMINS)
+
+
 @dataclass
 class Service:
     """Configuration for a single support track (e.g. HF or PSS)."""
@@ -470,6 +548,13 @@ CB_PICK_SELECT = "pk_s"    # pk_s:<member_id>
 CB_PICK_CANCEL = "pk_x"    # cancel my request
 CB_DIRECT_ACCEPT = "dr_a"  # dr_a:<session_id>, targeted supporter only
 CB_DIRECT_DECLINE = "dr_d" # dr_d:<session_id>, targeted supporter only
+
+# Registration approval. Dispatched BEFORE the membership gate, with its own and
+# strictly narrower gate (is_registration_admin) -- see D40 and handlers.py.
+# Longest form is "rg_a:" + uuid4 (36) + ":" + "pss" = 45 bytes; reject is 41.
+# Telegram's cap is 64.
+CB_REG_APPROVE = "rg_a"    # rg_a:<registration_id>:<service_key>
+CB_REG_REJECT = "rg_r"     # rg_r:<registration_id>
 
 # INVARIANT: SESSION_SWEEP_SECONDS must be < (min service_warning_minutes * 60),
 # or a session can expire without ever being warned. Currently 180 < 300 (HF).
@@ -716,6 +801,95 @@ MESSAGES = {
         "Thank you for letting us know - the conversation has been handed back and "
         "you're free again. Passing something on when you can't carry it is the "
         "right call, not a failure. 💚"
+    ),
+
+    # --- Registration (/register) -------------------------------------------
+    # EVERY value here is a plain str. The APPLICANT-facing half is scanned by
+    # test_copy.py's blame-word guard, by
+    # test_copy.py::test_registration_copy_never_names_a_decider, and by
+    # test_registration.py case (m), which asserts the rejection an applicant
+    # reads is BYTE-IDENTICAL to the value below. Nothing an applicant reads may
+    # name, number or hint at who decided (D44).
+
+    # Applicant-facing ---------------------------------------------------------
+    "registration_private_only": (
+        "Please send /register to me here, in this private chat."
+    ),
+    # No timeframe promise and no "who": both would be commitments nobody made.
+    "registration_submitted": (
+        "Thanks. I've passed your request on to the team. Someone will get back to "
+        "you."
+    ),
+    "registration_already_pending": (
+        "You've already asked, and it's with the team. There's nothing more you need "
+        "to do."
+    ),
+    "registration_already_member": (
+        "You're already part of the support team. Use /available when you're free to "
+        "take a conversation, and /unavailable when you're not."
+    ),
+    # Deliberately NOT named "..._declined": the key is what maintainers read, and
+    # a cooldown after any decision is not a verdict being repeated at somebody.
+    "registration_cooldown": (
+        "We've already answered a request from you recently. Please give it a little "
+        "time before asking again, or speak to the welfare team."
+    ),
+    # {member} is filled from the SERVICE's member_label, never a literal: HF's is
+    # the old brand spelling, and hardcoding it fails
+    # test_copy.py::test_no_message_mentions_the_old_brand.
+    "registration_approved": (
+        "Good news - you've been added to the support team as a {member}. 💚\n\n"
+        "You can pick up requests from your team's channel straight away. Your name "
+        "won't appear on the list people choose from until someone on the team sets "
+        "it up for you.\n\n"
+        "Use /available when you're free to take a conversation, /unavailable when "
+        "you're not, and /release if you ever need to hand a conversation back."
+    ),
+    # NEVER interpolated, NEVER .format()ted, sent verbatim. No reason, no name,
+    # no id, nothing traceable to a person. See D44 and case (m).
+    "registration_rejected": (
+        "Thanks for offering to help. We're not able to add you to the support team "
+        "at the moment. That says nothing about you as a person, and nothing changes "
+        "about using the bot - /chat is always open if you'd like support yourself."
+        "\n\nIf you'd like to talk it through, please speak to the welfare team."
+    ),
+    # Mongo down, no reachable admin, or row creation failed. MUST NOT imply the
+    # request is pending. Telling somebody who has just volunteered that it is with
+    # the team, when nobody will ever see it, is the worst available outcome (M28).
+    "registration_unavailable": (
+        "Sorry, I couldn't pass your request on just now, so it hasn't been "
+        "submitted. Please try again shortly, or speak to the welfare team directly."
+    ),
+
+    # Admin-facing -------------------------------------------------------------
+    # Seen ONLY by the ids on REGISTRATION_ADMIN_IDS. These may name the approver;
+    # nothing above may. That asymmetry is the whole of D44.
+    "registration_card_title": "🆕 Supporter registration request",
+    "registration_card_note": (
+        "Approving adds them to that roster straight away. They will not appear in "
+        "the list people choose from until someone sets a display name."
+    ),
+    "registration_approve_button": "✅ Approve as {member}",
+    "registration_reject_button": "🚫 Not now",
+    "registration_already_handled": "Someone has already handled this one.",
+    "registration_gone": "That request is no longer available.",
+    "registration_db_offline": (
+        "Our records are offline, so this can't be decided right now. The buttons "
+        "still work - please try again in a few minutes."
+    ),
+    "registration_self_decision": "You can't decide your own request.",
+    "registration_cross_roster": (
+        "They are already a {member}. Someone would need to take them off that "
+        "roster first."
+    ),
+    "registration_settled_approved": "✅ Approved as {member} by {approver}.",
+    "registration_settled_rejected": "🚫 Not approved, by {approver}.",
+    "registration_settled_unreachable": (
+        "⚠️ They could not be told - the bot cannot message them."
+    ),
+    "registration_settled_write_failed": (
+        "⚠️ The roster write did not confirm. Check with "
+        "`admins --action list` before relying on this."
     ),
 }
 
