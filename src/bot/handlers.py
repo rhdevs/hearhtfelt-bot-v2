@@ -35,6 +35,7 @@ from config import (
     is_registration_admin,
     registration_admin_ids,
     registration_is_enabled,
+    REGISTER_DEEP_LINK_PAYLOAD,
     enabled_services,
     default_service_key,
     get_service,
@@ -92,6 +93,25 @@ class BotHandlers:
         """Handle /start command"""
         user_id = update.effective_user.id
         user_states[user_id] = UserState.IDLE
+
+        # Deep link: t.me/<bot>?start=register lands here with args == ["register"].
+        # It is how a prospective supporter finds registration at all, because
+        # /register is deliberately NOT in set_my_commands -- that menu is what
+        # somebody who opened the bot in distress sees, and a recruitment prompt
+        # does not belong beside "Request support".
+        #
+        # Gated on registration_is_enabled() so the link cannot betray that the
+        # feature exists while it is switched off: with an empty allowlist this
+        # falls through and answers with the ordinary welcome, byte-identical to a
+        # bare /start. register_command re-checks every gate for itself.
+        # getattr, not context.args: PTB always sets it for a CommandHandler, but the
+        # existing test fakes build SimpleNamespace contexts without it -- the same
+        # reason _is_private_chat reaches for getattr on effective_chat.
+        args = getattr(context, "args", None)
+        if (args and args[0] == REGISTER_DEEP_LINK_PAYLOAD
+                and registration_is_enabled()):
+            await self.register_command(update, context)
+            return
 
         text = MESSAGES["welcome"]
         # /available, /unavailable and /release are member-only, so they are
