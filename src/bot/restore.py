@@ -245,7 +245,31 @@ def _restore_pending(docs, queue_manager, stats, dry_run) -> None:
         waiting = ensure_aware_utc(doc.get('waiting_since')) or created
         age_minutes = (now - waiting).total_seconds() / 60.0 if waiting else 0.0
 
-        horizon = svc.queue_expire_minutes + config.STALE_NOTIFY_GRACE_MINUTES
+        # A DIRECTED row is on a DIFFERENT CLOCK and must be judged against it.
+        # waiting_since is the requester's queue budget; a directed request's budget is
+        # directed_response_minutes measured from directed_at, and the two diverge by
+        # however long the requester spent at the picker before choosing. Judging a
+        # directed row by the queue horizon silently closes, at boot, a request whose
+        # supporter still has time left to accept -- the requester is told nothing and
+        # the Accept button in the supporter's DM goes dead. With the base Service
+        # defaults (queue_expire_minutes=60 vs directed_response_minutes=1440) that
+        # would be EVERY directed request more than three hours old, on every restart.
+        #
+        # Past this horizon nothing is sent either way: sweep_directed_requests owns
+        # the directed lane end to end and has its own, identical, silent horizon.
+        stale_routing = doc.get('routing') or 'open'
+        if stale_routing == 'directed':
+            budget = svc.directed_response_minutes
+            directed_ref = ensure_aware_utc(doc.get('directed_at'))
+            if directed_ref is not None and directed_ref <= now:
+                age_minutes = (now - directed_ref).total_seconds() / 60.0
+            # An unusable directed_at falls back to waiting_since against the DIRECTED
+            # budget: still generous enough not to destroy a live request, still
+            # bounded so a corrupt clock cannot resurrect an ancient row forever.
+        else:
+            budget = svc.queue_expire_minutes
+
+        horizon = budget + config.STALE_NOTIFY_GRACE_MINUTES
         if age_minutes > horizon:
             # Do NOT restore and do NOT notify. Because cleanup_expired_queues and
             # remove_from_queue never closed their Mongo rows before this branch existed,

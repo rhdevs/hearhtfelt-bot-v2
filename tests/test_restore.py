@@ -989,6 +989,85 @@ def case_ae_an_old_request_repicked_recently_survives_boot():
     print("OK  ae. an old request re-picked five minutes ago is not stale-closed at boot")
 
 
+async def case_af_a_directed_request_is_judged_on_its_own_clock():
+    """A directed row is on a DIFFERENT CLOCK from the queue lane, and the boot
+    horizon must use it.
+
+    `waiting_since` is the requester's queue budget; a directed request's budget is
+    directed_response_minutes measured from `directed_at`. The two diverge by however
+    long the requester sat at the picker before choosing. Judged by the QUEUE horizon,
+    a request whose supporter still has time left to accept is silently closed at
+    boot: the requester is told nothing at all, and the Accept button already sitting
+    in the supporter's DM resolves to "no longer waiting".
+
+    With the base Service defaults (queue_expire_minutes 60 vs
+    directed_response_minutes 1440) that is every directed request over three hours
+    old, on every single restart.
+    """
+    reset_state()
+    svc = config.get_service("pss")
+    queue_horizon = svc.queue_expire_minutes + config.STALE_NOTIFY_GRACE_MINUTES
+
+    dwell = 200                       # minutes spent at the picker before choosing
+    age = queue_horizon + 40          # comfortably past the QUEUE horizon
+    idle = age - dwell                # ... but still inside the DIRECTED window
+    assert age > queue_horizon, "the fixture must be past the queue horizon"
+    assert idle < svc.directed_response_minutes, (
+        "and the supporter must still have time left, or this case proves nothing")
+
+    doc = pending_doc("p-af", 7604, age, service="pss", routing="directed",
+                      target_member_id=PSS_MEMBER,
+                      directed_at=utcnow() - datetime.timedelta(minutes=idle))
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+
+    stats = restore_state(qm, sm)
+
+    assert stats['pending_stale_closed'] == 0, (
+        "the supporter still has %d minutes to accept" %
+        (svc.directed_response_minutes - idle), stats)
+    assert stub.end_reason_for("p-af") is None, (
+        "a live directed request must never be closed as 'stale_startup_sweep'",
+        stub.ended)
+    assert stats['pending_directed'] == 1, stats
+    assert "p-af" in config.queue_entries
+    assert config.queue_entries["p-af"]['routing'] == 'directed'
+    assert config.directed_by_member[PSS_MEMBER] == "p-af"
+
+    # Still inside the window, so the sweep leaves it alone and messages nobody.
+    assert await qm.sweep_directed_requests() == []
+    assert bot.sent == [], bot.sent
+    print("OK  af. a directed request past the QUEUE horizon but inside its own "
+          "window survives boot")
+
+
+async def case_ag_a_truly_stale_directed_request_still_closes_silently():
+    """The other side of (af): judging directed rows on their own clock must NOT
+    disarm the horizon. Past directed_response_minutes + the grace, the row is closed
+    and NOBODY is messaged -- the "bot was down for days" case, for the directed lane.
+    """
+    reset_state()
+    svc = config.get_service("pss")
+    idle = svc.directed_response_minutes + config.STALE_NOTIFY_GRACE_MINUTES + 60
+
+    doc = pending_doc("p-ag", 7605, idle + 30, service="pss", routing="directed",
+                      target_member_id=PSS_MEMBER,
+                      directed_at=utcnow() - datetime.timedelta(minutes=idle))
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+
+    stats = restore_state(qm, sm)
+
+    assert stats['pending_stale_closed'] == 1, stats
+    assert stats['pending_restored'] == 0, stats
+    assert stub.end_reason_for("p-ag") == 'stale_startup_sweep', stub.ended
+    assert "p-ag" not in config.queue_entries
+    assert config.directed_by_member == {}
+    assert bot.sent == [], (
+        "a bot that has been down for days must wake up SILENT", bot.sent)
+    print("OK  ag. a directed request past its own horizon is still closed silently")
+
+
 # --------------------------------------------------------------------------- runner
 CASES = [
     case_a_happy_pending,
@@ -1022,6 +1101,8 @@ CASES = [
     case_ac_choosing_is_restored_off_the_queue,
     case_ad_directed_is_restored_with_its_index,
     case_ae_an_old_request_repicked_recently_survives_boot,
+    case_af_a_directed_request_is_judged_on_its_own_clock,
+    case_ag_a_truly_stale_directed_request_still_closes_silently,
 ]
 
 
@@ -1042,7 +1123,7 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 31, (
+    assert len(CASES) >= 33, (
         "expected at least 31 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
