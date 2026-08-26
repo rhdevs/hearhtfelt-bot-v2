@@ -91,6 +91,39 @@ class SessionManager:
         
         return session_id
     
+    def release_session(self, session_id: str) -> Tuple[Optional[int], Optional[int]]:
+        """Drop the in-memory session WITHOUT closing the Mongo row.
+
+        Deliberately does NOT call db_mgr.end_session. The request is NOT over -- the
+        person who asked for help still needs someone -- and end_session would flip
+        the row to 'ended', which is exactly the state release_session in DBManager
+        exists to avoid. The caller has already moved the row back to 'pending'.
+        """
+        session = active_sessions.get(session_id)
+        if not session:
+            return None, None
+
+        user_id = session['user_id']
+        heartfelt_member_id = session['heartfelt_member_id']
+
+        del active_sessions[session_id]
+        if user_id in user_to_session_map:
+            del user_to_session_map[user_id]
+        if heartfelt_member_id in user_to_session_map:
+            del user_to_session_map[heartfelt_member_id]
+        if session_id in session_warnings:
+            del session_warnings[session_id]
+
+        safety_logs.append({
+            'session_id': session_id,
+            'user_id': user_id,
+            'heartfelt_member_id': heartfelt_member_id,
+            'timestamp': utcnow(),
+            'action': 'session_released'
+        })
+
+        return user_id, heartfelt_member_id
+
     def get_session_by_user(self, user_id: int) -> Optional[str]:
         """Find active session for a user - O(1) lookup"""
         return user_to_session_map.get(user_id)

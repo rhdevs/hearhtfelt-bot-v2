@@ -6,6 +6,7 @@ Usage: python db_utils.py [command]
 
 import datetime
 import argparse
+from typing import Optional
 from src.database.manager import db_mgr
 from src.timeutil import UTC, ensure_aware_utc, utcnow
 from config import get_service
@@ -125,7 +126,11 @@ def show_session_stats():
         completion_rate = (ended / total) * 100
         print(f"Completion Rate: {completion_rate:.1f}%")
 
-def manage_authorized_members(action: str, telegram_id: int = None, username: str = None, include_inactive: bool = False, service: str = 'hf'):
+def manage_authorized_members(action: str, telegram_id: Optional[int] = None,
+                              username: Optional[str] = None,
+                              include_inactive: bool = False, service: str = 'hf',
+                              display_name: Optional[str] = None,
+                              blurb: Optional[str] = None):
     """CLI helper to manage authorized members for a given service (hf/pss)."""
     if not db_mgr.initialize():
         print("❌ Database not available")
@@ -149,8 +154,23 @@ def manage_authorized_members(action: str, telegram_id: int = None, username: st
         for doc in records:
             member_id = doc.get('telegram_id')
             status = 'active' if doc.get('active', True) else 'inactive'
-            username_display = doc.get('username') or '—'
-            print(f"{member_id}: {status} (username: {username_display})")
+            # available absent means available -- do not invert this.
+            avail = 'available' if doc.get('available', True) else 'unavailable'
+            started = 'started' if doc.get('has_started_bot') else 'NOT SET'
+            display_name_val = doc.get('display_name') or '-'
+            username_val = doc.get('username')
+            # username_display already carries its own '@' (or is a bare '-' when
+            # absent), so it is not preceded by a separate literal '@' below --
+            # that avoids both double-'@' on stored "@handle" values and a stray
+            # '@' when there is no username at all.
+            if username_val:
+                username_display = username_val if str(username_val).startswith('@') else f"@{username_val}"
+            else:
+                username_display = '-'
+            print(f"{member_id}: {status:8} | {avail:11} | {started:7} | {display_name_val} | {username_display}")
+            blurb_val = doc.get('blurb')
+            if blurb_val:
+                print(f"   {blurb_val}")
         return
 
     if telegram_id is None:
@@ -175,6 +195,50 @@ def manage_authorized_members(action: str, telegram_id: int = None, username: st
             print(f"✅ Removed {label} {telegram_id}")
         else:
             print(f"❌ Failed to remove {label} {telegram_id}")
+    elif action == 'available':
+        success = db_mgr.set_member_availability(telegram_id, True, collection=collection)
+        if success:
+            print(f"✅ Marked {label} {telegram_id} as available")
+        else:
+            print(f"❌ Failed to mark {label} {telegram_id} as available")
+    elif action == 'unavailable':
+        success = db_mgr.set_member_availability(telegram_id, False, collection=collection)
+        if success:
+            print(f"✅ Marked {label} {telegram_id} as unavailable")
+        else:
+            print(f"❌ Failed to mark {label} {telegram_id} as unavailable")
+    elif action == 'set-profile':
+        if display_name is None and blurb is None:
+            print("❌ --display-name or --blurb is required for set-profile")
+            return
+        success = db_mgr.set_member_profile(telegram_id, collection=collection, display_name=display_name, blurb=blurb)
+        if success:
+            print(f"✅ Updated profile for {label} {telegram_id}")
+            doc = db_mgr.get_member_profile_doc(telegram_id, collection=collection)
+            if doc:
+                print(f"   telegram_id:    {doc.get('telegram_id')}")
+                print(f"   display_name:   {doc.get('display_name') or '-'}")
+                print(f"   blurb:          {doc.get('blurb') or '-'}")
+                print(f"   available:      {doc.get('available', True)}")
+                print(f"   has_started_bot: {doc.get('has_started_bot', False)}")
+                print(f"   active:         {doc.get('active', True)}")
+        else:
+            print(f"❌ Failed to update profile for {label} {telegram_id}")
+    elif action == 'set-started':
+        print("⚠️  This claims the supporter has an open chat with the bot. If they "
+              "don't, a directed request will fail and the requester will be asked "
+              "to choose again. Prefer asking them to press /start.")
+        success = db_mgr.mark_member_started(telegram_id, True, collection=collection)
+        if success:
+            print(f"✅ Marked {label} {telegram_id} as started")
+        else:
+            print(f"❌ Failed to mark {label} {telegram_id} as started")
+    elif action == 'clear-started':
+        success = db_mgr.mark_member_started(telegram_id, False, collection=collection)
+        if success:
+            print(f"✅ Cleared started flag for {label} {telegram_id}")
+        else:
+            print(f"❌ Failed to clear started flag for {label} {telegram_id}")
     else:
         print(f"❌ Unsupported action: {action}")
 
@@ -184,7 +248,9 @@ def main():
     parser.add_argument('command', choices=['transcript', 'monthly', 'stats', 'admins'],
                        help='Command to execute')
     parser.add_argument('--session-id', help='Session ID for transcript command')
-    parser.add_argument('--action', choices=['list', 'add', 'deactivate', 'remove'],
+    parser.add_argument('--action', choices=['list', 'add', 'deactivate', 'remove',
+                                              'available', 'unavailable',
+                                              'set-profile', 'set-started', 'clear-started'],
                         help='Action for admins command')
     parser.add_argument('--telegram-id', type=int, help='Telegram ID for admins command')
     parser.add_argument('--username', help='Optional username when adding an admin')
@@ -192,6 +258,8 @@ def main():
                         help='Include inactive members when listing admins')
     parser.add_argument('--service', choices=['hf', 'pss'], default='hf',
                         help='Which service roster to manage (default: hf)')
+    parser.add_argument('--display-name', help='Picker display name to set for set-profile')
+    parser.add_argument('--blurb', help='One-line free-text blurb to set for set-profile')
 
     args = parser.parse_args()
 
@@ -214,6 +282,8 @@ def main():
             username=args.username,
             include_inactive=args.include_inactive,
             service=args.service,
+            display_name=args.display_name,
+            blurb=args.blurb,
         )
 
 if __name__ == "__main__":

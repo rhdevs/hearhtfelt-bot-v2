@@ -178,6 +178,9 @@ python tests/test_timeutil.py            # aware-UTC helpers
 python tests/test_service_config.py      # service registry + timer invariants
 python tests/test_copy.py                # requester-facing copy guards
 python tests/test_pss_flow.py            # full HF+PSS flow with a fake bot
+python tests/test_member_profiles.py     # supporter profiles + availability rules
+python tests/test_directed_requests.py   # the PSS directed-support flow
+python tests/test_release_and_end.py     # requester-only /end, and /release
 python tests/test_per_service_timers.py  # per-track queue/session expiry
 python tests/test_restore.py             # restart durability
 python tests/test_session_expiry.py      # warn/expire lifecycle

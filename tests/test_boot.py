@@ -30,6 +30,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import sys
 from types import SimpleNamespace
 from typing import Optional
@@ -51,10 +52,11 @@ FAKE_TOKEN = "123456789:AAEyTESTtokenTESTtokenTESTtokenTEST"
 HF_CHANNEL = "-1009000000001"
 PSS_CHANNEL = "-1009000000002"
 
-# The ten callbacks main() registers on the application.
+# Every callback main() registers on the application.
 HANDLER_CALLBACKS = (
     "start_command", "chat_command", "end_command", "status_command",
-    "cancel_command", "handle_message", "handle_sticker", "handle_photo",
+    "cancel_command", "available_command", "unavailable_command",
+    "release_command", "handle_message", "handle_sticker", "handle_photo",
     "handle_callback_query", "handle_error",
 )
 
@@ -213,6 +215,10 @@ def _make_fakes(events):
     class FakeQueueManager:
         def __init__(self, bot):
             self.bot = bot
+
+        async def sweep_directed_requests(self):
+            events.append("directed_sweep")
+            return []
 
         async def sweep_expired_queues(self):
             events.append("queue_sweep")
@@ -375,10 +381,16 @@ def test_boot_order_rehydrate_then_sweep_then_poll():
         f"Events at the moment polling started: {snapshot}\n"
         f"Full event list: {events}\n"
     )
-    for name in ("restore", "queue_sweep", "expiry_sweep"):
+    for name in ("restore", "directed_sweep", "queue_sweep", "expiry_sweep"):
         assert name in snapshot, f"{name!r} had not happened when polling started." + why
 
+    # directed_sweep BEFORE queue_sweep, and that order is not cosmetic: handing a
+    # lapsed directed request back resets its waiting_since, so sweeping expiry first
+    # would expire a request the directed sweep was about to revive -- the requester
+    # gets "they're not free, pick again" AND "your request expired", for the same
+    # request, seconds apart.
     assert (snapshot.index("restore")
+            < snapshot.index("directed_sweep")
             < snapshot.index("queue_sweep")
             < snapshot.index("expiry_sweep")), why
 
@@ -386,6 +398,7 @@ def test_boot_order_rehydrate_then_sweep_then_poll():
     # "queue_sweep" in the snapshot would mean the periodic loop had already
     # started racing the boot sequence.
     assert snapshot.count("restore") == 1, why
+    assert snapshot.count("directed_sweep") == 1, why
     assert snapshot.count("queue_sweep") == 1, why
     assert snapshot.count("expiry_sweep") == 1, why
 
@@ -438,7 +451,7 @@ def test_shutdown_runs_the_finally_block():
     )
 
 
-def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
+def test_all_handler_callbacks_are_registered_against_real_ptb():
     """The fake Application records handlers, but CommandHandler / MessageHandler /
     CallbackQueryHandler / filters are the REAL PTB classes, so this is a live check
     that main()'s registration block still constructs under the installed version."""
@@ -477,17 +490,17 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
 
     app = app_holder.get("app")
     assert app is not None, "the fake Application was never built"
-    # 5 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
-    assert len(app.handlers) == 9, (
-        f"main() registered {len(app.handlers)} handlers, expected 9 "
-        f"(5 command, 3 message, 1 callback): {app.handlers!r}"
+    # 8 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
+    assert len(app.handlers) == 12, (
+        f"main() registered {len(app.handlers)} handlers, expected 12 "
+        f"(8 command, 3 message, 1 callback): {app.handlers!r}"
     )
     assert len(app.error_handlers) == 1, f"expected one error handler, got {app.error_handlers!r}"
 
     # WHICH callback is wired to WHICH handler, not just how many there are.
     # Counting handlers and collecting command names leaves every callback
     # identity unchecked: swapping handlers.handle_photo for handlers.handle_sticker
-    # in main.py keeps the count at 9 and the command set identical, so the suite
+    # in main.py keeps the count unchanged and the command set identical, so the suite
     # stayed green while every photo a requester sends went through the sticker
     # path. The same held for handle_message <-> handle_callback_query and for
     # handle_error <-> handle_message.
@@ -498,6 +511,9 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
         ("CommandHandler", "end_command"),
         ("CommandHandler", "status_command"),
         ("CommandHandler", "cancel_command"),
+        ("CommandHandler", "available_command"),
+        ("CommandHandler", "unavailable_command"),
+        ("CommandHandler", "release_command"),
         ("MessageHandler", "handle_message"),
         ("MessageHandler", "handle_sticker"),
         ("MessageHandler", "handle_photo"),
@@ -511,7 +527,11 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
 
     # The two singleton filters, by identity: a swap of the FILTERS rather than the
     # callbacks would leave the list above unchanged.
-    sticker_h, photo_h = app.handlers[6], app.handlers[7]
+    # HARD-CODED INDICES. They move every time a handler is added ahead of them,
+    # and a stale index still resolves to SOME handler, so the two asserts below
+    # would keep passing while testing the wrong objects. The ordered-pair list
+    # above is what pins them: keep the two in step.
+    sticker_h, photo_h = app.handlers[9], app.handlers[10]
     assert sticker_h.filters is filters.Sticker.ALL, (
         f"handle_sticker must be filtered on filters.Sticker.ALL, got {sticker_h.filters!r}"
     )
@@ -522,7 +542,8 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
     commands = set()
     for h in app.handlers:
         commands |= set(getattr(h, "commands", ()) or ())
-    assert commands == {"start", "chat", "help", "end", "status", "cancel"}, (
+    assert commands == {"start", "chat", "help", "end", "status", "cancel",
+                        "available", "unavailable", "release"}, (
         f"registered commands are {sorted(commands)}; /chat and its /help alias must "
         "both survive (main.py:117)"
     )
@@ -646,6 +667,74 @@ def _run_boot():
     return events, fakes, catcher
 
 
+# --------------------------------------------------------------------------- CI gate
+# The deploy job is `needs: test`, so this workflow file is the ONLY thing standing
+# between a red suite and a live mental-health helpline. It names its suites one
+# hard-coded step at a time, and nothing anywhere checked that the list was complete.
+#
+# A suite that is never invoked cannot go red. Add tests/test_foo.py, forget the
+# workflow line, and every future regression it would have caught ships green --
+# indistinguishable, from the outside, from a passing gate. The same happens on a
+# rename, or when a merge drops a step. This branch alone added three suites and
+# three hand-written steps; getting that right by hand is not a control.
+#
+# Deliberately excluded, and asserted to STAY excluded so the exclusion is a
+# decision rather than an oversight:
+CI_EXCLUDED_SUITES = {
+    # Requires a live Mongo (MONGODB_URI) and refuses to run without one. It is an
+    # operator tool, not a gate; running it in CI would either be a no-op or would
+    # hand the test job a database credential, which that job must never have.
+    "test_db_integration.py",
+}
+
+
+def _workflow_path():
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".github", "workflows", "deploy.yml")
+
+
+def test_every_suite_is_wired_into_the_deploy_gate():
+    """Every tests/test_*.py either runs in CI or is explicitly excluded here."""
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    on_disk = {f for f in os.listdir(tests_dir)
+               if f.startswith("test_") and f.endswith(".py")}
+    assert on_disk, "no suites found on disk -- discovery itself is broken"
+
+    workflow = _workflow_path()
+    assert os.path.isfile(workflow), (
+        "the deploy workflow is not where this guard looks (%s). If it moved, move "
+        "this check with it -- do not delete it." % workflow)
+
+    with open(workflow, encoding="utf-8") as fh:
+        body = fh.read()
+
+    invoked = set(re.findall(r"run:\s*python\s+tests/(test_\w+\.py)", body))
+
+    missing = sorted(on_disk - invoked - CI_EXCLUDED_SUITES)
+    assert not missing, (
+        "these suites exist but NOTHING runs them in CI, so they can never fail a "
+        "deploy: %s. Add a step to .github/workflows/deploy.yml, or add the file to "
+        "CI_EXCLUDED_SUITES with the reason." % ", ".join(missing))
+
+    phantom = sorted(invoked - on_disk)
+    assert not phantom, (
+        "the workflow runs suites that do not exist: %s. `python` on a missing file "
+        "exits non-zero, so this is a permanently red gate, not a silent one -- but "
+        "fix the name." % ", ".join(phantom))
+
+    still_excluded = sorted(CI_EXCLUDED_SUITES & invoked)
+    assert not still_excluded, (
+        "%s is listed as deliberately excluded but the workflow runs it. Pick one."
+        % ", ".join(still_excluded))
+
+    stale = sorted(CI_EXCLUDED_SUITES - on_disk)
+    assert not stale, (
+        "CI_EXCLUDED_SUITES names files that no longer exist: %s. A stale exclusion "
+        "will silently forgive a future suite that happens to reuse the name."
+        % ", ".join(stale))
+
+
+
 if __name__ == "__main__":
     # main.py's boot logging is deliberately chatty; keep the test output readable
     # without hiding the ERROR record that a swallowed boot failure produces.
@@ -659,8 +748,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 14, (
-        "expected at least 14 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 15, (
+        "expected at least 15 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

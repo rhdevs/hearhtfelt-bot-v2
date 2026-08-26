@@ -2,6 +2,7 @@ import datetime
 import uuid
 import logging
 from typing import Iterable, Optional, List, Dict, Any
+from pymongo import ReturnDocument
 from src.database.connection import db_manager
 from src.timeutil import ensure_aware_utc, utcnow
 
@@ -19,8 +20,16 @@ class DBManager:
     
     # SESSION MANAGEMENT
     
-    def create_session(self, user_id: int, description: str, anonymous_user_id: str, session_id: str = None, user_telehandle: str = None, service: str = "hf") -> Optional[str]:
-        """Create a new session in pending state"""
+    def create_session(self, user_id: int, description: str, anonymous_user_id: str, session_id: str = None, user_telehandle: str = None, service: str = "hf", routing: str = "open") -> Optional[str]:
+        """Create a new session in pending state.
+
+        `status` deliberately keeps its three values ('pending' / 'active' / 'ended'),
+        so every existing atomic gate -- claim_session, end_session,
+        get_pending_sessions -- keeps working with no widened filters. The new
+        `routing` field carries the directed-support lane instead. A fourth status
+        would have meant editing every filter in this file, which is exactly the
+        class of change where one gets missed. See D17.
+        """
         if not self.db_available:
             return None
 
@@ -48,6 +57,27 @@ class DBManager:
                 # still edit or delete it. Filled in by set_queue_message.
                 'queue_channel_id': None,
                 'queue_message_id': None,
+
+                # --- directed-support lane (Phase 5). All ADDITIVE: a legacy
+                # document with none of these reads as routing 'open', which is
+                # today's behaviour exactly.
+                'routing': routing,
+                # A SECOND clock. created_at stays immutable (audit, and the
+                # channel post's "Requested:" line); waiting_since is the
+                # requester's WAIT BUDGET and restarts whenever the decision is
+                # handed back to them. Without it a request that lapses at 23h59m
+                # would get "they're not free, pick again" and "your request
+                # expired" one sweep apart. The open lane NEVER resets it, so
+                # open-queue timing is byte-identical to before. See D18.
+                'waiting_since': now,
+                'target_member_id': None,
+                'directed_at': None,
+                'directed_message_id': None,
+                'notice_channel_id': None,
+                'notice_message_id': None,
+                # Everyone who has declined, let this lapse, or released it. The
+                # picker never re-offers them.
+                'declined_by': [],
             }
             
             db_manager.db.sessions.insert_one(session_doc)
@@ -220,6 +250,169 @@ class DBManager:
             logger.error(f"Error recording queue message for session {session_id}: {e}")
             return False
 
+    def set_directed_message(self, session_id: str, message_id: int) -> bool:
+        """Record the message_id of the DM sitting in the targeted supporter's chat,
+        so a restarted bot can still strip its Accept/Decline buttons.
+
+        Deliberately NOT filtered on routing: the DM physically exists whether or not
+        the supporter tapped Decline in the microsecond between send_message returning
+        and this write."""
+        if not self.db_available:
+            return False
+
+        try:
+            result = db_manager.db.sessions.update_one(
+                {'session_id': session_id},
+                {'$set': {'directed_message_id': int(message_id)}},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error recording directed message for session {session_id}: {e}")
+            return False
+
+    def set_directed_notice(self, session_id: str, channel_id, message_id: int) -> bool:
+        """Record where the no-detail channel note lives, so it can be edited later."""
+        if not self.db_available:
+            return False
+
+        try:
+            result = db_manager.db.sessions.update_one(
+                {'session_id': session_id},
+                {'$set': {
+                    'notice_channel_id': str(channel_id) if channel_id is not None else None,
+                    'notice_message_id': int(message_id),
+                }},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error recording directed notice for session {session_id}: {e}")
+            return False
+
+    # --- atomic routing transitions -----------------------------------------
+    #
+    # Each of these is the EXACTLY-ONCE GATE on a message to a real person, so each
+    # is one find_one_and_update whose FILTER names the state it is leaving. PyMongo
+    # is blocking, so a find_one_and_update is atomic against the event loop: two
+    # concurrent taps both call it, exactly one gets a document back, and only that
+    # one may send anything. Losing the race must be silent.
+    #
+    # ReturnDocument.AFTER, not the legacy `return_document=True` end_session still
+    # uses. end_session is deliberately left alone: changing it would touch the one
+    # gate every existing suite already depends on.
+
+    def direct_session(self, session_id: str, member_id: int) -> Optional[Dict[str, Any]]:
+        """choosing -> directed. The routing:'choosing' clause in the filter is what
+        makes a double-tapped picker button send exactly ONE DM."""
+        if not self.db_available:
+            return None
+
+        try:
+            return db_manager.db.sessions.find_one_and_update(
+                {'session_id': session_id, 'status': 'pending', 'routing': 'choosing'},
+                {'$set': {
+                    'routing': 'directed',
+                    'target_member_id': int(member_id),
+                    'directed_at': utcnow(),
+                    'directed_message_id': None,
+                }},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as e:
+            logger.error(f"Error directing session {session_id} to {member_id}: {e}")
+            return None
+
+    def undirect_session(self, session_id: str, member_id: int,
+                         reason: str = None) -> Optional[Dict[str, Any]]:
+        """directed -> choosing, for a decline, a lapse, a reroute or a release.
+
+        $addToSet declined_by is why the same supporter is never re-offered, and
+        waiting_since is reset so the requester gets a fresh window rather than
+        being told to choose again and that their request expired, one sweep apart.
+        """
+        if not self.db_available:
+            return None
+
+        try:
+            return db_manager.db.sessions.find_one_and_update(
+                {'session_id': session_id, 'status': 'pending', 'routing': 'directed',
+                 'target_member_id': int(member_id)},
+                {'$set': {
+                    'routing': 'choosing',
+                    'target_member_id': None,
+                    'directed_at': None,
+                    'directed_message_id': None,
+                    'waiting_since': utcnow(),
+                    'last_undirect_reason': reason,
+                 },
+                 '$addToSet': {'declined_by': int(member_id)}},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as e:
+            logger.error(f"Error undirecting session {session_id} from {member_id}: {e}")
+            return None
+
+    def open_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """choosing/directed -> open: the requester chose to ask anyone who's free."""
+        if not self.db_available:
+            return None
+
+        try:
+            return db_manager.db.sessions.find_one_and_update(
+                {'session_id': session_id, 'status': 'pending',
+                 'routing': {'$in': ['choosing', 'directed']}},
+                {'$set': {
+                    'routing': 'open',
+                    'target_member_id': None,
+                    'directed_at': None,
+                    'waiting_since': utcnow(),
+                }},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as e:
+            logger.error(f"Error opening session {session_id} to the queue: {e}")
+            return None
+
+    def release_session(self, session_id: str, member_id: int) -> Optional[Dict[str, Any]]:
+        """active -> pending, when the claiming member hands the conversation back.
+
+        Deliberately NOT end_session: the request is not over, and the person who
+        asked for help still needs someone. status returns to 'pending' so
+        claim_session, end_session and get_pending_sessions keep working with no new
+        special cases.
+
+        claimed_at MUST be reset, or the eventual end_session measures duration from
+        the abandoned stint. declined_by gets the releaser so the picker does not
+        immediately re-offer the person who just stepped away.
+
+        `routing` is deliberately NOT touched: it is the request's PROVENANCE, and
+        release_command reads it to decide whether this request may go back to the
+        channel at all. See D28.
+        """
+        if not self.db_available:
+            return None
+
+        now = utcnow()
+        try:
+            return db_manager.db.sessions.find_one_and_update(
+                {'session_id': session_id, 'status': 'active',
+                 'heartfelt_member_id': int(member_id)},
+                {'$set': {
+                    'status': 'pending',
+                    'heartfelt_member_id': None,
+                    'heartfelt_member_telehandle': None,
+                    'claimed_at': None,
+                    'waiting_since': now,
+                    'released_at': now,
+                 },
+                 '$inc': {'release_count': 1},
+                 '$addToSet': {'released_by': int(member_id),
+                               'declined_by': int(member_id)}},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as e:
+            logger.error(f"Error releasing session {session_id} by {member_id}: {e}")
+            return None
+
     def get_active_sessions(self) -> List[Dict[str, Any]]:
         """Get all active (claimed, unended) sessions, oldest first.
 
@@ -336,7 +529,9 @@ class DBManager:
         """Return raw authorized member documents from a service's MongoDB collection."""
         return self._fetch_authorized_member_docs(include_inactive=include_inactive, collection=collection)
 
-    def add_authorized_member(self, member_id: int, username: str = None, active: bool = True, collection: str = None) -> bool:
+    def add_authorized_member(self, member_id: int, username: Optional[str] = None,
+                              active: bool = True,
+                              collection: Optional[str] = None) -> bool:
         """Upsert an authorized member record in a service's collection."""
         if not self.db_available:
             return False
@@ -386,6 +581,101 @@ class DBManager:
         except Exception as e:
             logger.error(f"Error deactivating authorized member {member_id}: {e}")
             return False
+
+    # --- supporter profiles (Phase 4) ---------------------------------------
+    #
+    # NONE of these upsert. The only creator of a roster entry stays
+    # add_authorized_member: a typo in --telegram-id here must fail loudly, not
+    # quietly authorize a stranger's Telegram id to claim conversations.
+
+    def set_member_profile(self, member_id: int, collection: Optional[str] = None,
+                           display_name: Optional[str] = None,
+                           blurb: Optional[str] = None) -> bool:
+        """Set the picker label and/or the one free-text line, leaving the other alone."""
+        if not self.db_available:
+            return False
+
+        updates = {}
+        if display_name is not None:
+            updates['display_name'] = str(display_name).strip()
+        if blurb is not None:
+            updates['blurb'] = str(blurb).strip()
+        if not updates:
+            logger.error("set_member_profile called with nothing to set for %s", member_id)
+            return False
+
+        try:
+            coll = collection or self._authorized_collection
+            updates['updated_at'] = utcnow()
+            result = db_manager.db[coll].update_one(
+                {'telegram_id': int(member_id)},
+                {'$set': updates},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error setting profile for member {member_id}: {e}")
+            return False
+
+    def set_member_availability(self, member_id: int, available: bool,
+                                collection: str = None) -> bool:
+        """Toggle a supporter's availability.
+
+        Returns matched_count > 0, NOT modified_count: running /available when
+        already available changes nothing in Mongo but is a complete success, and
+        reporting it as a failure would send a supporter chasing a non-problem.
+        """
+        if not self.db_available:
+            return False
+
+        try:
+            coll = collection or self._authorized_collection
+            result = db_manager.db[coll].update_one(
+                {'telegram_id': int(member_id)},
+                {'$set': {'available': bool(available), 'updated_at': utcnow()}},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error setting availability for member {member_id}: {e}")
+            return False
+
+    def mark_member_started(self, member_id: int, started: bool = True,
+                            collection: str = None) -> bool:
+        """Record whether this member has an open chat with the bot.
+
+        Written when a member /starts or sends any private message, and CLEARED when
+        a directed DM comes back "bot can't initiate conversation" or "blocked" --
+        self-healing, so a supporter who blocks and later unblocks returns to the
+        picker on their next message rather than staying broken forever.
+        """
+        if not self.db_available:
+            return False
+
+        try:
+            coll = collection or self._authorized_collection
+            updates = {'has_started_bot': bool(started), 'updated_at': utcnow()}
+            if started:
+                updates['started_bot_at'] = utcnow()
+            result = db_manager.db[coll].update_one(
+                {'telegram_id': int(member_id)},
+                {'$set': updates},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error marking member {member_id} started: {e}")
+            return False
+
+    def get_member_profile_doc(self, member_id: int,
+                               collection: str = None) -> Optional[Dict[str, Any]]:
+        """One raw member document, for the CLI's confirmation output."""
+        if not self.db_available:
+            return None
+
+        try:
+            coll = collection or self._authorized_collection
+            return db_manager.db[coll].find_one({'telegram_id': int(member_id)})
+        except Exception as e:
+            logger.error(f"Error reading profile for member {member_id}: {e}")
+            return None
 
     def remove_authorized_member(self, member_id: int, collection: str = None) -> bool:
         """Completely remove an authorized member record from a service's collection."""

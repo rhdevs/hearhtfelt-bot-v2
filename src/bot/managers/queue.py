@@ -5,18 +5,27 @@ import random
 import uuid
 from typing import List, Optional, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+import config
 from config import (
+    CB_DIRECT_ACCEPT,
+    CB_DIRECT_DECLINE,
+    CB_PICK_CANCEL,
+    CB_PICK_LIST,
+    CB_PICK_OPEN,
     MESSAGES,
     used_anonymous_ids,
     ServiceType,
     UserState,
+    directed_by_member,
     get_service,
+    is_supporter_available,
+    picker_views,
     queue_entries,
     queue_order,
     user_states,
     user_to_queue_map,
 )
-from src.timeutil import ensure_aware_utc, format_hhmm, utcnow
+from src.timeutil import ensure_aware_utc, format_duration_minutes, format_hhmm, utcnow
 from src.database.manager import db_mgr
 
 
@@ -69,28 +78,51 @@ class QueueManager:
         return fallback_id
 
     def add_to_queue(self, user_id: int, description: str, user_telehandle: str = None,
-                     service_key: str = ServiceType.HF.value) -> str:
-        """Add user to the help queue for the given service"""
+                     service_key: str = ServiceType.HF.value, routing: str = "open") -> str:
+        """Add user to the help queue for the given service.
+
+        routing='open' is today's behaviour exactly: the request goes into
+        queue_order and gets a channel post with a Claim button. routing='choosing'
+        means the requester is being asked whether they want a specific supporter,
+        so the request exists and is durable but is NOT in the channel and NOT in
+        queue_order -- a queue POSITION is meaningless for a request nobody outside
+        this conversation can see.
+        """
         queue_id = str(uuid.uuid4())
         anonymous_id = self._generate_anonymous_id(get_service(service_key).anon_prefix)
+
+        # ONE `now` for both clocks, so a freshly created request cannot look like it
+        # has already been waiting.
+        now = utcnow()
 
         queue_entries[queue_id] = {
             'user_id': user_id,
             'description': description,
-            'created_at': utcnow(),
+            'created_at': now,
+            # The wait budget. Reset on every hand-back to the requester; NEVER reset
+            # by the open lane, which is what keeps open-queue timing unchanged.
+            'waiting_since': now,
             'anonymous_id': anonymous_id,
             'message_id': None,  # Will be set after posting to channel
             'channel_id': None,  # ditto -- the channel the post actually landed in
             'service': service_key,
+            'routing': routing,
+            'target_member_id': None,
+            'directed_at': None,
+            'directed_message_id': None,
+            'notice_channel_id': None,
+            'notice_message_id': None,
+            'declined_by': [],
         }
 
         # Maintain O(1) lookup indices
         user_to_queue_map[user_id] = queue_id
-        queue_order.append(queue_id)
+        if routing == 'open':
+            queue_order.append(queue_id)
 
         # Create pending session in database using queue_id as session_id
         if db_mgr.db_available:
-            db_mgr.create_session(user_id, description, anonymous_id, queue_id, user_telehandle, service=service_key)
+            db_mgr.create_session(user_id, description, anonymous_id, queue_id, user_telehandle, service=service_key, routing=routing)
 
         return queue_id
     
@@ -284,7 +316,17 @@ class QueueManager:
         expired_queue_ids = []
 
         for queue_id, entry in list(queue_entries.items()):
-            created = ensure_aware_utc(entry.get('created_at'))
+            # A directed request is owned ENTIRELY by sweep_directed_requests(): it has
+            # its own, much longer clock (directed_at + directed_response_minutes) and
+            # its own stale horizon. Expiring it here would close it out from under the
+            # supporter who is still looking at the DM.
+            if (entry.get('routing') or 'open') == 'directed':
+                continue
+            # waiting_since, not created_at: a request handed back to the requester
+            # gets a fresh window, or a decline at 23h59m produces "choose again" and
+            # "your request expired" one sweep apart. Legacy entries have no
+            # waiting_since and fall back to created_at, so the open lane is unchanged.
+            created = ensure_aware_utc(entry.get('waiting_since') or entry.get('created_at'))
             window_seconds = get_service(entry.get('service')).queue_expire_minutes * 60
             if created is None:
                 # Unusable timestamp: we cannot tell how long this has waited, and
@@ -305,17 +347,22 @@ class QueueManager:
             notify = False
             user_id = entry.get('user_id')
             if user_id:
-                if user_states.get(user_id) == UserState.IN_QUEUE:
+                # CHOOSING_SUPPORTER counts too: someone who never finished picking is
+                # still owed the news that their request is gone.
+                if user_states.get(user_id) in (UserState.IN_QUEUE,
+                                                UserState.CHOOSING_SUPPORTER):
                     user_states[user_id] = UserState.IDLE
                     notify = True
                 if user_id in user_to_queue_map:
                     del user_to_queue_map[user_id]
+                picker_views.pop(user_id, None)
 
             queue_entries.pop(queue_id, None)
             if queue_id in queue_order:
                 queue_order.remove(queue_id)
 
-            expired_entries.append({**entry, 'queue_id': queue_id, 'notify': notify})
+            expired_entries.append({**entry, 'queue_id': queue_id, 'notify': notify,
+                                    'routing': entry.get('routing') or 'open'})
 
         return expired_entries
 
@@ -348,12 +395,17 @@ class QueueManager:
             # 2. Retire the channel post so its Claim button stops being live.
             await self._retire_channel_post(entry, svc)
 
-            # 3. Notify the requester.
+            # 3. Notify the requester. queue_expired says "no {member} was available
+            #    in time", which is simply false for a request that never reached
+            #    anybody, so a 'choosing' request gets its own wording.
             if entry.get('notify') and entry.get('user_id'):
                 try:
+                    text = (MESSAGES["choosing_expired"]
+                            if entry.get('routing') == 'choosing'
+                            else MESSAGES["queue_expired"].format(member=svc.member_label))
                     await self.bot.send_message(
                         chat_id=entry['user_id'],
-                        text=MESSAGES["queue_expired"].format(member=svc.member_label),
+                        text=text,
                     )
                 except Exception as exc:
                     logger.warning("Failed to notify user %s about queue expiry: %s",
@@ -366,6 +418,11 @@ class QueueManager:
     async def _retire_channel_post(self, entry: dict, svc) -> None:
         """Edit an expired request's channel post into an EXPIRED card and strip the
         Claim button, falling back to deleting it. NEVER raises."""
+        # Stated, not inferred: only the open lane ever HAS a channel post with a Claim
+        # button. A 'choosing' request was never posted, and a 'directed' one has only
+        # the no-detail note, which _update_directed_notice owns.
+        if (entry.get('routing') or 'open') != 'open':
+            return
         message_id = entry.get('message_id')
         if not message_id or not self.channel_accessible.get(svc.key, True):
             return
@@ -403,6 +460,549 @@ class QueueManager:
                            entry.get('queue_id'), exc)
 
     
+    # ==================================================================
+    # Directed support (Phase 5)
+    # ==================================================================
+
+    @staticmethod
+    def _directed_notice_text(member_name: Optional[str], tail: str = "") -> str:
+        """The channel note, which carries NO description, NO claim button and NO
+        anonymous id.
+
+        Omitting the anonymous id is deliberate and is the whole reason this note is
+        safe: with it, the channel could correlate this note against a later
+        open-queue post of the SAME request and read off "X was asked and now it's
+        open" -- i.e. that X said no. That is exactly what must never be surfaced.
+        """
+        who = html.escape(member_name) if member_name else "a supporter"
+        return f"A request was sent directly to {who}{tail}"
+
+    async def _post_directed_notice(self, queue_id: str, entry: dict, svc,
+                                    member_name: str) -> None:
+        """Tell the channel that SOMETHING was routed, and nothing more. NEVER raises."""
+        try:
+            if not self.channel_accessible.get(svc.key, True) or not svc.channel_id:
+                return
+            text = self._directed_notice_text(member_name,
+                                              f" - {format_hhmm(utcnow())}")
+            message = await self.bot.send_message(
+                chat_id=svc.channel_id,
+                text=text,
+                parse_mode='HTML',
+            )
+            entry['notice_channel_id'] = svc.channel_id
+            entry['notice_message_id'] = getattr(message, 'message_id', None)
+            # Kept in memory only. A restarted bot can still EDIT the note (it has the
+            # coordinates from Mongo) but renders it without the name rather than
+            # persisting a curated display name onto the session document.
+            entry['notice_member_name'] = member_name
+            if db_mgr.db_available and entry['notice_message_id'] is not None:
+                try:
+                    db_mgr.set_directed_notice(queue_id, svc.channel_id,
+                                               entry['notice_message_id'])
+                except Exception as exc:
+                    logger.warning("Could not persist directed notice: %s", exc)
+        except Exception as exc:
+            logger.warning("Could not post the directed notice for service %s: %s",
+                           getattr(svc, 'key', '?'), exc)
+
+    async def _update_directed_notice(self, entry: dict, outcome: str) -> None:
+        """Edit the channel note in place. NEVER raises.
+
+        ONE wording covers every non-accept outcome -- decline, lapse, cancel,
+        reroute, release. "Declined" is never written to the channel: the channel is
+        the supporter's own peers, and naming a decline there invites exactly the
+        social pressure this feature exists to avoid.
+        """
+        try:
+            message_id = entry.get('notice_message_id')
+            channel_id = entry.get('notice_channel_id')
+            if not message_id or not channel_id:
+                return
+            tail = (f" - accepted {format_hhmm(utcnow())}" if outcome == 'accepted'
+                    else " - no longer waiting")
+            await self.bot.edit_message_text(
+                chat_id=channel_id,
+                message_id=message_id,
+                text=self._directed_notice_text(entry.get('notice_member_name'), tail),
+                reply_markup=None,
+                parse_mode='HTML',
+            )
+        except Exception as exc:
+            logger.warning("Could not update the directed notice: %s", exc)
+
+    async def _strip_directed_buttons(self, entry: dict, member_id: Optional[int]) -> None:
+        """Take Accept / Not right now off the supporter's DM. NEVER raises."""
+        try:
+            message_id = entry.get('directed_message_id')
+            target = member_id if member_id is not None else entry.get('target_member_id')
+            if not message_id or target is None:
+                return
+            await self.bot.edit_message_reply_markup(
+                chat_id=target, message_id=message_id, reply_markup=None)
+        except Exception as exc:
+            logger.warning("Could not strip the directed request buttons: %s", exc)
+
+    async def send_directed_request(self, queue_id: str, member_id: int) -> str:
+        """Route ONE request to ONE supporter. Returns 'ok' | 'gone' | 'busy' | 'unreachable'.
+
+        The order below IS the exactly-once gate. Everything that can refuse happens
+        first, then the atomic Mongo transition, then the in-memory transition, and
+        only THEN the first await. Two taps on the same name both reach
+        direct_session; exactly one gets a document back; exactly one DM is sent.
+        """
+        entry = queue_entries.get(queue_id)
+        if entry is None:
+            return 'gone'
+        if (entry.get('routing') or 'open') != 'choosing':
+            return 'gone'
+
+        svc = get_service(entry.get('service'))
+        try:
+            member_int = int(member_id)
+        except (TypeError, ValueError):
+            return 'busy'
+
+        declined = set(entry.get('declined_by') or [])
+        if member_int in declined or not is_supporter_available(svc.key, member_int):
+            return 'busy'
+        if member_int == entry.get('user_id'):
+            return 'busy'
+
+        # --- atomic, synchronous, BEFORE any await -------------------------------
+        if db_mgr.db_available:
+            doc = db_mgr.direct_session(queue_id, member_int)
+            if not doc:
+                logger.info("Directed request %s was already routed elsewhere; "
+                            "sending nothing", queue_id)
+                return 'gone'
+
+        entry['routing'] = 'directed'
+        entry['target_member_id'] = member_int
+        entry['directed_at'] = utcnow()
+        entry['directed_message_id'] = None
+        directed_by_member[member_int] = queue_id
+        # IN_QUEUE, not CHOOSING_SUPPORTER: the choosing is over and they ARE now
+        # waiting, on one named person. This MUST match what restore._restore_pending
+        # sets for a 'directed' row, or the requester's state silently changes across
+        # a restart -- and while it is CHOOSING_SUPPORTER, anything they type is read
+        # as a picker number against a view that no longer exists.
+        requester_id = entry.get('user_id')
+        if requester_id:
+            user_states[requester_id] = UserState.IN_QUEUE
+        # ------------------------------------------------------------------------
+
+        profile = svc.roster.profile(member_int)
+        member_name = profile.display_name if profile is not None else ""
+
+        description = entry.get('description') or ''
+        text = MESSAGES["directed_request"].format(
+            description=html.escape(description[:500]),
+            window=format_duration_minutes(svc.directed_response_minutes),
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(MESSAGES["directed_accept_button"],
+                                 callback_data=f"{CB_DIRECT_ACCEPT}:{queue_id}"),
+            InlineKeyboardButton(MESSAGES["directed_decline_button"],
+                                 callback_data=f"{CB_DIRECT_DECLINE}:{queue_id}"),
+        ]])
+
+        try:
+            message = await self.bot.send_message(
+                chat_id=member_int, text=text, reply_markup=keyboard, parse_mode='HTML')
+        except Exception as exc:
+            # ROLL EVERYTHING BACK. A row left 'directed' at a supporter who was never
+            # messaged burns 24 hours of silence on a person in distress.
+            logger.warning("Could not DM directed request %s to member %s: %s",
+                           queue_id, member_int, exc)
+            if db_mgr.db_available:
+                try:
+                    db_mgr.undirect_session(queue_id, member_int, reason='unreachable')
+                except Exception as inner:
+                    logger.warning("Rollback of directed request %s also failed: %s",
+                                   queue_id, inner)
+            entry['routing'] = 'choosing'
+            entry['target_member_id'] = None
+            entry['directed_at'] = None
+            entry['directed_message_id'] = None
+            # undirect_session also reset waiting_since; mirror it or memory expires
+            # this request on a clock Mongo no longer agrees with.
+            entry['waiting_since'] = utcnow()
+            directed_by_member.pop(member_int, None)
+            # Keep memory in step with what undirect_session just wrote, so the
+            # re-rendered picker does not offer the same unreachable person again.
+            if member_int not in declined:
+                entry['declined_by'] = list(entry.get('declined_by') or []) + [member_int]
+            # AND PUT THE REQUESTER BACK. The state was moved to IN_QUEUE before the
+            # await; rolling the row back to 'choosing' without rolling this back
+            # leaves them staring at a re-rendered picker that says "reply with its
+            # number" while handle_message answers every number they type with the
+            # generic unknown-command string. The buttons keep working, so nothing
+            # looks broken -- it just silently stops listening. Every other
+            # directed -> choosing path (undirect) restores this; so must the rollback.
+            if requester_id:
+                user_states[requester_id] = UserState.CHOOSING_SUPPORTER
+
+            lowered = str(exc).lower()
+            if ("bot can't initiate" in lowered
+                    or "can't initiate conversation" in lowered
+                    or "blocked" in lowered
+                    or "forbidden" in lowered):
+                # Self-healing: they drop out of the picker now and come back the
+                # moment they message the bot again.
+                logger.warning("Member %s cannot be messaged by the bot; clearing "
+                               "has_started_bot", member_int)
+                if db_mgr.db_available:
+                    try:
+                        db_mgr.mark_member_started(member_int, False,
+                                                   collection=svc.members_collection)
+                    except Exception as inner:
+                        logger.warning("Could not clear has_started_bot for %s: %s",
+                                       member_int, inner)
+                svc.roster.mark_started(member_int, False)
+            return 'unreachable'
+
+        entry['directed_message_id'] = getattr(message, 'message_id', None)
+        if db_mgr.db_available and entry['directed_message_id'] is not None:
+            try:
+                db_mgr.set_directed_message(queue_id, entry['directed_message_id'])
+            except Exception as exc:
+                logger.warning("Could not persist directed message id for %s: %s",
+                               queue_id, exc)
+
+        # Best-effort, never fatal, and always AFTER the DM.
+        await self._post_directed_notice(queue_id, entry, svc, member_name)
+        return 'ok'
+
+    async def accept_directed(self, queue_id: str, member_id: int, member_name: str = None,
+                              member_telehandle: str = None) -> Tuple[str, Optional[int]]:
+        """The targeted supporter, and ONLY the targeted supporter, takes the request.
+
+        Separate from claim_queue because the AUTHORIZATION RULE is different:
+        claim_queue authorizes against is_member_of_service -- the entire roster --
+        which is exactly wrong here. It REUSES db_mgr.claim_session because the atomic
+        win is the same one, and a second claim path is a second place for
+        exactly-once to be wrong.
+        """
+        entry = queue_entries.get(queue_id)
+        if entry is None:
+            return ('gone', None)
+
+        try:
+            member_int = int(member_id)
+        except (TypeError, ValueError):
+            return ('not_yours', None)
+
+        if ((entry.get('routing') or 'open') != 'directed'
+                or entry.get('target_member_id') != member_int):
+            return ('not_yours', None)
+
+        user_id = entry.get('user_id')
+        if user_id == member_int:
+            raise SelfClaimError("Claimant cannot take their own queue entry")
+
+        if db_mgr.db_available:
+            if not db_mgr.claim_session(queue_id, member_int, member_telehandle):
+                logger.info("Directed request %s was already claimed or closed; "
+                            "ignoring accept by %s", queue_id, member_int)
+                return ('gone', None)
+
+        # Synchronously, before the first await -- the same reason claim_queue does it.
+        queue_entries.pop(queue_id, None)
+        if user_id in user_to_queue_map:
+            del user_to_queue_map[user_id]
+        directed_by_member.pop(member_int, None)
+        picker_views.pop(user_id, None)
+        if queue_id in queue_order:
+            queue_order.remove(queue_id)
+
+        await self._strip_directed_buttons(entry, member_int)
+        await self._update_directed_notice(entry, 'accepted')
+        return ('ok', user_id)
+
+    async def undirect(self, queue_id: str, member_id: int, reason: str,
+                       notify_member: bool = True) -> bool:
+        """directed -> choosing. True IFF THIS CALLER WON the transition.
+
+        A decline and a 24-hour lapse are the same transition, so they share one
+        implementation. Only a caller that gets True back may message the requester;
+        losing this race must be completely silent, or two actors both tell the same
+        person their supporter isn't free.
+        """
+        entry = queue_entries.get(queue_id)
+        if entry is None:
+            return False
+
+        try:
+            member_int = int(member_id)
+        except (TypeError, ValueError):
+            return False
+
+        if ((entry.get('routing') or 'open') != 'directed'
+                or entry.get('target_member_id') != member_int):
+            return False
+
+        # Atomic, synchronous, pre-await. When Mongo is unavailable, the memory check
+        # above is the gate.
+        if db_mgr.db_available:
+            if not db_mgr.undirect_session(queue_id, member_int, reason=reason):
+                logger.info("Directed request %s had already moved on; staying quiet",
+                            queue_id)
+                return False
+
+        message_id = entry.get('directed_message_id')
+        entry['routing'] = 'choosing'
+        entry['target_member_id'] = None
+        entry['directed_at'] = None
+        # A FRESH window. Without this a request lapsing at 23h59m would produce
+        # "they're not free, pick again" and "your request expired" one sweep apart.
+        entry['waiting_since'] = utcnow()
+        declined = list(entry.get('declined_by') or [])
+        if member_int not in declined:
+            declined.append(member_int)
+        entry['declined_by'] = declined
+        directed_by_member.pop(member_int, None)
+        requester = entry.get('user_id')
+        if requester:
+            user_states[requester] = UserState.CHOOSING_SUPPORTER
+
+        await self._strip_directed_buttons({'directed_message_id': message_id},
+                                           member_int)
+        entry['directed_message_id'] = None
+        await self._update_directed_notice(entry, 'closed')
+
+        if notify_member and reason == 'timeout':
+            # Otherwise their DM sits looking live forever.
+            try:
+                await self.bot.send_message(chat_id=member_int,
+                                            text=MESSAGES["directed_lapsed_member"])
+            except Exception as exc:
+                logger.warning("Could not tell member %s their request lapsed: %s",
+                               member_int, exc)
+        return True
+
+    async def _offer_next_step(self, entry: dict, note_key: str, name: str = "") -> None:
+        """DM the requester the "what next?" prompt. NEVER raises."""
+        user_id = entry.get('user_id')
+        if not user_id:
+            return
+        note = MESSAGES[note_key]
+        if "{name}" in note:
+            note = note.format(name=name or "They")
+        text = note + "\n\n" + MESSAGES["next_step_question"]
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(MESSAGES["picker_choose_else_button"],
+                                  callback_data=f"{CB_PICK_LIST}:0")],
+            [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
+                                  callback_data=CB_PICK_OPEN)],
+            [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
+                                  callback_data=CB_PICK_CANCEL)],
+        ])
+        try:
+            await self.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        except Exception as exc:
+            logger.warning("Could not offer the next step to %s: %s", user_id, exc)
+
+    async def sweep_directed_requests(self) -> List[dict]:
+        """Hand back requests one supporter has sat on for too long.
+
+        THE STALE HORIZON IS THE POINT. Without it, the first boot after a multi-day
+        outage walks every mid-request row and DMs every one of those people, months
+        after the fact. This is the twin of restore._restore_pending's horizon and of
+        expiry._expire_session's, and it is the single most dangerous send path added
+        by this feature.
+        """
+        now = utcnow()
+        acted: List[dict] = []
+
+        for queue_id, entry in list(queue_entries.items()):
+            if (entry.get('routing') or 'open') != 'directed':
+                continue
+
+            svc = get_service(entry.get('service'))
+            target = entry.get('target_member_id')
+
+            directed = ensure_aware_utc(entry.get('directed_at'))
+            if directed is None or directed > now:
+                # Unusable clock. REPAIR IT AND WAIT -- exactly what
+                # restore._restore_pending does with the same bad value, and for the
+                # same reason.
+                #
+                # The two obvious alternatives are both wrong. Treating it as
+                # infinitely old lands in the silent branch below and DESTROYS a live
+                # request: the requester is told nothing, ever, and one bad write
+                # across many rows quietly deletes all of them. Treating it as
+                # infinitely old but notifying is worse still -- that is messaging on
+                # a timestamp we know we cannot trust, which is the exact failure this
+                # sweep exists to prevent.
+                #
+                # Failing toward waiting sends nobody anything now, keeps the request
+                # alive, and lets it resolve normally one window from here. It cannot
+                # loop: the repaired value is a real timestamp that ages.
+                logger.warning("Directed request %s has an unusable directed_at (%r); "
+                               "treating it as just sent rather than messaging on a "
+                               "clock we cannot trust", queue_id,
+                               entry.get('directed_at'))
+                entry['directed_at'] = now
+                continue
+
+            idle = (now - directed).total_seconds() / 60.0
+
+            if idle < svc.directed_response_minutes:
+                continue
+
+            stale = idle > (svc.directed_response_minutes
+                            + config.STALE_NOTIFY_GRACE_MINUTES)
+
+            if stale:
+                won = True
+                if db_mgr.db_available:
+                    try:
+                        won = db_mgr.end_session(queue_id, None, system_end=True,
+                                                 end_reason='stale_startup_sweep')
+                    except Exception as exc:
+                        logger.warning("Could not close stale directed row %s: %s",
+                                       queue_id, exc)
+                        won = False
+                if not won:
+                    continue
+
+                requester = entry.get('user_id')
+                queue_entries.pop(queue_id, None)
+                if requester in user_to_queue_map:
+                    del user_to_queue_map[requester]
+                if queue_id in queue_order:
+                    queue_order.remove(queue_id)
+                if target is not None:
+                    directed_by_member.pop(target, None)
+                picker_views.pop(requester, None)
+                if requester:
+                    user_states[requester] = UserState.IDLE
+
+                await self._strip_directed_buttons(entry, target)
+                await self._update_directed_notice(entry, 'closed')
+                # AND MESSAGE NOBODY.
+                logger.info("Directed request %s was %.0f min old (> %d min horizon); "
+                            "closed silently", queue_id, idle,
+                            svc.directed_response_minutes
+                            + config.STALE_NOTIFY_GRACE_MINUTES)
+                acted.append({**entry, 'queue_id': queue_id, 'outcome': 'stale'})
+                continue
+
+            if target is None:
+                continue
+
+            profile = svc.roster.profile(target)
+            name = profile.display_name if profile is not None else ""
+
+            if await self.undirect(queue_id, target, reason='timeout'):
+                # Only the winner speaks to the requester.
+                await self._offer_next_step(entry, "directed_unavailable", name)
+                acted.append({**entry, 'queue_id': queue_id, 'outcome': 'lapsed'})
+
+        return acted
+
+    def rebuild_released_entry(self, doc: dict, routing: str) -> str:
+        """Rebuild the in-memory queue entry for a request handed back by its member.
+
+        The SAME session_id and the SAME anonymous_user_id: the channel must see the
+        RHesident #NNNN it already knows, or a released request reads as a brand new
+        person asking for help.
+        """
+        session_id = doc['session_id']
+        svc = get_service(doc.get('service'))
+        anon = (doc.get('anonymous_user_id')
+                or self._generate_anonymous_id(svc.anon_prefix))
+        used_anonymous_ids.add(anon)
+        user_id = doc.get('user_id')
+
+        queue_entries[session_id] = {
+            'user_id': user_id,
+            # The description exists ONLY on the document -- active_sessions has never
+            # carried one -- which is why /release requires Mongo at all.
+            'description': doc.get('description') or '',
+            'created_at': ensure_aware_utc(doc.get('created_at')) or utcnow(),
+            'waiting_since': ensure_aware_utc(doc.get('waiting_since')) or utcnow(),
+            'anonymous_id': anon,
+            'message_id': None,
+            'channel_id': None,
+            'service': svc.key,
+            'routing': routing,
+            'target_member_id': None,
+            'directed_at': None,
+            'directed_message_id': None,
+            'notice_channel_id': None,
+            'notice_message_id': None,
+            'declined_by': list(doc.get('declined_by') or []),
+            'released': True,
+        }
+        if user_id is not None:
+            user_to_queue_map[user_id] = session_id
+        if routing == 'open' and session_id not in queue_order:
+            queue_order.append(session_id)
+        return session_id
+
+    async def route_to_open_queue(self, queue_id: str) -> bool:
+        """The requester chose to ask anyone who's free.
+
+        Allowed from 'directed' as well as 'choosing', and deliberately so: the
+        alternative locks somebody in distress behind one person's 24-hour silence
+        with no exit but /cancel and retyping everything. It is their own choice, so
+        it is not the automatic reroute that must never happen.
+        """
+        entry = queue_entries.get(queue_id)
+        if entry is None:
+            return False
+
+        routing = entry.get('routing') or 'open'
+        if routing not in ('choosing', 'directed'):
+            return False
+
+        if routing == 'directed':
+            target = entry.get('target_member_id')
+            if target is None:
+                return False
+            if not await self.undirect(queue_id, target, reason='rerouted',
+                                       notify_member=False):
+                return False
+
+        # Before the first await: a double tap finds routing already 'open' and bails.
+        entry['routing'] = 'open'
+
+        # POST FIRST, FLIP MONGO SECOND. The reverse can leave a live 'open' row with
+        # no channel post -- invisible to every member until it expires, i.e. a person
+        # waiting for a message that never comes.
+        posted, _error_type = await self.post_queue_to_channel(queue_id)
+        if not posted:
+            entry['routing'] = 'choosing'
+            return False
+
+        if db_mgr.db_available:
+            try:
+                if not db_mgr.open_session(queue_id):
+                    # Not fatal: claim_session filters on status, not routing, so the
+                    # request still works. Only rehydration would get it wrong.
+                    logger.warning("Could not flip session %s to routing 'open'", queue_id)
+            except Exception as exc:
+                logger.warning("Error flipping session %s to routing 'open': %s",
+                               queue_id, exc)
+
+        entry['waiting_since'] = utcnow()
+        if queue_id not in queue_order:
+            queue_order.append(queue_id)
+
+        requester = entry.get('user_id')
+        if requester:
+            user_states[requester] = UserState.IN_QUEUE
+            picker_views.pop(requester, None)
+            try:
+                await self.bot.send_message(chat_id=requester,
+                                            text=MESSAGES["queue_added"])
+            except Exception as exc:
+                logger.warning("Could not confirm the open queue to %s: %s",
+                               requester, exc)
+        return True
+
     def is_user_in_queue(self, user_id: int) -> bool:
         """Check if user is already in queue - O(1) lookup"""
         return user_id in user_to_queue_map
@@ -445,12 +1045,30 @@ class QueueManager:
 
         # Close the Mongo row. Without this a cancelled request stays status='pending'
         # forever and would be resurrected by rehydration on the next restart.
+        #
+        # The open lane deliberately IGNORES this return value and keeps its ordering
+        # exactly as it was: the only person messaged is the requester, and they are
+        # the one who just pressed cancel.
+        closed = True
         if db_mgr.db_available:
+            closed = False
             try:
-                db_mgr.end_session(queue_id_to_remove, user_id, system_end=False,
-                                   end_reason='user_cancelled')
+                closed = db_mgr.end_session(queue_id_to_remove, user_id, system_end=False,
+                                            end_reason='user_cancelled')
             except Exception as exc:
                 logger.warning("Could not close cancelled queue row %s: %s",
                                queue_id_to_remove, exc)
+
+        # Directed tail. This one IS gated on winning the close, because it touches a
+        # THIRD PARTY's chat: if a supporter accepted in the same instant, end_session
+        # returns False and their live conversation must not have its DM defaced.
+        if closed and (queue_entry.get('routing') or 'open') == 'directed':
+            target = queue_entry.get('target_member_id')
+            if target is not None:
+                directed_by_member.pop(target, None)
+            await self._strip_directed_buttons(queue_entry, target)
+            await self._update_directed_notice(queue_entry, 'closed')
+
+        picker_views.pop(user_id, None)
 
         return True, "success"

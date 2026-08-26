@@ -28,6 +28,22 @@ from config import (
 # so "Heartfelt", "HeaRHtfelt" and "HEARTFELT" are all covered.
 STALE_BRAND_TOKENS = ("heartfelt", "hearhtfelt")
 
+# Words that must never appear in anything the REQUESTER reads about a supporter.
+# A decline and a 24-hour silence are the same event to them; a release is not
+# something that was done to them. See D24 and D28.
+BLAME_WORDS = ("declin", "rejected", "dropped", "abandoned", "gave up",
+               "turned you down", "said no", "left you", "walked")
+
+# Requester-facing keys added by Phases 5 and 6. released_* is matched by prefix as
+# well, so a key added later is covered without editing this list.
+NO_BLAME_KEYS = (
+    "comfort_question", "comfort_specific_button", "comfort_anyone_button",
+    "picker_nobody_free", "picker_lost_view", "picker_not_a_number",
+    "picker_busy", "picker_unreachable", "picker_header", "picker_hint",
+    "directed_sent", "directed_unavailable", "next_step_question",
+    "directed_status", "choosing_status", "choosing_expired", "directed_gone",
+)
+
 
 def test_welcome_is_rebranded():
     welcome = MESSAGES["welcome"]
@@ -118,6 +134,52 @@ def test_session_warning_is_a_duration_template():
     assert "{" not in rendered
 
 
+def test_requester_facing_copy_never_blames_a_supporter():
+    """The single most important copy rule in this feature.
+
+    "{name} isn't free right now" is the ONLY wording for both a decline and a
+    24-hour silence. Anything that distinguishes the two turns a supporter's
+    completely legitimate "not tonight" into a rejection the requester carries.
+    """
+    keys = [k for k in NO_BLAME_KEYS if k in MESSAGES]
+    keys += [k for k in MESSAGES if k.startswith("released_")]
+    assert len(keys) >= 15, (
+        "far fewer requester-facing keys than expected (%d); this scan would be "
+        "nearly vacuous: %s" % (len(keys), sorted(keys)))
+    for key in keys:
+        lowered = MESSAGES[key].lower()
+        for word in BLAME_WORDS:
+            assert word not in lowered, (
+                f"MESSAGES[{key!r}] is requester-facing and says {word!r}. A decline "
+                "and a silence must be indistinguishable, and a release is not "
+                f"something that was done to them. Value: {MESSAGES[key]!r}")
+
+
+def test_phase_five_and_six_templates_render():
+    """Every template with a slot renders, and leaves nothing unrendered behind."""
+    rendered = {
+        "directed_unavailable": MESSAGES["directed_unavailable"].format(name="Alex"),
+        "directed_status": MESSAGES["directed_status"].format(name="Alex"),
+        "directed_sent": MESSAGES["directed_sent"].format(name="Alex"),
+        "picker_page": MESSAGES["picker_page"].format(page=2, pages=3),
+        "directed_request": MESSAGES["directed_request"].format(
+            description="a thing", window="24 hours"),
+    }
+    for key, text in rendered.items():
+        assert "{" not in text and "}" not in text, (key, text)
+        assert text.strip(), key
+    assert "Alex" in rendered["directed_unavailable"]
+    assert "Page 2 of 3" == rendered["picker_page"]
+
+
+def test_member_addendum_names_the_member_only_commands():
+    """These three are deliberately absent from set_my_commands -- that menu is the
+    requester's surface -- so this addendum is the ONLY way a supporter finds them."""
+    addendum = MESSAGES["member_addendum"]
+    for command in ("/available", "/unavailable", "/release"):
+        assert command in addendum, (command, addendum)
+
+
 def test_bot_command_menu():
     import main
     assert [c.command for c in main.BOT_COMMANDS] == ["chat", "status", "cancel", "end"]
@@ -137,8 +199,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 10, (
-        "expected at least 10 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 13, (
+        "expected at least 13 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

@@ -19,6 +19,7 @@ from config import (
     ServiceType,
     UserState,
     active_sessions,
+    directed_by_member,
     get_service,
     queue_entries,
     queue_order,
@@ -43,6 +44,11 @@ def _empty_stats(**overrides) -> Dict[str, Any]:
         'pending_restored': 0,
         'pending_skipped': 0,
         'pending_stale_closed': 0,
+        # Broken out of pending_restored (they are a SUBSET of it, not extra) so the
+        # R4 dry-run readout says how many people are mid-pick and how many are
+        # sitting with one named supporter.
+        'pending_choosing': 0,
+        'pending_directed': 0,
         'active_restored': 0,
         'active_skipped': 0,
     }
@@ -94,10 +100,12 @@ def restore_state(queue_manager, session_manager) -> Dict[str, Any]:
         return stats
 
     logger.info(
-        "🔄 Rehydration%s: %d pending restored, %d pending stale-closed, %d pending skipped, "
+        "🔄 Rehydration%s: %d pending restored (%d choosing, %d directed), "
+        "%d pending stale-closed, %d pending skipped, "
         "%d active restored, %d active skipped",
         " [DRY RUN]" if dry_run else "",
-        stats['pending_restored'], stats['pending_stale_closed'], stats['pending_skipped'],
+        stats['pending_restored'], stats['pending_choosing'], stats['pending_directed'],
+        stats['pending_stale_closed'], stats['pending_skipped'],
         stats['active_restored'], stats['active_skipped'],
     )
     return stats
@@ -228,13 +236,40 @@ def _restore_pending(docs, queue_manager, stats, dry_run) -> None:
             stats['pending_skipped'] += 1
             continue
 
+        # TWO variables, two jobs. `created` is immutable: it feeds entry['created_at']
+        # and the channel post's "Requested:" line. `waiting` is the requester's wait
+        # budget, restarted every time the decision is handed back to them. Measuring
+        # the stale horizon against created_at instead would silently close, at boot,
+        # an old request that was re-picked five minutes ago -- see mutation M18.
         created = ensure_aware_utc(doc.get('created_at'))
-        if created is None:
-            age_minutes = 0.0
-        else:
-            age_minutes = (now - created).total_seconds() / 60.0
+        waiting = ensure_aware_utc(doc.get('waiting_since')) or created
+        age_minutes = (now - waiting).total_seconds() / 60.0 if waiting else 0.0
 
-        horizon = svc.queue_expire_minutes + config.STALE_NOTIFY_GRACE_MINUTES
+        # A DIRECTED row is on a DIFFERENT CLOCK and must be judged against it.
+        # waiting_since is the requester's queue budget; a directed request's budget is
+        # directed_response_minutes measured from directed_at, and the two diverge by
+        # however long the requester spent at the picker before choosing. Judging a
+        # directed row by the queue horizon silently closes, at boot, a request whose
+        # supporter still has time left to accept -- the requester is told nothing and
+        # the Accept button in the supporter's DM goes dead. With the base Service
+        # defaults (queue_expire_minutes=60 vs directed_response_minutes=1440) that
+        # would be EVERY directed request more than three hours old, on every restart.
+        #
+        # Past this horizon nothing is sent either way: sweep_directed_requests owns
+        # the directed lane end to end and has its own, identical, silent horizon.
+        stale_routing = doc.get('routing') or 'open'
+        if stale_routing == 'directed':
+            budget = svc.directed_response_minutes
+            directed_ref = ensure_aware_utc(doc.get('directed_at'))
+            if directed_ref is not None and directed_ref <= now:
+                age_minutes = (now - directed_ref).total_seconds() / 60.0
+            # An unusable directed_at falls back to waiting_since against the DIRECTED
+            # budget: still generous enough not to destroy a live request, still
+            # bounded so a corrupt clock cannot resurrect an ancient row forever.
+        else:
+            budget = svc.queue_expire_minutes
+
+        horizon = budget + config.STALE_NOTIFY_GRACE_MINUTES
         if age_minutes > horizon:
             # Do NOT restore and do NOT notify. Because cleanup_expired_queues and
             # remove_from_queue never closed their Mongo rows before this branch existed,
@@ -254,25 +289,97 @@ def _restore_pending(docs, queue_manager, stats, dry_run) -> None:
             continue
 
         anon = doc.get('anonymous_user_id') or queue_manager._generate_anonymous_id(svc.anon_prefix)
+        routing = doc.get('routing') or 'open'
+        if routing not in ('open', 'choosing', 'directed'):
+            logger.warning("Pending %s has unknown routing %r; treating it as 'open'",
+                           sid, routing)
+            routing = 'open'
 
-        queue_entries[sid] = {
+        entry = {
             'user_id': user_id,
             'description': doc.get('description') or '',
             'created_at': created or now,
+            'waiting_since': waiting or created or now,
             'anonymous_id': anon,
             'message_id': doc.get('queue_message_id'),
             'channel_id': doc.get('queue_channel_id') or svc.channel_id,
             'service': svc.key,
+            'routing': routing,
+            'target_member_id': None,
+            'directed_at': None,
+            'directed_message_id': doc.get('directed_message_id'),
+            'notice_channel_id': doc.get('notice_channel_id'),
+            'notice_message_id': doc.get('notice_message_id'),
+            'declined_by': list(doc.get('declined_by') or []),
             'restored': True,
         }
+
+        if routing == 'directed':
+            target = doc.get('target_member_id')
+            try:
+                target = int(target)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Pending %s is routed 'directed' but its target_member_id is %r; "
+                    "downgrading to 'choosing' so the requester is asked again rather "
+                    "than waiting on nobody", sid, doc.get('target_member_id'))
+                target = None
+                routing = 'choosing'
+                entry['routing'] = 'choosing'
+
+            if target is not None and target in directed_by_member:
+                # Should be unreachable: available_supporters() excludes anyone already
+                # in this index, so two live requests cannot name the same supporter.
+                # Keep the OLDER one (docs arrive created_at ASC) and say so loudly.
+                logger.warning(
+                    "Pending %s targets member %s who already holds request %s; "
+                    "leaving the index pointing at the older one", sid, target,
+                    directed_by_member[target])
+                # No rebinding here: the setdefault below is what keeps the older one.
+
+            if entry['routing'] == 'directed':
+                directed_at = ensure_aware_utc(doc.get('directed_at'))
+                if directed_at is None or directed_at > now:
+                    # FAIL TOWARD WAITING, never toward a spurious lapse-DM at boot: an
+                    # unusable clock must not read as "this has been silent for a day".
+                    logger.warning(
+                        "Pending %s has an unusable directed_at (%r); treating it as "
+                        "just sent", sid, doc.get('directed_at'))
+                    directed_at = utcnow()
+                entry['target_member_id'] = target
+                entry['directed_at'] = directed_at
+
+        queue_entries[sid] = entry
         user_to_queue_map[user_id] = sid
-        queue_order.append(sid)
-        user_states[user_id] = UserState.IN_QUEUE
         used_anonymous_ids.add(anon)
+        routing = entry['routing']
+
+        if routing == 'open':
+            # Today's path, verbatim. get_pending_sessions sorts created_at ASC, so
+            # appending here preserves FIFO across a restart.
+            queue_order.append(sid)
+            user_states[user_id] = UserState.IN_QUEUE
+        elif routing == 'choosing':
+            # NOT in queue_order: a request nobody outside this chat can see has no
+            # queue position. And do NOT re-send the picker -- the buttons already in
+            # the requester's chat are still live and resolve through user_to_queue_map.
+            # Re-sending would DM every mid-pick requester on every single restart.
+            user_states[user_id] = UserState.CHOOSING_SUPPORTER
+            stats['pending_choosing'] += 1
+        else:  # 'directed'
+            # IN_QUEUE, not CHOOSING_SUPPORTER: they ARE waiting, on one named person.
+            user_states[user_id] = UserState.IN_QUEUE
+            # Deliberately NOT touching user_states[target]. A supporter holding a
+            # directed request is not IN_QUEUE -- that state means "I asked for help",
+            # and setting it would make /chat tell them they are already queued.
+            # Their availability comes from directed_by_member, nothing else.
+            if entry['target_member_id'] is not None:
+                directed_by_member.setdefault(entry['target_member_id'], sid)
+            stats['pending_directed'] += 1
 
         stats['pending_restored'] += 1
         # Anything already past its window is restored anyway: the sweep_expired_queues()
         # pass main() runs before polling starts expires it and sends one correctly-timed
         # notification, through the same code path as a live expiry.
-        logger.info("Restored pending %s (user %s, service %s, age %.1f min)",
-                    sid, user_id, svc.key, age_minutes)
+        logger.info("Restored pending %s (user %s, service %s, routing %s, age %.1f min)",
+                    sid, user_id, svc.key, routing, age_minutes)
