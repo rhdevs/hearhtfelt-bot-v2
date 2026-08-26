@@ -80,6 +80,23 @@ def test_per_service_timers():
         assert 0 < svc.session_warning_minutes < svc.session_timeout_minutes, svc.key
 
 
+def test_directed_support_is_a_pss_feature_only():
+    hf, pss = SERVICES["hf"], SERVICES["pss"]
+    assert hf.directed_enabled is False, (
+        "HF must never offer the picker: its supporters are not curated with display "
+        "names and its channel is the only routing it has")
+    assert pss.directed_enabled is True
+    assert pss.directed_response_minutes == 1440
+    assert pss.picker_page_size == 8
+    for svc in SERVICES.values():
+        # A page size of 0 renders an empty picker -- a dead end with no way out
+        # but /cancel -- and a negative one raises on the slice.
+        assert svc.picker_page_size >= 1, svc.key
+        assert svc.directed_response_minutes > 0, svc.key
+        assert isinstance(svc.closing_extra, str), svc.key
+        assert isinstance(svc.closing_extra_member, str), svc.key
+
+
 def test_back_compat_aliases_mirror_hf():
     hf = SERVICES["hf"]
     assert config.QUEUE_EXPIRE_MINUTES == hf.queue_expire_minutes
@@ -111,8 +128,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 11, (
-        "expected at least 11 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 12, (
+        "expected at least 12 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

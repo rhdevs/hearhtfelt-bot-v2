@@ -211,6 +211,12 @@ def pending_doc(sid, user_id, age_minutes, service="hf", **extra):
         'description': 'I could use someone to talk to',
         'anonymous_user_id': f'RHesident #{user_id % 10000}',
         'created_at': created,
+        # Phase 5 additions, defaulted to exactly what a pre-Phase-5 document
+        # behaves like, so every case above this line is unaffected: routing 'open'
+        # is the old single lane, and waiting_since == created_at is the old single
+        # clock. Cases (ac)-(ae) override them via **extra.
+        'routing': 'open',
+        'waiting_since': created,
         'last_activity_at': created,
         'claimed_at': None,
         'heartfelt_member_id': None,
@@ -893,39 +899,155 @@ def case_ab_restore_enabled_false_is_a_true_no_op():
     print("OK  ab. RESTORE_ENABLED=false reads nothing and restores nothing")
 
 
+def case_ac_choosing_is_restored_off_the_queue():
+    """A requester who was mid-pick when the bot restarted keeps their request, keeps
+    their state, and is NOT re-sent the picker: the buttons already in their chat are
+    still live. Re-sending would DM every mid-pick requester on every restart."""
+    reset_state()
+    stub = StubDB([pending_doc("p-ac", 7601, 5, service="pss", routing="choosing")])
+    bot, sm, qm, em, _ = build(stub)
+
+    stats = restore_state(qm, sm)
+
+    assert stats['pending_restored'] == 1, stats
+    assert stats['pending_choosing'] == 1, stats
+    assert stats['pending_directed'] == 0, stats
+    entry = config.queue_entries["p-ac"]
+    assert entry['routing'] == 'choosing'
+    assert config.user_states[7601] == UserState.CHOOSING_SUPPORTER
+    assert config.user_to_queue_map[7601] == "p-ac"
+    assert config.queue_order == [], (
+        "a request nobody outside the chat can see has no queue position")
+    assert config.picker_views == {}, (
+        "picker_views is deliberately NOT persisted: after a restart there is no "
+        "rendered view, so a typed number must re-render rather than select "
+        "somebody the requester never saw")
+    assert bot.sent == [], "rehydration sends nothing"
+    print("OK  ac. a mid-pick request is restored off the queue, with no picker re-sent")
+
+
+async def case_ad_directed_is_restored_with_its_index():
+    """A request sitting with one supporter keeps its target, and the supporter's own
+    state is left completely alone."""
+    reset_state()
+    directed_at = utcnow() - datetime.timedelta(minutes=5)
+    stub = StubDB([pending_doc("p-ad", 7602, 30, service="pss", routing="directed",
+                               target_member_id=PSS_MEMBER, directed_at=directed_at,
+                               directed_message_id=555, declined_by=[9999])])
+    bot, sm, qm, em, _ = build(stub)
+
+    stats = restore_state(qm, sm)
+
+    assert stats['pending_directed'] == 1, stats
+    entry = config.queue_entries["p-ad"]
+    assert entry['routing'] == 'directed'
+    assert entry['target_member_id'] == PSS_MEMBER
+    assert entry['directed_message_id'] == 555
+    assert entry['declined_by'] == [9999]
+    assert config.directed_by_member[PSS_MEMBER] == "p-ad"
+    assert config.user_states[7602] == UserState.IN_QUEUE, (
+        "the REQUESTER is waiting -- on one named person, but waiting")
+    assert PSS_MEMBER not in config.user_states, (
+        "a supporter HOLDING a request is not IN_QUEUE -- that state means 'I asked "
+        "for help', and setting it would make /chat tell them they are already "
+        "queued. Their availability comes from directed_by_member and nothing else")
+    assert config.queue_order == []
+
+    # Five minutes in, nothing has lapsed and nobody is messaged.
+    assert await qm.sweep_directed_requests() == []
+    assert bot.sent == [], bot.sent
+    assert config.queue_entries["p-ad"]['routing'] == 'directed'
+    print("OK  ad. a directed request is restored with its index, and its target is left alone")
+
+
+def case_ae_an_old_request_repicked_recently_survives_boot():
+    """M18. `created_at` is immutable and feeds the channel post's "Requested:" line;
+    `waiting_since` is the wait budget and restarts every time the decision is handed
+    back. Measuring the boot horizon against created_at silently closes, at boot, a
+    request that was re-picked five minutes ago."""
+    reset_state()
+    doc = pending_doc("p-ae", 7603, 1700, service="pss", routing="choosing")
+    doc['waiting_since'] = utcnow() - datetime.timedelta(minutes=5)
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+
+    horizon = (config.get_service("pss").queue_expire_minutes
+               + config.STALE_NOTIFY_GRACE_MINUTES)
+    assert 1700 > horizon, (
+        "the fixture must be older than the horizon, or this case proves nothing")
+
+    stats = restore_state(qm, sm)
+
+    assert stats['pending_stale_closed'] == 0, (
+        "measured from waiting_since this request is five minutes old", stats)
+    assert stats['pending_restored'] == 1, stats
+    assert stub.end_reason_for("p-ae") is None, stub.ended
+    assert "p-ae" in config.queue_entries
+    assert config.queue_entries["p-ae"]['created_at'] == doc['created_at'], (
+        "created_at stays immutable -- it is what the channel post's Requested: "
+        "line renders")
+    print("OK  ae. an old request re-picked five minutes ago is not stale-closed at boot")
+
+
 # --------------------------------------------------------------------------- runner
+CASES = [
+    case_a_happy_pending,
+    case_b_fifo,
+    case_c_legacy_doc_without_message_id,
+    case_d_naive_created_at,
+    case_e_expired_during_deploy,
+    case_f_ancient_pending,
+    case_g_pss_pending_not_expired,
+    case_h_happy_active,
+    case_i_active_without_claimer,
+    case_j_pending_and_active_same_user,
+    case_k_db_unavailable,
+    case_l_pending_query_raises,
+    case_m_circuit_breaker,
+    case_n_dry_run,
+    case_o_claim_on_restored_entry,
+    case_p_shared_anon_set,
+    case_q_p0_regression_no_notification_storm,
+    case_r_db_fallback_respects_each_service_window,
+    case_s_ancient_active_sessions_are_closed_silently,
+    case_t_recently_dead_sessions_still_notify,
+    case_u_exactly_once_across_two_instances,
+    case_v_end_session_return_is_a_commit_signal,
+    case_w_claim_is_atomic_against_the_cleanup_loop,
+    case_x_expired_sweep_stays_quiet_if_row_closed_elsewhere,
+    case_y_only_users_still_in_queue_are_told,
+    case_z_inactivity_warning_fires_once_not_every_sweep,
+    case_aa_activity_rearms_the_warning,
+    case_ab_restore_enabled_false_is_a_true_no_op,
+    case_ac_choosing_is_restored_off_the_queue,
+    case_ad_directed_is_restored_with_its_index,
+    case_ae_an_old_request_repicked_recently_survives_boot,
+]
+
+
 async def run():
-    case_a_happy_pending()
-    case_b_fifo()
-    await case_c_legacy_doc_without_message_id()
-    case_d_naive_created_at()
-    await case_e_expired_during_deploy()
-    await case_f_ancient_pending()
-    await case_g_pss_pending_not_expired()
-    case_h_happy_active()
-    case_i_active_without_claimer()
-    case_j_pending_and_active_same_user()
-    case_k_db_unavailable()
-    case_l_pending_query_raises()
-    await case_m_circuit_breaker()
-    case_n_dry_run()
-    await case_o_claim_on_restored_entry()
-    case_p_shared_anon_set()
-    await case_q_p0_regression_no_notification_storm()
-    await case_r_db_fallback_respects_each_service_window()
-    await case_s_ancient_active_sessions_are_closed_silently()
-    await case_t_recently_dead_sessions_still_notify()
-    await case_u_exactly_once_across_two_instances()
-    case_v_end_session_return_is_a_commit_signal()
-    await case_w_claim_is_atomic_against_the_cleanup_loop()
-    await case_x_expired_sweep_stays_quiet_if_row_closed_elsewhere()
-    await case_y_only_users_still_in_queue_are_told()
-    await case_z_inactivity_warning_fires_once_not_every_sweep()
-    await case_aa_activity_rearms_the_warning()
-    case_ab_restore_enabled_false_is_a_true_no_op()
+    # A list, not 28 hand-written call lines: a case that gets defined but never
+    # added to a hand-written runner is invisible, and the length assertion in
+    # __main__ cannot see a call list at all.
+    for case in CASES:
+        result = case()
+        if asyncio.iscoroutine(result):
+            await result
 
 
 if __name__ == "__main__":
+    # A driver that discovers its own tests reports success when it discovers
+    # NOTHING. Verified: renaming the `test_` prefix in this file made it print
+    # "All 0 tests passed!" and exit 0 -- a fully green CI step, in front of a
+    # deploy to a live helpline, having run zero assertions. A refactor into a
+    # class, a rename, an import shadow or a bad merge all reach that state.
+    # Coverage here may grow; it may not silently shrink.
+    assert len(CASES) >= 31, (
+        "expected at least 31 cases, collected %d (%s). Test discovery has "
+        "regressed -- fix the discovery, do not lower this number."
+        % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
+    )
+
     real = (restore_mod.db_mgr, queue_mod.db_mgr, session_mod.db_mgr, expiry_mod.db_mgr)
     hf = config.SERVICES[ServiceType.HF.value]
     pss = config.SERVICES[ServiceType.PSS.value]
@@ -933,7 +1055,7 @@ if __name__ == "__main__":
     enable_both_services()
     try:
         asyncio.run(run())
-        print("\nAll restart-durability assertions passed!")
+        print("\nAll %d restart-durability assertions passed!" % len(CASES))
     finally:
         (restore_mod.db_mgr, queue_mod.db_mgr,
          session_mod.db_mgr, expiry_mod.db_mgr) = real
