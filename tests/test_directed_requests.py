@@ -657,7 +657,30 @@ async def case_j_a_failed_dm_rolls_everything_back():
     assert config.MESSAGES["picker_unreachable"] in text, text
     assert "Sup 00" not in text, "and the unreachable supporter is off the list"
     assert "Sup 01" in text
-    print("OK  j. a failed DM rolls back the row, clears has_started_bot and posts no note")
+
+    # THE REQUESTER MUST BE PUT BACK TOO. send_directed_request moves them to
+    # IN_QUEUE before the await; a rollback that returns the ROW to 'choosing' but
+    # leaves the PERSON in IN_QUEUE re-renders a picker that says "reply with its
+    # number" and then answers every number with the generic unknown-command string.
+    assert config.user_states[REQUESTER] == UserState.CHOOSING_SUPPORTER, (
+        "the row rolled back to 'choosing' but the requester did not",
+        config.user_states.get(REQUESTER))
+    assert entry['waiting_since'] is not None
+
+    # Prove it behaviourally, not just by the enum: the number the picker just told
+    # them to type must still select somebody.
+    before = stub.count('direct_session')
+    await handlers.handle_message(text_update(REQUESTER, "1", rec), ctx)
+    reply = rec.replies[-1][0]
+    assert reply != config.MESSAGES["unknown_command"], (
+        "the picker asked for a number and the bot answered 'I'm not sure what you "
+        "mean'", reply)
+    assert stub.count('direct_session') == before + 1, (
+        "a typed number after a failed send must reach the ONE send path", stub.calls)
+    assert config.queue_entries[queue_id]['target_member_id'] == supporter_id(1), (
+        "and it must select the supporter still on the list")
+    print("OK  j. a failed DM rolls back the row AND the requester, clears "
+          "has_started_bot and posts no note")
 
 
 async def case_k_accept_by_a_non_target_is_refused():

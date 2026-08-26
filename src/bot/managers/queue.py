@@ -625,11 +625,23 @@ class QueueManager:
             entry['target_member_id'] = None
             entry['directed_at'] = None
             entry['directed_message_id'] = None
+            # undirect_session also reset waiting_since; mirror it or memory expires
+            # this request on a clock Mongo no longer agrees with.
+            entry['waiting_since'] = utcnow()
             directed_by_member.pop(member_int, None)
             # Keep memory in step with what undirect_session just wrote, so the
             # re-rendered picker does not offer the same unreachable person again.
             if member_int not in declined:
                 entry['declined_by'] = list(entry.get('declined_by') or []) + [member_int]
+            # AND PUT THE REQUESTER BACK. The state was moved to IN_QUEUE before the
+            # await; rolling the row back to 'choosing' without rolling this back
+            # leaves them staring at a re-rendered picker that says "reply with its
+            # number" while handle_message answers every number they type with the
+            # generic unknown-command string. The buttons keep working, so nothing
+            # looks broken -- it just silently stops listening. Every other
+            # directed -> choosing path (undirect) restores this; so must the rollback.
+            if requester_id:
+                user_states[requester_id] = UserState.CHOOSING_SUPPORTER
 
             lowered = str(exc).lower()
             if ("bot can't initiate" in lowered
