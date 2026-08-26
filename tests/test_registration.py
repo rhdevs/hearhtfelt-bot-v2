@@ -25,6 +25,7 @@ Run directly: `python tests/test_registration.py`
 import asyncio
 import contextlib
 import datetime
+import io
 import logging
 import os
 import sys
@@ -1230,9 +1231,30 @@ async def case_ab_the_cli_renders_a_malformed_row_without_raising():
     }
     stub.initialize = lambda: True
 
-    utils_mod.manage_registrations('list', status='pending')
-    utils_mod.manage_registrations('list', status='approved')
+    # Captured, for two reasons. First, so the case can assert what was actually
+    # RENDERED rather than only that nothing raised -- "renders a malformed row"
+    # is the claim in the name, and reaching the list branch does not prove it.
+    # Second, utils.py prints emoji, which is house style there, and writing
+    # them to a console whose encoding is not UTF-8 raises UnicodeEncodeError
+    # from print() itself. Uncaptured, this suite was the only one of the
+    # thirteen that could not run on a stock Windows console, which is a red
+    # gate for a reason that has nothing to do with the code under test.
+    dump = io.StringIO()
+    with contextlib.redirect_stdout(dump):
+        utils_mod.manage_registrations('list', status='pending')
+        utils_mod.manage_registrations('list', status='approved')
+    listing = dump.getvalue()
     assert stub.called('list_registrations'), stub.calls
+    assert '--/-- --:--' in listing, (
+        "the malformed created_at must fall back rather than kill the dump: %r"
+        % (listing,))
+    assert '4242' in listing and 'broken' in listing, (
+        "the malformed row must still be printed: %r" % (listing,))
+    assert '@hopeful' in listing and 'Ada' in listing, (
+        "the good row must render its name and username: %r" % (listing,))
+    assert "No registrations found for status 'approved'." in listing, (
+        "an empty status must say so rather than print a bare header: %r"
+        % (listing,))
 
     # The baseline is sampled BEFORE the id-less call, deliberately. Sampling it
     # after would make this pair of assertions self-neutralising: a regression
@@ -1242,11 +1264,15 @@ async def case_ab_the_cli_renders_a_malformed_row_without_raising():
     # guard deleted and the old ordering, the whole thirteen-suite gate stayed
     # green.
     closes_before = stub.count('close_registration')
-    utils_mod.manage_registrations('close')            # no id -> refused, no call
-    assert stub.count('close_registration') == closes_before, (
-        "`registrations --action close` with no --registration-id must refuse "
-        "BEFORE it touches the database: %r" % (stub.calls,))
-    utils_mod.manage_registrations('close', registration_id=doc['registration_id'])
+    closes = io.StringIO()
+    with contextlib.redirect_stdout(closes):
+        utils_mod.manage_registrations('close')        # no id -> refused, no call
+        assert stub.count('close_registration') == closes_before, (
+            "`registrations --action close` with no --registration-id must "
+            "refuse BEFORE it touches the database: %r" % (stub.calls,))
+        utils_mod.manage_registrations(
+            'close', registration_id=doc['registration_id'])
+    assert '--registration-id is required' in closes.getvalue(), closes.getvalue()
     assert stub.count('close_registration') == closes_before + 1, stub.calls
     assert stub.regs[doc['registration_id']]['status'] == 'closed', doc
     print("OK  ab. the CLI renders a malformed row without raising, and closes a row")
