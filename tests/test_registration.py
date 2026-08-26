@@ -1400,6 +1400,55 @@ async def case_ae_the_real_mongo_filter_names_the_state_it_leaves():
 
 
 # --------------------------------------------------------------------------- runner
+async def case_af_a_switched_off_track_says_so_on_its_button():
+    """A non-runnable track still accepts approvals, but nothing is posted to its
+    queue -- so an approved supporter would be told they can claim and then find
+    nothing to claim. The approver must be able to see that on the button.
+
+    Admin-facing only: the callback_data is unchanged (so approving still works and
+    every other case's callback string still matches) and NO applicant-facing copy
+    differs. Reproduces the deployed shape of the trap: PSS switched off while HF
+    stays live, which is exactly what HANDOFF's PSS rollback procedure produces.
+    """
+    bot, handlers, stub = setup()
+    pss = config.SERVICES[ServiceType.PSS.value]
+    hf = config.SERVICES[ServiceType.HF.value]
+    pss.enabled = False                      # the documented rollback
+    assert not pss.runnable and hf.runnable, "fixture must switch off exactly one track"
+
+    markup = handlers._registration_keyboard("rid-af")
+    buttons = [b for row in markup.inline_keyboard for b in row]
+    by_data = {b.callback_data: b.text for b in buttons}
+
+    hf_data = f"{config.CB_REG_APPROVE}:rid-af:{hf.key}"
+    pss_data = f"{config.CB_REG_APPROVE}:rid-af:{pss.key}"
+
+    # The callback_data must NOT change -- approving a switched-off track is still
+    # how a roster gets built before launch (see _registration_keyboard's docstring).
+    assert hf_data in by_data, f"the runnable track lost its button: {list(by_data)}"
+    assert pss_data in by_data, (
+        f"a switched-off track must still be approvable, only marked: {list(by_data)}")
+
+    offline_marker = MESSAGES["registration_approve_button_offline"].format(
+        member=pss.member_label)
+    live_marker = MESSAGES["registration_approve_button"].format(member=hf.member_label)
+    assert by_data[pss_data] == offline_marker, (
+        f"the switched-off track must say so on its button, got {by_data[pss_data]!r}")
+    assert by_data[hf_data] == live_marker, (
+        f"the live track must be unmarked, got {by_data[hf_data]!r}")
+
+    # And the applicant is told nothing different -- approving still works, and the
+    # message they receive comes from MESSAGES verbatim as every other case asserts.
+    await do_register(handlers, bot)
+    doc = sole_registration(stub)
+    before = len(bot.texts_to(APPLICANT))
+    await tap(handlers, bot, A1, approve_data(doc['registration_id'], pss.key))
+    sent = bot.texts_to(APPLICANT)[before:]
+    assert len(sent) == 1, f"exactly one message to the applicant, got {sent}"
+    assert sent[0] == MESSAGES["registration_approved"].format(member=pss.member_label), (
+        "the applicant's copy must be untouched by the admin-facing marker")
+
+
 CASES = [
     case_a_an_empty_allowlist_makes_register_indistinguishable_from_nothing,
     case_b_an_inert_bot_refuses_every_registration_tap,
@@ -1432,6 +1481,7 @@ CASES = [
     case_ac_an_admin_can_never_decide_their_own_request,
     case_ad_the_allowlist_parser_drops_exactly_what_it_should,
     case_ae_the_real_mongo_filter_names_the_state_it_leaves,
+    case_af_a_switched_off_track_says_so_on_its_button,
 ]
 
 
@@ -1449,7 +1499,7 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 31, (
+    assert len(CASES) >= 32, (
         "expected at least 31 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")

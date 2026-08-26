@@ -870,6 +870,11 @@ MESSAGES = {
         "the list people choose from until someone sets a display name."
     ),
     "registration_approve_button": "✅ Approve as {member}",
+    # Admin-facing only. A track with no channel, or switched off, still accepts
+    # approvals -- that is how a roster gets built before launch -- but nothing is
+    # posted to its queue, so an approved supporter would have nothing to claim.
+    # The approver needs to see that; the applicant's copy is deliberately untouched.
+    "registration_approve_button_offline": "✅ Approve as {member} (track is off)",
     "registration_reject_button": "🚫 Not now",
     "registration_already_handled": "Someone has already handled this one.",
     "registration_gone": "That request is no longer available.",

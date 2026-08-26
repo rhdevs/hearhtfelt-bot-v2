@@ -639,8 +639,16 @@ class BotHandlers:
         """
         rows = []
         for svc in sorted(SERVICES.values(), key=lambda s: s.key):
+            # A non-runnable track (switched off, or no channel) still accepts
+            # approvals, but nothing is posted to its queue -- so an approved
+            # supporter would be told they can claim and then find nothing to claim.
+            # Say so on the button. Admin-facing only; the applicant's copy and the
+            # callback_data are both unchanged, so approving is still possible and
+            # every existing test's callback string still matches.
+            label_key = ("registration_approve_button" if svc.runnable
+                         else "registration_approve_button_offline")
             rows.append([InlineKeyboardButton(
-                MESSAGES["registration_approve_button"].format(member=svc.member_label),
+                MESSAGES[label_key].format(member=svc.member_label),
                 callback_data=f"{CB_REG_APPROVE}:{registration_id}:{svc.key}")])
         rows.append([InlineKeyboardButton(
             MESSAGES["registration_reject_button"],
