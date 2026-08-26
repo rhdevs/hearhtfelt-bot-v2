@@ -500,7 +500,16 @@ def assert_no_decider_leak(bot, extra_names=(APPROVER_FIRST, APPROVER_USER)):
     Run from every case that sends the applicant anything, not only case (m):
     one leaked handle in one branch is the whole failure, and the branch that
     leaks is the one nobody thought to check.
+
+    SELF-GUARDING. Every one of this helper's call sites is on a path where a
+    decision was made and the applicant was therefore messaged, so an empty
+    list means the notification was lost, not that the scan is clean. Without
+    this assertion the entire scan below degrades to a silent no-op in exactly
+    the situation where somebody most needs to be told it broke.
     """
+    assert bot.texts_to(APPLICANT), (
+        "the leak scan was handed nothing to scan; a decision was made, so the "
+        "applicant must have been messaged: %r" % (bot.sent,))
     for text in bot.texts_to(APPLICANT):
         assert "@" not in text, (
             "an applicant-bound message contains '@', which is how a Telegram "
