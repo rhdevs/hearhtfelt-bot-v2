@@ -30,6 +30,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import sys
 from types import SimpleNamespace
 from typing import Optional
@@ -666,6 +667,74 @@ def _run_boot():
     return events, fakes, catcher
 
 
+# --------------------------------------------------------------------------- CI gate
+# The deploy job is `needs: test`, so this workflow file is the ONLY thing standing
+# between a red suite and a live mental-health helpline. It names its suites one
+# hard-coded step at a time, and nothing anywhere checked that the list was complete.
+#
+# A suite that is never invoked cannot go red. Add tests/test_foo.py, forget the
+# workflow line, and every future regression it would have caught ships green --
+# indistinguishable, from the outside, from a passing gate. The same happens on a
+# rename, or when a merge drops a step. This branch alone added three suites and
+# three hand-written steps; getting that right by hand is not a control.
+#
+# Deliberately excluded, and asserted to STAY excluded so the exclusion is a
+# decision rather than an oversight:
+CI_EXCLUDED_SUITES = {
+    # Requires a live Mongo (MONGODB_URI) and refuses to run without one. It is an
+    # operator tool, not a gate; running it in CI would either be a no-op or would
+    # hand the test job a database credential, which that job must never have.
+    "test_db_integration.py",
+}
+
+
+def _workflow_path():
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".github", "workflows", "deploy.yml")
+
+
+def test_every_suite_is_wired_into_the_deploy_gate():
+    """Every tests/test_*.py either runs in CI or is explicitly excluded here."""
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    on_disk = {f for f in os.listdir(tests_dir)
+               if f.startswith("test_") and f.endswith(".py")}
+    assert on_disk, "no suites found on disk -- discovery itself is broken"
+
+    workflow = _workflow_path()
+    assert os.path.isfile(workflow), (
+        "the deploy workflow is not where this guard looks (%s). If it moved, move "
+        "this check with it -- do not delete it." % workflow)
+
+    with open(workflow, encoding="utf-8") as fh:
+        body = fh.read()
+
+    invoked = set(re.findall(r"run:\s*python\s+tests/(test_\w+\.py)", body))
+
+    missing = sorted(on_disk - invoked - CI_EXCLUDED_SUITES)
+    assert not missing, (
+        "these suites exist but NOTHING runs them in CI, so they can never fail a "
+        "deploy: %s. Add a step to .github/workflows/deploy.yml, or add the file to "
+        "CI_EXCLUDED_SUITES with the reason." % ", ".join(missing))
+
+    phantom = sorted(invoked - on_disk)
+    assert not phantom, (
+        "the workflow runs suites that do not exist: %s. `python` on a missing file "
+        "exits non-zero, so this is a permanently red gate, not a silent one -- but "
+        "fix the name." % ", ".join(phantom))
+
+    still_excluded = sorted(CI_EXCLUDED_SUITES & invoked)
+    assert not still_excluded, (
+        "%s is listed as deliberately excluded but the workflow runs it. Pick one."
+        % ", ".join(still_excluded))
+
+    stale = sorted(CI_EXCLUDED_SUITES - on_disk)
+    assert not stale, (
+        "CI_EXCLUDED_SUITES names files that no longer exist: %s. A stale exclusion "
+        "will silently forgive a future suite that happens to reuse the name."
+        % ", ".join(stale))
+
+
+
 if __name__ == "__main__":
     # main.py's boot logging is deliberately chatty; keep the test output readable
     # without hiding the ERROR record that a swallowed boot failure produces.
@@ -679,8 +748,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 14, (
-        "expected at least 14 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 15, (
+        "expected at least 15 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )
