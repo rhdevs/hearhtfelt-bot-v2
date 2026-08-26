@@ -191,11 +191,14 @@ docker logs --since 2m heartfelt-bot | grep Rehydration
 ```
 
 The log line reads:
-`🔄 Rehydration [DRY RUN]: N pending restored, N pending stale-closed, N pending skipped, N active restored, N active skipped`
+`🔄 Rehydration [DRY RUN]: N pending restored (N choosing, N directed), N pending stale-closed, N pending skipped, N active restored, N active skipped`
 
 Confirm those numbers are plausible. `pending restored` is the number of people
 who would be brought back into the queue and, if already past their window, DMed.
-If it is larger than a handful, stop and investigate before going live. Then:
+The `(N choosing, N directed)` pair is a breakdown of that same `pending restored`
+count, not additional people on top of it: `choosing` is how many were mid-pick of
+a PSS supporter, `directed` is how many had already named one. If it is larger
+than a handful, stop and investigate before going live. Then:
 
 ```bash
 sed -i '/^RESTORE_DRY_RUN=/d' "$ENV"
@@ -233,7 +236,7 @@ warning. `tests/test_service_config.py` asserts the invariant.
 **R6 — CI now gates deploys.**
 The `test` job in `.github/workflows/deploy.yml` runs first, and
 `build-and-push` (and therefore `deploy`) `needs: test`, so a red suite blocks
-the deploy. It runs the nine suites listed in §6 below, in that order.
+the deploy. It runs the twelve suites listed in §6 below, in that order.
 `tests/test_db_integration.py` is deliberately excluded: it needs a live Mongo
 and it **writes documents** — there must never be a `MONGODB_URI` secret in the
 test job. It also now refuses to run at all unless `ALLOW_DB_INTEGRATION_TEST=1`
@@ -274,6 +277,49 @@ job), so a fork PR can run the gate safely.
   checked command names, so rewiring `filters.PHOTO` to `handle_sticker` stayed
   green. It now asserts the ordered (handler class, callback name) pairs.
 
+**R8 — PSS follow-up copy is env-supplied and empty by default.**
+`PSS_FOLLOWUP_NOTE` (appended to the SUPPORTER's closing message) and
+`PSS_CLOSING_NOTE` (appended to the REQUESTER's closing message) default to `""`,
+which makes every closing message byte-identical to today's. They are deliberately
+NOT written in the repo: inventing clinical follow-up instructions for a
+mental-health service is not a coding decision, and the stakeholder has not
+supplied wording. When wording arrives, set them in `.env.production` on the
+droplet — and note that `config.py` reads env at import, so the container must be
+RECREATED, not merely restarted, for a change to take effect.
+
+**R9 — `/end` is now REQUESTER-ONLY, on BOTH tracks, and `/release` is new. Tell
+the HF leads BEFORE this ships.** Today any party can `/end`. After this, a
+member who types `/end` gets a refusal pointing them at `/release`. This is a
+behaviour change for every existing HF member, and they will hit it the first time
+they try to close a conversation. `/release` hands the conversation back instead:
+the requester keeps their place and gets someone else, rather than being closed out.
+
+**R10 — supporters must press /start (or send the bot any private message) before
+they can be chosen.** Telegram forbids a bot messaging someone who has never
+messaged it, so `has_started_bot` is recorded from `/start` and from any private
+message by a roster member, and defaults to False. A supporter with the flag unset
+is invisible in the picker. Check with
+`python -m src.database.utils admins --action list --service pss` — the third
+column reads `NOT SET` for anyone who has not. There is an admin override
+(`--action set-started`) but it should be a last resort: it CLAIMS the chat exists,
+and if it does not the directed request fails and the requester is asked to choose
+again. Prefer asking the supporter to press /start.
+
+**R11 — the picker is invisible until profiles exist, which is the rollout lever.**
+A supporter only appears in the picker once they have a `display_name`. With no
+display names anywhere, `available_supporters()` is empty, the fork never fires,
+and the bot behaves exactly as it does today. So the feature rolls out one
+supporter at a time via
+`python -m src.database.utils admins --action set-profile --service pss --telegram-id <id> --display-name "<name>" [--blurb "<one line>"]`.
+Rollback is either `--display-name ""` for one person, or `PSS_DIRECTED_ENABLED=false`
+in the environment (container recreate) to disable the whole fork.
+
+**R12 — `/release` requires Mongo.** The request's description lives only on the
+session document; `active_sessions` has never carried one. With Mongo down,
+`/release` refuses with a clear message rather than handing back a request nobody
+could be shown. If Mongo is down and a supporter genuinely cannot continue, the
+conversation will idle-expire on its own timer.
+
 ---
 
 ## 6. Tests
@@ -288,6 +334,9 @@ python tests/test_timeutil.py            # aware-UTC helpers
 python tests/test_service_config.py      # registry/parity + timer invariants
 python tests/test_copy.py                # requester-facing copy guards
 python tests/test_pss_flow.py            # full HF+PSS flow w/ fake bot (no DB)
+python tests/test_member_profiles.py     # supporter profiles + availability rules
+python tests/test_directed_requests.py   # the PSS directed-support flow
+python tests/test_release_and_end.py     # requester-only /end, and /release
 python tests/test_per_service_timers.py  # per-track queue/session expiry
 python tests/test_restore.py             # restart durability (the important one)
 python tests/test_session_expiry.py      # warn/expire lifecycle
