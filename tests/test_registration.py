@@ -1233,8 +1233,18 @@ async def case_ab_the_cli_renders_a_malformed_row_without_raising():
     utils_mod.manage_registrations('list', status='approved')
     assert stub.called('list_registrations'), stub.calls
 
-    utils_mod.manage_registrations('close')            # no id -> refused, no call
+    # The baseline is sampled BEFORE the id-less call, deliberately. Sampling it
+    # after would make this pair of assertions self-neutralising: a regression
+    # that dropped utils.py's "--registration-id is required" guard would call
+    # close_registration(None, ...), closes_before would be 1, and the final
+    # assertion would compare 2 == 2 and pass. Verified by mutation -- with the
+    # guard deleted and the old ordering, the whole thirteen-suite gate stayed
+    # green.
     closes_before = stub.count('close_registration')
+    utils_mod.manage_registrations('close')            # no id -> refused, no call
+    assert stub.count('close_registration') == closes_before, (
+        "`registrations --action close` with no --registration-id must refuse "
+        "BEFORE it touches the database: %r" % (stub.calls,))
     utils_mod.manage_registrations('close', registration_id=doc['registration_id'])
     assert stub.count('close_registration') == closes_before + 1, stub.calls
     assert stub.regs[doc['registration_id']]['status'] == 'closed', doc
