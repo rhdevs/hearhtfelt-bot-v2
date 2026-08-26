@@ -553,6 +553,11 @@ CB_DIRECT_DECLINE = "dr_d" # dr_d:<session_id>, targeted supporter only
 # strictly narrower gate (is_registration_admin) -- see D40 and handlers.py.
 # Longest form is "rg_a:" + uuid4 (36) + ":" + "pss" = 45 bytes; reject is 41.
 # Telegram's cap is 64.
+# Deep-link payload: t.me/<bot>?start=register. This is the ONLY discovery route
+# for /register -- it is deliberately absent from set_my_commands, because that
+# menu is what somebody who opened the bot in distress sees.
+REGISTER_DEEP_LINK_PAYLOAD = "register"
+
 CB_REG_APPROVE = "rg_a"    # rg_a:<registration_id>:<service_key>
 CB_REG_REJECT = "rg_r"     # rg_r:<registration_id>
 

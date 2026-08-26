@@ -1449,6 +1449,56 @@ async def case_af_a_switched_off_track_says_so_on_its_button():
         "the applicant's copy must be untouched by the admin-facing marker")
 
 
+async def case_ag_the_deep_link_starts_registration_only_when_it_is_on():
+    """t.me/<bot>?start=register is the ONLY discovery route for /register.
+
+    It must do three things and no more: register when the feature is on; be
+    indistinguishable from a bare /start when it is off (so the link cannot betray
+    that registration exists); and leave an ordinary /start completely alone.
+    """
+    async def start(handlers, bot, args):
+        """Drive the REAL start_command and return what the applicant was told."""
+        rec = Rec()
+        ctx = SimpleNamespace(bot=bot) if args is None else               SimpleNamespace(bot=bot, args=args)
+        await handlers.start_command(text_update(APPLICANT, "/start", rec), ctx)
+        assert rec.replies, "expected a reply to the applicant"
+        return rec.replies[-1][0]
+
+    link = [config.REGISTER_DEEP_LINK_PAYLOAD]
+
+    # 1. enabled -> the link registers, exactly as typing /register would
+    bot, handlers, stub = setup()
+    said = await start(handlers, bot, link)
+    assert stub.called('create_registration'), "the link must start registration"
+    assert bot.texts_to(A1) and bot.texts_to(A2), "both admins must get a card"
+    assert said == MESSAGES["registration_submitted"], said
+
+    # 2. DISABLED -> byte-identical to a bare /start, and nothing is created.
+    #    A link that behaves differently when off is a link that leaks the feature.
+    bot_off, handlers_off, stub_off = setup()
+    config.REGISTRATION_ADMINS = frozenset()
+    off_reply = await start(handlers_off, bot_off, link)
+    assert not stub_off.calls, f"nothing may be created while off: {stub_off.calls}"
+    assert not bot_off.sent, f"nobody may be messaged while off: {bot_off.sent}"
+
+    bot_bare, handlers_bare, _ = setup()
+    config.REGISTRATION_ADMINS = frozenset()
+    bare_reply = await start(handlers_bare, bot_bare, [])
+    assert off_reply == bare_reply, (
+        "a disabled deep link must be indistinguishable from a bare /start")
+
+    # 3. enabled, but an ORDINARY /start -> still the welcome, no registration
+    bot_p, handlers_p, stub_p = setup()
+    plain = await start(handlers_p, bot_p, [])
+    assert not stub_p.called('create_registration'), "a bare /start must not register"
+    assert "Care Network" in plain
+
+    # 4. a context with NO .args at all -- the shape every other suite's fake has
+    bot_n, handlers_n, stub_n = setup()
+    noargs = await start(handlers_n, bot_n, None)
+    assert not stub_n.called('create_registration')
+    assert "Care Network" in noargs
+
 CASES = [
     case_a_an_empty_allowlist_makes_register_indistinguishable_from_nothing,
     case_b_an_inert_bot_refuses_every_registration_tap,
@@ -1482,6 +1532,7 @@ CASES = [
     case_ad_the_allowlist_parser_drops_exactly_what_it_should,
     case_ae_the_real_mongo_filter_names_the_state_it_leaves,
     case_af_a_switched_off_track_says_so_on_its_button,
+    case_ag_the_deep_link_starts_registration_only_when_it_is_on,
 ]
 
 
@@ -1499,7 +1550,7 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 32, (
+    assert len(CASES) >= 33, (
         "expected at least 31 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")

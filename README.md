@@ -104,6 +104,19 @@ Replace `heartfelt-bot` with your container name if it differs. Changes propagat
 
 ## Joining the support team
 
+Share this link with prospective supporters:
+
+```
+https://t.me/hearhtfelt_companion_bot?start=register
+```
+
+Tapping it opens the bot and starts registration directly. `/register` is
+deliberately **not** in the Telegram command menu -- that menu is what someone
+who opened the bot in distress sees, and a recruitment prompt does not belong
+beside "Request support". The link is the only discovery route, and it falls
+back to the ordinary welcome while `REGISTRATION_ADMIN_IDS` is unset, so it
+cannot reveal the feature before you switch it on.
+
 Prospective supporters send `/register` to the bot in a private chat. The bot DMs
 every id on `REGISTRATION_ADMIN_IDS` a card with the applicant's name, username and
 Telegram id, and one Approve button per track plus "Not now". The first tap wins;

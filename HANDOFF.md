@@ -320,7 +320,7 @@ session document; `active_sessions` has never carried one. With Mongo down,
 could be shown. If Mongo is down and a supporter genuinely cannot continue, the
 conversation will idle-expire on its own timer.
 
-**R13 — `/register` is inert until `REGISTRATION_ADMIN_IDS` is set, and every id on
+**R13 (link: `https://t.me/hearhtfelt_companion_bot?start=register` -- the only discovery route; `/register` is not in the command menu by design) — `/register` is inert until `REGISTRATION_ADMIN_IDS` is set, and every id on
 it must have pressed /start.** The env var is a comma-separated list of positive
 Telegram **user** ids; a negative id is a channel id, is rejected, and is logged at
 boot as an unusable entry (a channel would have been DMed the applicant's real name,
