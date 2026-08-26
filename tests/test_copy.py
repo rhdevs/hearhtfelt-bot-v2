@@ -44,6 +44,21 @@ NO_BLAME_KEYS = (
     "directed_status", "choosing_status", "choosing_expired", "directed_gone",
 )
 
+# Everything a /register APPLICANT can be sent. The admin-facing registration_*
+# keys are deliberately NOT here: those may name the approver, and only those.
+# That asymmetry is the whole of D44, and the two tests below enforce both halves.
+REGISTRATION_APPLICANT_KEYS = (
+    "registration_private_only", "registration_submitted",
+    "registration_already_pending", "registration_already_member",
+    "registration_cooldown", "registration_approved", "registration_rejected",
+    "registration_unavailable",
+)
+
+# Substrings that would tell an applicant a PERSON judged them, and invite the
+# question "who?". "@" is here because a Telegram handle is the likeliest leak.
+DECIDER_MARKERS = ("approved by", "rejected by", "declined by", "reviewed by",
+                   "decided by", "admin", "@")
+
 
 def test_welcome_is_rebranded():
     welcome = MESSAGES["welcome"]
@@ -143,6 +158,7 @@ def test_requester_facing_copy_never_blames_a_supporter():
     """
     keys = [k for k in NO_BLAME_KEYS if k in MESSAGES]
     keys += [k for k in MESSAGES if k.startswith("released_")]
+    keys += [k for k in REGISTRATION_APPLICANT_KEYS if k in MESSAGES]
     assert len(keys) >= 15, (
         "far fewer requester-facing keys than expected (%d); this scan would be "
         "nearly vacuous: %s" % (len(keys), sorted(keys)))
@@ -180,9 +196,84 @@ def test_member_addendum_names_the_member_only_commands():
         assert command in addendum, (command, addendum)
 
 
+def test_registration_copy_never_names_a_decider():
+    """Nothing a /register applicant reads may name, number or hint at WHO decided.
+
+    Approving somebody onto a mental-health support roster is a judgement made by
+    one of two named people. The applicant is told the outcome and nothing else:
+    a rejection that names a decider turns an operational decision into a personal
+    one, and hands the applicant somebody to go and argue with.
+
+    The rejection additionally carries NO format slot at all, so there is nothing
+    for a future edit to interpolate into. handlers.py sends it verbatim.
+    """
+    for key in REGISTRATION_APPLICANT_KEYS:
+        assert key in MESSAGES, f"{key} is missing from MESSAGES"
+        value = MESSAGES[key]
+        assert isinstance(value, str), (key, type(value))
+        lowered = value.lower()
+        for marker in DECIDER_MARKERS:
+            assert marker not in lowered, (
+                f"MESSAGES[{key!r}] is applicant-facing and contains {marker!r}, "
+                "which tells them a person judged them and invites 'who?'. "
+                f"Value: {value!r}")
+        for slot in ("{approver}", "{decided_by}", "{admin}"):
+            assert slot not in value, (
+                f"MESSAGES[{key!r}] carries a {slot} slot. Applicant-facing copy "
+                f"must have nothing a decider's identity could be poured into. "
+                f"Value: {value!r}")
+
+    # The one that is sent verbatim has no slots whatsoever.
+    rejected = MESSAGES["registration_rejected"]
+    assert "{" not in rejected and "}" not in rejected, (
+        "registration_rejected is sent straight from MESSAGES with no .format(); "
+        f"a slot here would ship as literal braces to the applicant: {rejected!r}")
+
+
+def test_registration_templates_render():
+    """Every registration template renders and leaves nothing behind.
+
+    Rendered with a NEUTRAL placeholder rather than a real svc.member_label: HF's
+    label is the old brand spelling, so using it here would make this test the one
+    place in the suite that legitimately contains it.
+    """
+    rendered = {
+        "registration_approved": MESSAGES["registration_approved"].format(
+            member="Support Volunteer"),
+        "registration_approve_button": MESSAGES["registration_approve_button"].format(
+            member="Support Volunteer"),
+        "registration_cross_roster": MESSAGES["registration_cross_roster"].format(
+            member="Support Volunteer"),
+        "registration_settled_approved": MESSAGES["registration_settled_approved"].format(
+            member="Support Volunteer", approver="Alex"),
+        "registration_settled_rejected": MESSAGES["registration_settled_rejected"].format(
+            approver="Alex"),
+    }
+    for key, text in rendered.items():
+        assert "{" not in text and "}" not in text, (key, text)
+        assert text.strip(), key
+    assert "Support Volunteer" in rendered["registration_approved"]
+    assert "Alex" in rendered["registration_settled_rejected"]
+
+    # And every registration value is a plain, non-empty str -- the admin-facing
+    # ones included, since they are sent with parse_mode='HTML'.
+    registration_keys = [k for k in MESSAGES if k.startswith("registration_")]
+    assert len(registration_keys) >= 20, (
+        "far fewer registration keys than expected (%d); this scan would be "
+        "nearly vacuous: %s" % (len(registration_keys), sorted(registration_keys)))
+    for key in registration_keys:
+        assert isinstance(MESSAGES[key], str), (key, type(MESSAGES[key]))
+        assert MESSAGES[key].strip(), key
+
+
 def test_bot_command_menu():
     import main
     assert [c.command for c in main.BOT_COMMANDS] == ["chat", "status", "cancel", "end"]
+    # /register is deliberately absent. set_my_commands publishes ONE menu to
+    # every chat, and that menu is the REQUESTER's surface: advertising a
+    # recruitment command to somebody who opened this bot in distress is the
+    # wrong thing to put in front of them. Discovery is out-of-band. D42/R13.
+    assert "register" not in [c.command for c in main.BOT_COMMANDS]
     for c in main.BOT_COMMANDS:
         # Telegram's constraints: names [a-z0-9_]{1,32}, descriptions 1-256 chars.
         assert 1 <= len(c.command) <= 32
@@ -199,8 +290,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 13, (
-        "expected at least 13 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 15, (
+        "expected at least 15 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )
