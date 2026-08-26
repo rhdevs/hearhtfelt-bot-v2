@@ -596,6 +596,47 @@ async def case_j_closing_copy_follows_the_session_role_not_the_roster():
     assert config.MESSAGES["conversation_ended_heartfelt"] in to_member, to_member
     print("OK  j. closing copy is chosen by session role, not by a roster lookup")
 
+async def case_k_a_member_is_never_sealed_into_a_conversation():
+    """/end sends a supporter to /release, and /release needs Mongo. With Mongo down
+    both doors are shut: /end says "use /release", /release says "records are
+    offline", and the only remaining exit is the IDLE timeout -- which never fires
+    while the other person keeps typing. Before /end became requester-only a
+    supporter could always leave.
+
+    In that degraded mode, and only there, /end is honoured again.
+    """
+    bot, sm, qm, handlers, stub = build(pickable=1)
+    rec = Rec()
+    ctx = SimpleNamespace(bot=bot)
+    session_id = await directed_conversation(handlers, bot, rec, ctx)
+
+    # While Mongo is up nothing changes: the member is still refused.
+    await handlers.end_command(text_update(MEMBER, "/end", rec), ctx)
+    assert rec.replies[-1][0] == config.MESSAGES["end_is_requester_only"], rec.replies[-1][0]
+    assert sm.get_session_by_user(MEMBER) == session_id, (
+        "the refusal must leave the session untouched")
+
+    # Now the records go offline, so /release cannot hand the request back.
+    stub.db_available = False
+    await handlers.release_command(text_update(MEMBER, "/release", rec), ctx)
+    assert rec.replies[-1][0] == config.MESSAGES["release_unavailable"], rec.replies[-1][0]
+
+    before = len(bot.sent)
+    await handlers.end_command(text_update(MEMBER, "/end", rec), ctx)
+
+    assert sm.get_session_by_user(MEMBER) is None, (
+        "with /release unavailable, /end is the supporter's only way out and must "
+        "work -- otherwise a volunteer is sealed in until the idle timeout, which "
+        "never arrives while the requester keeps typing")
+    assert sm.get_session_by_user(REQUESTER) is None
+    assert config.user_states.get(MEMBER) == UserState.IDLE
+
+    # And the requester is told the ordinary thing, never that they were dropped.
+    said = [t for c, t, *_ in bot.sent[before:] if c == str(REQUESTER)]
+    assert said, "the requester must still be told the conversation ended"
+    assert_no_blame(said, "the requester")
+    print("OK  k. a supporter is never sealed in: /end works when /release cannot")
+
 
 # --------------------------------------------------------------------------- runner
 CASES = [
@@ -609,6 +650,7 @@ CASES = [
     case_h_a_released_request_can_be_claimed_again,
     case_i_closing_text_appends_only_when_configured,
     case_j_closing_copy_follows_the_session_role_not_the_roster,
+    case_k_a_member_is_never_sealed_into_a_conversation,
 ]
 
 
@@ -626,7 +668,7 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 10, (
+    assert len(CASES) >= 11, (
         "expected at least 10 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")

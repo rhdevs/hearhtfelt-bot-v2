@@ -221,9 +221,26 @@ class BotHandlers:
         member_id = info.get('heartfelt_member_id')
 
         if user_id != requester_id:
-            # Refused WITHOUT ending: the session survives untouched.
-            await update.message.reply_text(MESSAGES["end_is_requester_only"])
-            return
+            # Refused WITHOUT ending: the session survives untouched. The copy sends
+            # them to /release, which keeps the requester's request alive.
+            #
+            # UNLESS /release cannot run. It requires Mongo (the description lives
+            # only on the document), so with Mongo down a supporter who says /end is
+            # told to use /release and /release then refuses them. Before this
+            # command became requester-only they could always leave; that combination
+            # leaves a volunteer sealed inside a conversation with no exit but the
+            # IDLE timeout -- which never fires while the other person keeps typing.
+            #
+            # So in that degraded mode only, /end is honoured. It is the same escape
+            # hatch they had before, restricted to the one case where the intended
+            # route is genuinely unavailable, and the requester still gets the normal
+            # closing message rather than being told they were dropped.
+            if db_mgr.db_available:
+                await update.message.reply_text(MESSAGES["end_is_requester_only"])
+                return
+            logger.warning(
+                "Member %s ended session %s directly: Mongo is unavailable, so "
+                "/release could not have handed it back", user_id, session_id)
 
         await self.session_manager.end_session(session_id, user_id)
 
