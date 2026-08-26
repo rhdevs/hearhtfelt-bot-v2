@@ -187,7 +187,10 @@ Not run by CI:
 
 ```bash
 python tests/demo_session_expiry.py      # demo, no assertions, not in CI
-ALLOW_DB_INTEGRATION_TEST=1 python tests/test_db_integration.py   # needs a live MongoDB -- WRITES DOCUMENTS; never point it at production
+# WRITES DOCUMENTS. Set MONGODB_URI explicitly on the command line: without it
+# config.py's load_dotenv() supplies whatever is in your .env, which on a
+# maintainer's machine is usually PRODUCTION. Never omit it, never point it at prod.
+ALLOW_DB_INTEGRATION_TEST=1 MONGODB_URI=mongodb://localhost:27017 python tests/test_db_integration.py
 ```
 
 Run these from a virtualenv built with `pip install -r requirements.txt`;

@@ -243,6 +243,37 @@ assertions and always exits 0. By design, no secrets are available to the
 `test` job (`permissions: contents: read`, zero `secrets.` references in that
 job), so a fork PR can run the gate safely.
 
+**R7 — things an adversarial review of R6 found. Do not undo these.**
+
+- **`tests/test_db_integration.py` writes to whatever `MONGODB_URI` resolves to,
+  and its opt-in guard only covers `python tests/test_db_integration.py`.** The
+  guard is inside `main()`. The file is named `test_*.py`, so `pytest` collected
+  its three module-level `test_*` functions and ran them without ever entering
+  `main()`; the file has zero `assert`s, so pytest reported "3 passed" while
+  inserting documents. A maintainer with the production URI in `.env` typing the
+  reflex command `pytest` was one keystroke from writing fabricated sessions into
+  the live helpline. The checks are now named `check_*` and the module sets
+  `__test__ = False`. **Never give anything in that file a `test_` prefix**, and
+  always pass `MONGODB_URI=` explicitly on the command line (§6) — without it
+  `load_dotenv()` silently supplies your `.env`, which is usually production.
+
+- **A suite that discovers no tests used to pass.** Five suites build their test
+  list with `sorted(globals())` and reported `All 0 tests passed!` with exit 0
+  when discovery collected nothing. Each now asserts a minimum count. If you add
+  tests you may raise the number; **never lower it to make a run go green.**
+
+- **Concurrency must be scoped by event, not by ref.** `workflow_dispatch` runs on
+  any branch and reaches `deploy`, so a ref-scoped group let a dispatch deploy and
+  a main deploy run at the same time against one droplet. `deploy/deploy.sh` is
+  not concurrency-safe (it renames the live container aside and `rm -f`s the
+  rollback target), and two live containers means Telegram getUpdates 409s and
+  dropped messages. Everything that can deploy shares one lane; only
+  `pull_request` runs are per-ref.
+
+- **Assert identity, not counts.** The boot suite counted nine handlers and
+  checked command names, so rewiring `filters.PHOTO` to `handle_sticker` stayed
+  green. It now asserts the ordered (handler class, callback name) pairs.
+
 ---
 
 ## 6. Tests
@@ -264,7 +295,10 @@ python tests/test_session_expiry.py      # warn/expire lifecycle
 Not run by CI:
 ```bash
 python tests/demo_session_expiry.py      # demo, no assertions, not in CI
-ALLOW_DB_INTEGRATION_TEST=1 python tests/test_db_integration.py   # needs a live MongoDB -- WRITES DOCUMENTS; never point it at production
+# WRITES DOCUMENTS. Set MONGODB_URI explicitly on the command line: without it
+# config.py's load_dotenv() supplies whatever is in your .env, which on a
+# maintainer's machine is usually PRODUCTION. Never omit it, never point it at prod.
+ALLOW_DB_INTEGRATION_TEST=1 MONGODB_URI=mongodb://localhost:27017 python tests/test_db_integration.py
 ```
 Run these from a virtualenv built with `pip install -r requirements.txt`;
 `tests/test_dependency_pins.py` will tell you if you have not (it fails
@@ -281,11 +315,34 @@ cross-roster claim rejection, correct labels, HF/PSS in parallel.
 
 ### Branch `feat/care-network-phases-1-3` (NOT merged, NOT pushed)
 
-- `9d4b55a` — Fix P0: orphaned sessions re-notify both parties every sweep
-- `8d7a07c` — Phase 0: aware-UTC everywhere, shared anonymous-id set
-- `349f4c1` — Phase 1: rebrand to Care Network Bot, `/chat` as the primary command
-- `b5f5a77` — Phase 2: per-track queue and session expiry
-- `46f7bfc` — Phase 3: restart durability
+**25 commits.** Do not maintain the list by hand — it was stale within a day of
+being written, still showing five commits ending at `46f7bfc` when the branch had
+twenty-five. Get the current set with:
+
+```bash
+git log --oneline fdb6079..HEAD        # fdb6079 is the merge-base with main
+```
+
+In four groups, oldest first:
+
+1. **Phases 0–3** (`9d4b55a`, `8d7a07c`, `349f4c1`, `b5f5a77`, `46f7bfc`) —
+   the P0 re-notify fix, aware-UTC, the Care Network rebrand with `/chat`,
+   per-track queue/session expiry, restart durability.
+2. **Review round 1 — correctness** (`d1499e4`..`f6c1022`) — boot-time expiry no
+   longer mass-DMs months-old sessions, tracebacks kept on boot failure, tasks
+   drained on shutdown, `end_session` no longer reports failure after the close
+   commits, a claim can no longer be expired out from under itself.
+3. **Review round 2 — the CI gate and test integrity** (`1133c99`..`cc0fedc`) —
+   dependency-pin and boot-ordering suites, the unittest scaffolding that let six
+   async tests assert nothing removed, `manual_test_expiry` renamed to
+   `demo_session_expiry` and made truthful, the deploy gated on the suite,
+   `test_db_integration` given an opt-in guard.
+4. **Review round 3 — adversarial review of round 2** (`5bc9423`..`01bf3b8`) —
+   see §5b R7. pytest could collect and run the database-writing integration
+   script; a partial rebrand of the welcome message passed every suite; five
+   suites reported success when they discovered zero tests; two boot cases hung
+   for the whole CI budget instead of failing; handler callback identity was
+   unchecked; and the ref-scoped concurrency group let two deploys overlap.
 
 Read §5b before deploying any of it.
 
