@@ -451,6 +451,26 @@ used_anonymous_ids: Set[str] = set()
 
 AUTHORIZED_MEMBER_REFRESH_SECONDS = 300  # Interval for refreshing Heartfelt members from DB
 
+# --- callback_data prefixes ----------------------------------------------------
+# Telegram caps callback_data at 64 BYTES. The requester's picker callbacks carry no
+# session id (a requester has at most one open request, resolved through
+# user_to_queue_map and then ownership-checked), which keeps them at <= 17 bytes; the
+# supporter's carry one, at 41. Both have headroom.
+#
+# Defined here as constants so the handlers and the tests cannot drift apart on a
+# string literal.
+#
+# DISPATCH ORDER MATTERS: pk_* is handled BEFORE the membership gate, for the same
+# reason svc_ is -- requesters are not members. A member who is themselves a
+# requester still works, because every pk_* handler resolves through
+# user_to_queue_map[user_id] and then validates that the entry is theirs.
+CB_PICK_OPEN = "pk_o"      # "ask anyone who's free"
+CB_PICK_LIST = "pk_l"      # pk_l:<page>
+CB_PICK_SELECT = "pk_s"    # pk_s:<member_id>
+CB_PICK_CANCEL = "pk_x"    # cancel my request
+CB_DIRECT_ACCEPT = "dr_a"  # dr_a:<session_id>, targeted supporter only
+CB_DIRECT_DECLINE = "dr_d" # dr_d:<session_id>, targeted supporter only
+
 # INVARIANT: SESSION_SWEEP_SECONDS must be < (min service_warning_minutes * 60),
 # or a session can expire without ever being warned. Currently 180 < 300 (HF).
 # The binding constraint is the SHORTEST warning band, not the longest timeout:
@@ -577,6 +597,94 @@ MESSAGES = {
         "(Our records are offline right now, so this will only last until the bot "
         "next restarts. Please set it again if it seems to have been forgotten.)"
     ),
+
+    # --- Phase 5: choosing a specific supporter ------------------------------
+    #
+    # WORDING RULE FOR EVERYTHING THE REQUESTER SEES: a decline and a 24-hour silence
+    # are the SAME transition and get the SAME words. Never "declined", never
+    # "rejected", never anything that distinguishes the two. The requester learns only
+    # that the person they chose is not free. tests/test_directed_requests.py case (o)
+    # scans every requester-bound string in this file's flows for regressions.
+    "comfort_question": (
+        "Before I pass this on - would you like to talk to someone in particular, "
+        "or is anyone who's free okay?"
+    ),
+    "comfort_specific_button": "I'd like to choose someone",
+    "comfort_anyone_button": "Anyone who's free",
+
+    "picker_header": "I'm comfortable talking to...",
+    "picker_hint": "Tap a name below, or reply with its number.",
+    "picker_page": "Page {page} of {pages}",
+    "picker_anyone_button": "Anyone who's free (usually faster)",
+    "picker_cancel_button": "Cancel my request",
+    "picker_back_button": "Back",
+    "picker_next_button": "Next",
+    "picker_choose_else_button": "Choose someone else",
+
+    "picker_nobody_free": (
+        "Nobody is free to be chosen right now. You can ask anyone who's free instead - "
+        "your message goes to the whole support team - or cancel the request."
+    ),
+    # Shown when we have no record of what this person was last looking at, which is
+    # exactly the state after a restart. We re-render rather than guess, because a
+    # stale number must never select somebody the requester never saw.
+    "picker_lost_view": "Here's the list again.",
+    "picker_not_a_number": (
+        "Sorry, I didn't catch that. Please tap a name below, or reply with just the "
+        "number next to it."
+    ),
+    "picker_busy": "That person has just become unavailable. Please choose someone else.",
+    "picker_unreachable": (
+        "Sorry, I couldn't reach them just now, so they're off the list for this "
+        "request. Please choose someone else."
+    ),
+
+    "directed_sent": (
+        "✅ Sent to {name}. They'll be in touch if they're free.\n\n"
+        "If you'd rather not wait, you can ask anyone who's free instead."
+    ),
+    # Sent to the TARGETED SUPPORTER. HTML parse mode: {description} is escaped by the
+    # caller. Carries NO requester name, username, Telegram id or anonymous id -- the
+    # anonymous id is withheld until the conversation actually starts.
+    "directed_request": (
+        "Someone has asked to talk to you.\n\n"
+        "\"{description}\"\n\n"
+        "They chose you specifically, so this hasn't gone to the channel.\n"
+        "If you're free, tap Accept. If not, tap Not right now - the request goes "
+        "straight back to them and they can choose again. They are not told why.\n\n"
+        "If there's no answer within {window}, it goes back to them automatically.\n"
+        "(You can use /unavailable any time to stay off the list.)"
+    ),
+    "directed_accept_button": "Accept",
+    "directed_decline_button": "Not right now",
+    "directed_lapsed_member": (
+        "That request has gone back to the person who sent it, because there was no "
+        "answer. Nothing more is needed from you."
+    ),
+    "decline_ack": (
+        "Thanks for letting us know - it's completely fine to say no. The request has "
+        "gone back to the person who sent it so they can choose again, and they "
+        "haven't been told anything about who was asked."
+    ),
+    # THE ONLY wording for both a decline and a 24-hour silence. {name} is the display
+    # name the requester already chose, so this carries no new information.
+    "directed_unavailable": "{name} isn't free right now.",
+    "next_step_question": "What would you like to do?",
+    "directed_status": (
+        "Your request is with {name}. We'll let you know as soon as they reply. "
+        "You can use /cancel if you've changed your mind."
+    ),
+    "choosing_status": (
+        "Your request is open and you're choosing who to talk to. Tap a name on the "
+        "list, or use /cancel if you've changed your mind."
+    ),
+    # queue_expired says "no {member} was available in time", which is false for a
+    # request nobody was ever asked about.
+    "choosing_expired": (
+        "⏱️ Your request has expired because it wasn't sent to anyone in time. "
+        "You can use /chat to start again whenever you're ready."
+    ),
+    "directed_gone": "This request is no longer waiting.",
 }
 
 

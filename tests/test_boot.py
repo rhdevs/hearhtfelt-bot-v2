@@ -215,6 +215,10 @@ def _make_fakes(events):
         def __init__(self, bot):
             self.bot = bot
 
+        async def sweep_directed_requests(self):
+            events.append("directed_sweep")
+            return []
+
         async def sweep_expired_queues(self):
             events.append("queue_sweep")
             return []
@@ -376,10 +380,16 @@ def test_boot_order_rehydrate_then_sweep_then_poll():
         f"Events at the moment polling started: {snapshot}\n"
         f"Full event list: {events}\n"
     )
-    for name in ("restore", "queue_sweep", "expiry_sweep"):
+    for name in ("restore", "directed_sweep", "queue_sweep", "expiry_sweep"):
         assert name in snapshot, f"{name!r} had not happened when polling started." + why
 
+    # directed_sweep BEFORE queue_sweep, and that order is not cosmetic: handing a
+    # lapsed directed request back resets its waiting_since, so sweeping expiry first
+    # would expire a request the directed sweep was about to revive -- the requester
+    # gets "they're not free, pick again" AND "your request expired", for the same
+    # request, seconds apart.
     assert (snapshot.index("restore")
+            < snapshot.index("directed_sweep")
             < snapshot.index("queue_sweep")
             < snapshot.index("expiry_sweep")), why
 
@@ -387,6 +397,7 @@ def test_boot_order_rehydrate_then_sweep_then_poll():
     # "queue_sweep" in the snapshot would mean the periodic loop had already
     # started racing the boot sequence.
     assert snapshot.count("restore") == 1, why
+    assert snapshot.count("directed_sweep") == 1, why
     assert snapshot.count("queue_sweep") == 1, why
     assert snapshot.count("expiry_sweep") == 1, why
 

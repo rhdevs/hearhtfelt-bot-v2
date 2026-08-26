@@ -48,6 +48,47 @@ async def register_bot_commands(bot) -> bool:
         logger.warning("Could not register command menu (continuing): %s", exc)
         return False
 
+async def refresh_all_rosters() -> None:
+    """Reload every service roster, WITH PROFILES, from Mongo.
+
+    Module-level rather than nested inside main() so a test can drive it against a
+    recording stub. It closes over nothing but module globals, so this is a pure
+    move; the alternative is that the single highest-risk line in Phase 4 has no
+    test that can reach it.
+    """
+    if not db_mgr.db_available:
+        return
+    for svc in SERVICES.values():
+        try:
+            # include_inactive=False is MANDATORY. get_authorized_member_records
+            # defaults to True, while the get_authorized_members call it replaces
+            # hard-filtered active != False. Omitting it silently re-authorizes
+            # every deactivated member on the next refresh -- a security regression
+            # with no user-visible symptom. See tests/test_member_profiles.py case f.
+            records = db_mgr.get_authorized_member_records(
+                include_inactive=False,
+                collection=svc.members_collection,
+            )
+            if records is None:
+                # DB error for this collection -> keep the current roster (no-op).
+                # None and [] mean different things: [] is a genuinely empty roster.
+                continue
+            if svc.roster.replace_records(records):
+                logger.info("Roster '%s' updated from database (%d entries)", svc.key, len(svc.roster))
+            svc.roster.update_last_synced(time.time())
+        except Exception as exc:
+            logger.error("Error refreshing roster '%s': %s", svc.key, exc)
+
+
+async def refresh_authorized_members_periodically() -> None:
+    while True:
+        try:
+            await refresh_all_rosters()
+        except Exception as exc:
+            logger.error("Error refreshing authorized members: %s", exc)
+        await asyncio.sleep(AUTHORIZED_MEMBER_REFRESH_SECONDS)
+
+
 async def main():
     """Main function to start the bot"""
     
@@ -74,38 +115,6 @@ async def main():
                 db_mgr.ensure_authorized_members_seed(svc.default_members, collection=svc.members_collection)
     else:
         logger.warning("🟡 Database unavailable - running in memory-only mode")
-
-    async def refresh_all_rosters() -> None:
-        if not db_mgr.db_available:
-            return
-        for svc in SERVICES.values():
-            try:
-                # include_inactive=False is MANDATORY and is the highest-risk line in
-                # Phase 4. get_authorized_member_records defaults to True, while the
-                # get_authorized_members call it replaces hard-filtered active != False.
-                # Omitting it silently re-authorizes every deactivated member on the
-                # next refresh -- a security regression with no user-visible symptom.
-                records = db_mgr.get_authorized_member_records(
-                    include_inactive=False,
-                    collection=svc.members_collection,
-                )
-                if records is None:
-                    # DB error for this collection -> keep the current roster (no-op).
-                    # None and [] mean different things: [] is a genuinely empty roster.
-                    continue
-                if svc.roster.replace_records(records):
-                    logger.info("Roster '%s' updated from database (%d entries)", svc.key, len(svc.roster))
-                svc.roster.update_last_synced(time.time())
-            except Exception as exc:
-                logger.error("Error refreshing roster '%s': %s", svc.key, exc)
-
-    async def refresh_authorized_members_periodically() -> None:
-        while True:
-            try:
-                await refresh_all_rosters()
-            except Exception as exc:
-                logger.error("Error refreshing authorized members: %s", exc)
-            await asyncio.sleep(AUTHORIZED_MEMBER_REFRESH_SECONDS)
 
     if db_available:
         await refresh_all_rosters()
@@ -157,9 +166,16 @@ async def main():
         All the work -- closing the DB row, retiring the channel post, notifying the
         requester -- lives in QueueManager.sweep_expired_queues, so boot-time and
         periodic expiry go through exactly one code path.
+
+        sweep_directed_requests runs BEFORE it here for the same reason it does at
+        boot: a lapse resets waiting_since, and running the expiry sweep first turns
+        a would-be "lapse, then immediately expire" double message into a lapse only.
         """
         while True:
             try:
+                lapsed = await queue_manager.sweep_directed_requests()
+                if lapsed:
+                    logger.info("Handed back %d directed requests", len(lapsed))
                 expired = await queue_manager.sweep_expired_queues()
                 if expired:
                     logger.info("Cleaned up %d expired queue entries", len(expired))
@@ -208,6 +224,13 @@ async def main():
             # 4. Retire anything already past its window BEFORE any update can be
             #    processed, so a member cannot claim an entry mid-rehydration and a
             #    stale entry cannot be claimed before it is expired.
+            #
+            #    The DIRECTED sweep runs FIRST, and the order is load-bearing: a lapse
+            #    resets waiting_since, so running the queue sweep first would expire a
+            #    request that the directed sweep was a moment away from handing back --
+            #    the requester gets "they're not free, pick again" AND "your request
+            #    expired", one after the other, for the same request.
+            await queue_manager.sweep_directed_requests()
             await queue_manager.sweep_expired_queues()
             await expiry_manager.run_once()
 

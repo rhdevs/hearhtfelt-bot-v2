@@ -1,12 +1,22 @@
+import html
 import logging
 import re
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CallbackContext
 from config import (
+    CB_DIRECT_ACCEPT,
+    CB_DIRECT_DECLINE,
+    CB_PICK_CANCEL,
+    CB_PICK_LIST,
+    CB_PICK_OPEN,
+    CB_PICK_SELECT,
     SERVICES,
     UserState,
+    available_supporters,
+    picker_views,
     user_states,
+    user_to_queue_map,
     user_to_service_map,
     MESSAGES,
     PHOTO_SHARING_ENABLED,
@@ -21,6 +31,7 @@ from config import (
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager, SelfClaimError
 from src.database.manager import db_mgr
+from src.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +158,14 @@ class BotHandlers:
         if existing_session:
             await update.message.reply_text(MESSAGES["already_in_conversation"])
             return
+
+        # An INDEX-based check, immune to user_states drift. Without it a requester
+        # sitting at the picker (CHOOSING_SUPPORTER, which the IN_QUEUE test above
+        # does not catch) can start a SECOND request -- two pending rows for one user,
+        # which rehydration then treats as duplicate_pending and silently closes one.
+        if self.queue_manager.is_user_in_queue(user_id):
+            await update.message.reply_text(self._open_request_status_text(user_id))
+            return
         
         # Landing page: if more than one support track is available, let the user
         # choose. With a single runnable service (Phase 1 = HF only) we skip the
@@ -226,17 +245,39 @@ class BotHandlers:
             except:
                 pass
     
+    def _open_request_status_text(self, user_id: int) -> str:
+        """One description of an existing open request, shared by /status and /chat.
+
+        Two callers, one answer: telling somebody at the picker "you're already in
+        the queue, please wait for a support member" would have them waiting for a
+        message that only arrives once they tap a name.
+        """
+        queue_id = user_to_queue_map.get(user_id)
+        entry = self.queue_manager.get_queue_entry(queue_id) if queue_id else None
+        if entry is None:
+            return MESSAGES["idle_status"]
+
+        routing = entry.get('routing') or 'open'
+        svc = get_service(entry.get('service'))
+        if routing == 'choosing':
+            return MESSAGES["choosing_status"]
+        if routing == 'directed':
+            # Discloses only the supporter this requester chose themselves.
+            profile = svc.roster.profile(entry.get('target_member_id'))
+            name = profile.display_name if profile is not None else svc.member_label
+            return MESSAGES["directed_status"].format(name=name)
+        return MESSAGES["queue_status"].format(member=svc.member_label)
+
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
         user_id = update.effective_user.id
         current_state = user_states.get(user_id, UserState.IDLE)
-        
+
         if current_state == UserState.IN_CONVERSATION:
             await update.message.reply_text(MESSAGES["conversation_status"])
-        elif current_state == UserState.IN_QUEUE:
+        elif current_state in (UserState.IN_QUEUE, UserState.CHOOSING_SUPPORTER):
             if self.queue_manager.is_user_in_queue(user_id):
-                svc = get_service(self.queue_manager.get_user_service(user_id))
-                await update.message.reply_text(MESSAGES["queue_status"].format(member=svc.member_label))
+                await update.message.reply_text(self._open_request_status_text(user_id))
             else:
                 # State drift: reset local state to avoid confusing responses
                 user_states[user_id] = UserState.IDLE
@@ -255,8 +296,9 @@ class BotHandlers:
             await update.message.reply_text(MESSAGES["help_request_cancelled"])
             return
 
-        # Check if user is actually in queue
-        if current_state != UserState.IN_QUEUE:
+        # Check if user is actually in queue. CHOOSING_SUPPORTER counts: they have a
+        # live request, it is just not in the channel yet.
+        if current_state not in (UserState.IN_QUEUE, UserState.CHOOSING_SUPPORTER):
             await update.message.reply_text(MESSAGES["not_in_queue"])
             return
         
@@ -289,6 +331,13 @@ class BotHandlers:
         # picker until they happen to type /start again, which most never will.
         if self._is_private_chat(update) and is_any_member(user_id):
             self._record_bot_started(user_id)
+
+        # A number typed at the picker. Checked BEFORE the description branch, and
+        # routed into the SAME coroutine the pk_s: buttons use -- two entry points
+        # into a send path is how one of them ends up missing a guard.
+        if current_state == UserState.CHOOSING_SUPPORTER:
+            await self._handle_picker_number(update, context, message_text)
+            return
 
         # Check if user is waiting for description
         if current_state == UserState.WAITING_FOR_DESCRIPTION:
@@ -357,8 +406,32 @@ class BotHandlers:
         # Which service did the user pick? (read-and-clear; defaults to hf in Phase 1)
         service_key = user_to_service_map.pop(user_id, default_service_key())
 
-        # Add to queue
         user_telehandle = f"@{update.effective_user.username}" if update.effective_user.username else None
+
+        # THE FORK. `if options:` is load-bearing in three separate ways: no pickable
+        # supporters means no dead-end UI, means HF (directed_enabled False) never
+        # reaches it, and means the pre-Phase-5 suites -- whose rosters are bare ints
+        # with no display names -- keep driving the original path below untouched.
+        svc = get_service(service_key)
+        options = available_supporters(svc.key) if svc.directed_enabled else []
+        if options:
+            # The Mongo row is created BEFORE the question, so a restart mid-question
+            # is recoverable rather than a request that quietly never existed.
+            queue_id = self.queue_manager.add_to_queue(
+                user_id, description, user_telehandle, service_key, routing='choosing')
+            user_states[user_id] = UserState.CHOOSING_SUPPORTER
+            await update.message.reply_text(
+                MESSAGES["comfort_question"],
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(MESSAGES["comfort_specific_button"],
+                                          callback_data=f"{CB_PICK_LIST}:0")],
+                    [InlineKeyboardButton(MESSAGES["comfort_anyone_button"],
+                                          callback_data=CB_PICK_OPEN)],
+                ]),
+            )
+            return
+
+        # Add to queue
         queue_id = self.queue_manager.add_to_queue(user_id, description, user_telehandle, service_key)
         
         # Post to admin channel
@@ -390,10 +463,27 @@ class BotHandlers:
             await self._handle_service_choice(update, context)
             return
 
+        # Picker callbacks, for the SAME reason: requesters are not members. Every
+        # pk_* branch resolves the request through user_to_queue_map[user_id] and then
+        # checks the entry belongs to them, so a member who is themselves a requester
+        # still works and nobody can act on somebody else's request.
+        if (data in (CB_PICK_OPEN, CB_PICK_CANCEL)
+                or data.startswith(CB_PICK_LIST + ":")
+                or data.startswith(CB_PICK_SELECT + ":")):
+            await self._handle_picker_callback(update, context)
+            return
+
         # Membership gate first, matching the original ordering: any non-svc action by a
         # non-member gets "not authorized" before we distinguish claim vs other data.
         if not is_any_member(user_id):
             await query.answer("You are not authorized to perform this action.", show_alert=True)
+            return
+
+        # Accept / Not right now on a directed request. After the gate: only members
+        # get here, and accept_directed then narrows that to the ONE targeted member.
+        if (data.startswith(CB_DIRECT_ACCEPT + ":")
+                or data.startswith(CB_DIRECT_DECLINE + ":")):
+            await self._handle_directed_response(update, context)
             return
 
         # Only claim actions remain valid for members
@@ -418,6 +508,17 @@ class BotHandlers:
         entry = self.queue_manager.get_queue_entry(queue_id)
         if entry is None:
             await query.answer("This request has already been claimed or expired.", show_alert=True)
+            return
+
+        # Defence in depth. Should be unreachable -- a choosing/directed request has no
+        # channel post -- but a supporter can be holding a stale Claim button from an
+        # EARLIER lane: a request that was declined and went open reuses the same
+        # session_id, and could be sent back to a specific supporter later. One dict
+        # lookup closes the window in which claim_queue would authorize the whole
+        # roster against a request routed to one person.
+        if (entry.get('routing') or 'open') in ('choosing', 'directed'):
+            await query.answer("This request was sent to a specific supporter.",
+                               show_alert=True)
             return
 
         # A member may only claim requests for their own service's roster.
@@ -448,35 +549,357 @@ class BotHandlers:
             await query.answer("This request has already been claimed or expired.", show_alert=True)
             return
 
+        await self._start_claimed_conversation(context, queue_id, claimed_user_id,
+                                               user_id, service_key)
+        await query.answer("Conversation claimed successfully!")
+
+    async def _start_claimed_conversation(self, context, queue_id: str, requester_id: int,
+                                          member_id: int, service_key: str) -> str:
+        """Create the session and greet both parties.
+
+        Shared by the channel Claim path and the directed Accept path. Two copies of a
+        session-creation path is how the two drift, and the drift is invisible until
+        somebody in one lane never gets told their conversation started.
+        """
         # Create session using the queue_id as session_id to maintain database consistency
-        session_id = self.session_manager.create_session(claimed_user_id, user_id, queue_id, service=service_key)
-        
+        session_id = self.session_manager.create_session(requester_id, member_id, queue_id, service=service_key)
+
         # Update states
-        user_states[claimed_user_id] = UserState.IN_CONVERSATION
-        user_states[user_id] = UserState.IN_CONVERSATION
-        
+        user_states[requester_id] = UserState.IN_CONVERSATION
+        user_states[member_id] = UserState.IN_CONVERSATION
+
         # Notify both parties
         try:
             await context.bot.send_message(
-                chat_id=claimed_user_id,
+                chat_id=requester_id,
                 text=MESSAGES["conversation_started"]
             )
         except:
             pass
-        
+
         try:
             # Get the session to retrieve the anonymous ID
             session_info = self.session_manager.get_session_info(session_id)
             anonymous_id = session_info.get('anonymous_user_id', 'Unknown User') if session_info else 'Unknown User'
-            
+
             await context.bot.send_message(
-                chat_id=user_id,
+                chat_id=member_id,
                 text=f"You have claimed a conversation with {anonymous_id}. You can now start chatting."
             )
         except:
             pass
-        
-        await query.answer("Conversation claimed successfully!")
+
+        return session_id
+
+    # ==================================================================
+    # The supporter picker (Phase 5)
+    # ==================================================================
+
+    async def _send_or_edit(self, query, context, chat_id: int, text: str,
+                            reply_markup=None, parse_mode=None) -> None:
+        """Edit the message the button lives on, falling back to a fresh DM.
+
+        The same pattern _handle_service_choice already uses: an edit can fail for
+        reasons that have nothing to do with us (message too old, identical content),
+        and the requester must still see the new list."""
+        if query is not None:
+            try:
+                await query.edit_message_text(text, reply_markup=reply_markup,
+                                              parse_mode=parse_mode)
+                return
+            except Exception:
+                pass
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text,
+                                           reply_markup=reply_markup,
+                                           parse_mode=parse_mode)
+        except Exception as exc:
+            logger.warning("Could not show the picker to %s: %s", chat_id, exc)
+
+    async def _render_picker(self, query, context, user_id: int, queue_id: str,
+                             page: int, note: str = "") -> bool:
+        """Render one page of choosable supporters. False when there is nobody to show.
+
+        Numbers are 1-based and PAGE-LOCAL, and the view is recorded BEFORE the
+        message is sent so a very fast reply cannot race the record and be read
+        against the previous page.
+        """
+        entry = self.queue_manager.get_queue_entry(queue_id)
+        if entry is None:
+            return False
+
+        svc = get_service(entry.get('service'))
+        declined = set(entry.get('declined_by') or [])
+        options = [p for p in available_supporters(svc.key)
+                   if p.telegram_id not in declined]
+
+        if not options:
+            # NEVER render an empty list: a picker with no names is a dead end with no
+            # way out but /cancel.
+            picker_views.pop(user_id, None)
+            await self._send_or_edit(
+                query, context, user_id, MESSAGES["picker_nobody_free"],
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
+                                          callback_data=CB_PICK_OPEN)],
+                    [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
+                                          callback_data=CB_PICK_CANCEL)],
+                ]))
+            return False
+
+        page_size = max(1, svc.picker_page_size)
+        pages = max(1, (len(options) + page_size - 1) // page_size)
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 0
+        page = max(0, min(page, pages - 1))
+        chunk = options[page * page_size:(page + 1) * page_size]
+
+        lines = []
+        for number, profile in enumerate(chunk, start=1):
+            lines.append(f"{number}. {html.escape(profile.display_name)}")
+            if profile.blurb:
+                lines.append(f"   {html.escape(profile.blurb)}")
+
+        text = ((note + "\n\n") if note else "") + MESSAGES["picker_header"] + "\n\n"
+        text += "\n".join(lines) + "\n\n" + MESSAGES["picker_hint"]
+        if pages > 1:
+            text += "\n" + MESSAGES["picker_page"].format(page=page + 1, pages=pages)
+
+        rows = [[InlineKeyboardButton(f"{number}. {profile.display_name}"[:60],
+                                      callback_data=f"{CB_PICK_SELECT}:{profile.telegram_id}")]
+                for number, profile in enumerate(chunk, start=1)]
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(MESSAGES["picker_back_button"],
+                                            callback_data=f"{CB_PICK_LIST}:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(MESSAGES["picker_next_button"],
+                                            callback_data=f"{CB_PICK_LIST}:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton(MESSAGES["picker_anyone_button"],
+                                          callback_data=CB_PICK_OPEN)])
+        rows.append([InlineKeyboardButton(MESSAGES["picker_cancel_button"],
+                                          callback_data=CB_PICK_CANCEL)])
+
+        # RECORD BEFORE SENDING.
+        picker_views[user_id] = {
+            'queue_id': queue_id,
+            'page': page,
+            'ids': [p.telegram_id for p in chunk],
+            'rendered_at': utcnow(),
+        }
+
+        await self._send_or_edit(query, context, user_id, text,
+                                 InlineKeyboardMarkup(rows), parse_mode='HTML')
+        return True
+
+    async def _handle_picker_number(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                    message_text: str) -> None:
+        """A typed number. Converges on the same _choose_supporter the buttons use."""
+        user_id = update.effective_user.id
+        queue_id = user_to_queue_map.get(user_id)
+        if not queue_id:
+            # State drift: they are CHOOSING_SUPPORTER with no request.
+            user_states[user_id] = UserState.IDLE
+            await update.message.reply_text(MESSAGES["not_in_queue"])
+            return
+
+        view = picker_views.get(user_id)
+        # NO GUESSING when there is no view. This is the post-restart path -- picker_views
+        # is deliberately not persisted -- and a number read against a list we never
+        # rendered could select somebody the requester has never seen.
+        if view is None or view.get('queue_id') != queue_id:
+            await self._render_picker(None, context, user_id, queue_id, 0,
+                                      MESSAGES["picker_lost_view"])
+            return
+
+        ids = view.get('ids') or []
+        text = (message_text or "").strip()
+        # isascii(): "\u00b2".isdigit() is True but int() raises on it.
+        if not (text.isascii() and text.isdigit()):
+            await self._render_picker(None, context, user_id, queue_id,
+                                      view.get('page', 0), MESSAGES["picker_not_a_number"])
+            return
+
+        number = int(text)
+        if not (1 <= number <= len(ids)):
+            await self._render_picker(None, context, user_id, queue_id,
+                                      view.get('page', 0), MESSAGES["picker_not_a_number"])
+            return
+
+        await self._choose_supporter(None, context, user_id, queue_id, ids[number - 1])
+
+    async def _handle_picker_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """pk_o / pk_l:<page> / pk_s:<member_id> / pk_x, all from the requester."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        data = query.data or ""
+
+        queue_id = user_to_queue_map.get(user_id)
+        entry = self.queue_manager.get_queue_entry(queue_id) if queue_id else None
+        # Ownership, not just existence: user_to_queue_map is keyed by the requester,
+        # so this can only ever be their own request -- assert it anyway.
+        if entry is None or entry.get('user_id') != user_id:
+            await query.answer(MESSAGES["directed_gone"], show_alert=True)
+            return
+
+        if data == CB_PICK_CANCEL:
+            await query.answer()
+            success, _reason = await self.queue_manager.remove_from_queue(user_id)
+            user_states[user_id] = UserState.IDLE
+            picker_views.pop(user_id, None)
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=MESSAGES["queue_cancelled"] if success else MESSAGES["cancel_error"])
+            except Exception as exc:
+                logger.warning("Could not confirm cancellation to %s: %s", user_id, exc)
+            return
+
+        if data == CB_PICK_OPEN:
+            await query.answer()
+            if not await self.queue_manager.route_to_open_queue(queue_id):
+                try:
+                    await context.bot.send_message(chat_id=user_id,
+                                                   text=MESSAGES["channel_error"])
+                except Exception as exc:
+                    logger.warning("Could not report the channel error to %s: %s",
+                                   user_id, exc)
+            return
+
+        if data.startswith(CB_PICK_LIST + ":"):
+            await query.answer()
+            try:
+                page = int(data.split(":", 1)[1])
+            except (IndexError, TypeError, ValueError):
+                page = 0
+            await self._render_picker(query, context, user_id, queue_id, page)
+            return
+
+        # CB_PICK_SELECT
+        await query.answer()
+        try:
+            member_id = int(data.split(":", 1)[1])
+        except (IndexError, TypeError, ValueError):
+            await self._render_picker(query, context, user_id, queue_id, 0,
+                                      MESSAGES["picker_not_a_number"])
+            return
+        await self._choose_supporter(query, context, user_id, queue_id, member_id)
+
+    async def _choose_supporter(self, query, context, user_id: int, queue_id: str,
+                                member_id: int) -> None:
+        """THE ONE send path, reached identically by a tapped button and a typed number."""
+        outcome = await self.queue_manager.send_directed_request(queue_id, member_id)
+
+        if outcome == 'ok':
+            entry = self.queue_manager.get_queue_entry(queue_id)
+            svc = get_service(entry.get('service')) if entry else None
+            profile = svc.roster.profile(member_id) if svc is not None else None
+            name = profile.display_name if profile is not None else ""
+            picker_views.pop(user_id, None)
+            await self._send_or_edit(
+                query, context, user_id,
+                MESSAGES["directed_sent"].format(name=html.escape(name) or "them"),
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
+                                          callback_data=CB_PICK_OPEN)],
+                    [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
+                                          callback_data=CB_PICK_CANCEL)],
+                ]), parse_mode='HTML')
+            return
+
+        if outcome == 'busy':
+            await self._render_picker(query, context, user_id, queue_id, 0,
+                                      MESSAGES["picker_busy"])
+            return
+
+        if outcome == 'unreachable':
+            await self._render_picker(query, context, user_id, queue_id, 0,
+                                      MESSAGES["picker_unreachable"])
+            return
+
+        # 'gone': the request itself has moved on. Say nothing about supporters.
+        picker_views.pop(user_id, None)
+        await self._send_or_edit(query, context, user_id, MESSAGES["directed_gone"])
+
+    async def _handle_directed_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """dr_a:<sid> / dr_d:<sid>, from the targeted supporter."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        data = query.data or ""
+        accepting = data.startswith(CB_DIRECT_ACCEPT + ":")
+        queue_id = data.split(":", 1)[1] if ":" in data else ""
+
+        if accepting:
+            # The SAME guards the channel claim path applies, re-applied here rather
+            # than assumed: a targeted supporter is still a member with their own life.
+            if self.queue_manager.is_user_in_queue(user_id):
+                await query.answer(MESSAGES["member_cancel_before_claim"], show_alert=True)
+                return
+            if self.session_manager.get_session_by_user(user_id):
+                await query.answer(
+                    "You are already in a conversation. End it first before claiming a new one.",
+                    show_alert=True)
+                return
+
+            entry = self.queue_manager.get_queue_entry(queue_id)
+            service_key = entry.get('service', 'hf') if entry else 'hf'
+
+            member_name = query.from_user.first_name or f"Member #{user_id}"
+            if query.from_user.last_name:
+                member_name += f" {query.from_user.last_name}"
+            member_telehandle = f"@{query.from_user.username}" if query.from_user.username else None
+
+            try:
+                result, requester_id = await self.queue_manager.accept_directed(
+                    queue_id, user_id, member_name, member_telehandle)
+            except SelfClaimError:
+                await query.answer("You can't claim your own request.", show_alert=True)
+                return
+
+            if result == 'not_yours':
+                await query.answer("This request was sent to a different supporter.",
+                                   show_alert=True)
+                return
+            if result != 'ok' or requester_id is None:
+                await query.answer(MESSAGES["directed_gone"], show_alert=True)
+                return
+
+            await self._start_claimed_conversation(context, queue_id, requester_id,
+                                                   user_id, service_key)
+            await query.answer("Conversation claimed successfully!")
+            return
+
+        # --- declining -------------------------------------------------------
+        entry = self.queue_manager.get_queue_entry(queue_id)
+        name = ""
+        if entry is not None:
+            profile = get_service(entry.get('service')).roster.profile(user_id)
+            name = profile.display_name if profile is not None else ""
+
+        if not await self.queue_manager.undirect(queue_id, user_id, reason='declined',
+                                                 notify_member=False):
+            # We did NOT win the transition, so the requester hears nothing at all --
+            # somebody else already moved this request.
+            await query.answer(MESSAGES["directed_gone"], show_alert=True)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        await query.answer()
+        try:
+            await context.bot.send_message(chat_id=user_id, text=MESSAGES["decline_ack"])
+        except Exception as exc:
+            logger.warning("Could not acknowledge the decline to %s: %s", user_id, exc)
+
+        entry = self.queue_manager.get_queue_entry(queue_id)
+        if entry is not None:
+            await self.queue_manager._offer_next_step(entry, "directed_unavailable", name)
 
     async def _handle_service_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the requester's landing-page service selection (Phase 2 chooser)."""

@@ -115,6 +115,9 @@ jobs:
       - name: tests/test_pss_flow.py
         run: python tests/test_pss_flow.py
 
+      - name: tests/test_member_profiles.py
+        run: python tests/test_member_profiles.py
+
       - name: tests/test_per_service_timers.py
         run: python tests/test_per_service_timers.py
 
