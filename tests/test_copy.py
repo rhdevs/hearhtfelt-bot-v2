@@ -159,7 +159,13 @@ def test_requester_facing_copy_never_blames_a_supporter():
     keys = [k for k in NO_BLAME_KEYS if k in MESSAGES]
     keys += [k for k in MESSAGES if k.startswith("released_")]
     keys += [k for k in REGISTRATION_APPLICANT_KEYS if k in MESSAGES]
-    assert len(keys) >= 15, (
+    # Raised from 15 in step with the pool this scan walks. The three sources
+    # above currently supply 17 + 3 + 8 = 28 keys; at 15 the floor had drifted
+    # to thirteen keys of slack, so more than half the requester-facing copy
+    # could have vanished from MESSAGES without this guard noticing. Zero
+    # headroom is the convention in this file: raise it when the pool grows,
+    # never lower it.
+    assert len(keys) >= 28, (
         "far fewer requester-facing keys than expected (%d); this scan would be "
         "nearly vacuous: %s" % (len(keys), sorted(keys)))
     for key in keys:

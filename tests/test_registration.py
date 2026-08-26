@@ -1198,7 +1198,8 @@ async def case_z_an_approved_supporter_becomes_pickable_once_named():
 
 async def case_aa_every_registration_string_passes_the_copy_guards():
     keys = [k for k in MESSAGES if k.startswith("registration_")]
-    assert len(keys) >= 20, (
+    # 21 registration_* keys exist; zero headroom, house convention.
+    assert len(keys) >= 21, (
         "far fewer registration keys than expected (%d); this scan would be "
         "nearly vacuous: %s" % (len(keys), sorted(keys)))
     for key in keys:
@@ -1413,8 +1414,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 30, (
-        "expected at least 30 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 31, (
+        "expected at least 31 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )
