@@ -1,3 +1,4 @@
+import datetime
 import html
 import logging
 import re
@@ -9,6 +10,9 @@ from config import (
     closing_text,
     CB_DIRECT_DECLINE,
     CB_PICK_CANCEL,
+    CB_REG_APPROVE,
+    CB_REG_REJECT,
+    REGISTRATION_REAPPLY_HOURS,
     CB_PICK_LIST,
     CB_PICK_OPEN,
     CB_PICK_SELECT,
@@ -23,6 +27,14 @@ from config import (
     PHOTO_SHARING_ENABLED,
     is_any_member,
     is_member_of_service,
+    # Imported as FUNCTIONS, never as the REGISTRATION_ADMINS frozenset itself:
+    # this module imports from config BY VALUE, so a rebind of that frozenset
+    # would be invisible here. A function defined inside config.py reads config's
+    # own global at call time, which is what makes the allowlist testable and
+    # what makes "evaluated at DECISION time" true. See config.py.
+    is_registration_admin,
+    registration_admin_ids,
+    registration_is_enabled,
     enabled_services,
     default_service_key,
     get_service,
@@ -31,7 +43,7 @@ from config import (
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager, SelfClaimError
 from src.database.manager import db_mgr
-from src.timeutil import utcnow
+from src.timeutil import ensure_aware_utc, format_hhmm, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -374,7 +386,550 @@ class BotHandlers:
                                requester_id, exc)
 
         await update.message.reply_text(MESSAGES["released_member"])
-    
+
+    # --- self-service supporter registration (/register) --------------------
+    #
+    # Approval here grants somebody the ability to read messages from students in
+    # crisis. Every gate below is a deliberate refusal, not a convenience check,
+    # and the ORDER of them is load-bearing. See D33-D45.
+
+    # Telegram error text that means "this chat does not exist / we are not
+    # allowed to write to it", as opposed to a transient failure. One tuple, two
+    # readers: the admin fan-out (which escalates to ERROR and points at R13) and
+    # the post-approval DM (which clears has_started_bot so the picker never
+    # offers somebody the bot cannot reach). Identical rule to D16.
+    _UNREACHABLE_MARKERS = ("bot can't initiate", "can't initiate conversation",
+                            "blocked", "forbidden")
+
+    @staticmethod
+    def _looks_unreachable(exc) -> bool:
+        lowered = str(exc).lower()
+        return any(marker in lowered for marker in BotHandlers._UNREACHABLE_MARKERS)
+
+    async def register_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /register: a prospective supporter asks to join the team."""
+        user = update.effective_user
+        user_id = user.id
+
+        # 1. INERTNESS GATE #1. With an empty allowlist there is nobody who could
+        #    ever approve, so the command must be indistinguishable from one that
+        #    does not exist. This string is BYTE-IDENTICAL to what handle_message
+        #    sends for gibberish and what _set_availability sends to a non-member.
+        #    Confirming the command exists would advertise a recruitment surface
+        #    to somebody who opened this bot in distress. D41/D42.
+        if not registration_is_enabled():
+            await update.message.reply_text(MESSAGES["unknown_command"])
+            return
+
+        # 2. Private chat only, and NOTHING is said in the group. A /register in a
+        #    group would broadcast the applicant's intent to that group, and a
+        #    group message is not proof the bot may DM them -- which is the entire
+        #    point of capturing this. An update with no effective_chat at all
+        #    lands here too: _is_private_chat fails CLOSED. Note the deliberate
+        #    absence of any update.message.reply_text on this path.
+        if not self._is_private_chat(update):
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=MESSAGES["registration_private_only"])
+            except Exception as exc:
+                # Usually expected: there is no private chat, which is the point.
+                logger.info("Could not nudge %s to /register privately: %s",
+                            user_id, exc)
+            logger.info("Ignored a /register from %s sent outside a private chat",
+                        user_id)
+            return
+
+        # 3. Degraded mode fails CLOSED. A memory-only registration would evaporate
+        #    on restart while the applicant believed it pending, and there would be
+        #    no atomic gate at all. Same precedent as /release. D36/R12.
+        if not db_mgr.db_available:
+            logger.warning("/register from %s refused: our records are offline",
+                           user_id)
+            await update.message.reply_text(MESSAGES["registration_unavailable"])
+            return
+
+        # 4. Already on a roster. The ROSTER-WIDE check, deliberately not
+        #    is_any_member(): that one filters on svc.enabled, so a member of a
+        #    track that is not switched on yet would be told to register again.
+        if any(user_id in s.roster for s in SERVICES.values()):
+            # Free and correct here: this IS a private message from them.
+            self._record_bot_started(user_id)
+            await update.message.reply_text(MESSAGES["registration_already_member"])
+            return
+
+        # 5. Duplicate pending. Mongo-backed, so it survives a restart.
+        existing = db_mgr.get_pending_registration(user_id)
+        if existing:
+            if existing.get('admin_messages'):
+                await update.message.reply_text(
+                    MESSAGES["registration_already_pending"])
+                return
+            # Nobody was ever SHOWN this row: the previous attempt died between
+            # creation and fan-out. A request nobody has seen is not a pending
+            # request, and without this branch one crash blocks that person
+            # forever. Supersede it and fall through to a fresh one.
+            logger.warning("Superseding registration %s for %s: the row was created "
+                           "but never delivered to any admin",
+                           existing.get('registration_id'), user_id)
+            try:
+                db_mgr.close_registration(existing.get('registration_id'),
+                                          'never_delivered')
+            except Exception as exc:
+                logger.warning("Could not close undelivered registration %s: %s",
+                               existing.get('registration_id'), exc)
+
+        # 6. Cooldown after a decision. If the timestamp is unusable we ALLOW:
+        #    fail toward letting a person reach a human, never toward silently
+        #    blocking them on a clock we cannot trust. D43.
+        last = db_mgr.get_last_decided_registration(user_id)
+        if last and last.get('status') == 'rejected':
+            decided_at = ensure_aware_utc(last.get('decided_at'))
+            if decided_at is None:
+                logger.warning("Registration %s for %s carries an unusable "
+                               "decided_at (%r); allowing the re-application rather "
+                               "than blocking somebody on a clock we cannot trust",
+                               last.get('registration_id'), user_id,
+                               last.get('decided_at'))
+            elif (utcnow() - decided_at
+                    < datetime.timedelta(hours=REGISTRATION_REAPPLY_HOURS)):
+                await update.message.reply_text(MESSAGES["registration_cooldown"])
+                return
+
+        # 7. Fan-out targets. EXCLUDING THE APPLICANT closes the only
+        #    self-elevation path at source: an admin who runs /register on
+        #    themselves never receives a card they could tap.
+        targets = [a for a in registration_admin_ids() if a != user_id]
+        if not targets:
+            logger.error("/register from %s can be sent to nobody: the only "
+                         "registration admin is the applicant themselves", user_id)
+            await update.message.reply_text(MESSAGES["registration_unavailable"])
+            return
+
+        # 8. Create the row BEFORE the fan-out, so a crash mid-fan-out still leaves
+        #    something a surviving admin's card can act on. Step 5's
+        #    empty-admin_messages clause is the counterweight.
+        attempt = db_mgr.count_registrations(user_id) + 1
+        registration_id = db_mgr.create_registration(
+            user_id, username=user.username, first_name=user.first_name,
+            last_name=user.last_name, attempt=attempt)
+        if not registration_id:
+            logger.error("Could not create a registration row for applicant %s",
+                         user_id)
+            await update.message.reply_text(MESSAGES["registration_unavailable"])
+            return
+
+        # Render from the STORED document where we can, so the card an admin sees
+        # now is built the same way as the settled card after a restart.
+        reg = db_mgr.get_registration(registration_id) or {
+            'registration_id': registration_id, 'telegram_id': user_id,
+            'username': user.username, 'first_name': user.first_name,
+            'last_name': user.last_name, 'created_at': utcnow(),
+            'attempt': attempt,
+        }
+
+        # 9. Fan out, in the deterministic sorted order. NEVER raises out of the
+        #    loop: one unreachable admin must not cost the other one their card.
+        card = self._registration_card(reg)
+        keyboard = self._registration_keyboard(registration_id)
+        delivered = []
+        for admin_id in targets:
+            try:
+                sent = await context.bot.send_message(
+                    chat_id=admin_id, text=card, reply_markup=keyboard,
+                    parse_mode='HTML')
+            except Exception as exc:
+                if self._looks_unreachable(exc):
+                    logger.error(
+                        "Registration admin %s cannot be DMed by the bot. They must "
+                        "send the bot /start (or any private message) before they "
+                        "can approve anybody. See runbook R13. (%s)", admin_id, exc)
+                else:
+                    logger.warning("Could not send the registration card to admin "
+                                   "%s: %s", admin_id, exc)
+                continue
+            message_id = getattr(sent, "message_id", None)
+            if message_id is None:
+                # A card we cannot address is a card whose buttons we could never
+                # strip later. Do not record it as delivered.
+                logger.warning("The registration card sent to admin %s returned no "
+                               "message_id; its buttons could not be settled later",
+                               admin_id)
+                continue
+            delivered.append({'admin_id': admin_id, 'message_id': message_id})
+
+        # 10. Outcome.
+        if delivered:
+            try:
+                db_mgr.set_registration_admin_messages(registration_id, delivered)
+            except Exception as exc:
+                logger.warning("Could not record the admin cards for registration "
+                               "%s: %s", registration_id, exc)
+            logger.info("Registration %s from %s was sent to %d of %d admins",
+                        registration_id, user_id, len(delivered), len(targets))
+            await update.message.reply_text(MESSAGES["registration_submitted"])
+            return
+
+        # NOBODY was reached. The applicant must NEVER be told this is pending.
+        # Somebody who has just volunteered, believing their offer is with the team
+        # when in fact nobody will ever see it, is the worst available outcome --
+        # so the row is closed and they are told honestly. See D34 and M28.
+        try:
+            db_mgr.close_registration(registration_id, 'undeliverable')
+        except Exception as exc:
+            logger.warning("Could not close undeliverable registration %s: %s",
+                           registration_id, exc)
+        logger.error("REGISTRATION UNDELIVERABLE: none of the %d registration admins "
+                     "could be DMed for applicant %s; the request has NOT been "
+                     "submitted. Every admin must send the bot a private message "
+                     "before they can be reached. See runbook R13.",
+                     len(targets), user_id)
+        await update.message.reply_text(MESSAGES["registration_unavailable"])
+
+    def _registration_card(self, reg: dict, footer: str = "") -> str:
+        """The admin-facing card, built from the STORED document.
+
+        From the document and never from memory, so the settled edit after a
+        restart renders identically to the card that was originally sent -- after
+        a restart the document is the only thing that still exists.
+
+        parse_mode='HTML', so every Telegram-supplied string goes through
+        html.escape: a first name of "<b>" would otherwise break the parse and the
+        card would never send at all.
+        """
+        first = (reg.get('first_name') or "").strip()
+        last = (reg.get('last_name') or "").strip()
+        name = (first + " " + last).strip() or "not set"
+
+        username = (reg.get('username') or "").strip()
+        if username:
+            # Add the '@' only if it is not already stored with one.
+            username = username if username.startswith("@") else "@" + username
+        else:
+            username = "not set"
+
+        try:
+            attempt = int(reg.get('attempt') or 1)
+        except (TypeError, ValueError):
+            attempt = 1
+
+        lines = [
+            MESSAGES["registration_card_title"],
+            "",
+            "Name: " + html.escape(name),
+            "Username: " + html.escape(username),
+            "Telegram id: " + html.escape(str(reg.get('telegram_id'))),
+            "Asked: " + format_hhmm(reg.get('created_at')),
+        ]
+        if attempt > 1:
+            lines.append("Previous requests: %d" % (attempt - 1))
+        lines += ["", MESSAGES["registration_card_note"]]
+        if footer:
+            lines += ["", footer]
+        return "\n".join(lines)
+
+    def _registration_keyboard(self, registration_id: str) -> InlineKeyboardMarkup:
+        """One Approve row per service, plus one reject row.
+
+        Iterates SERVICES rather than enabled_services(), deliberately:
+        refresh_all_rosters syncs EVERY service regardless of `enabled`, so
+        approving into a track that has not been switched on yet is meaningful and
+        is how a roster gets built before launch. sorted() by key so the button
+        order -- and therefore every callback_data in the tests -- is deterministic.
+        """
+        rows = []
+        for svc in sorted(SERVICES.values(), key=lambda s: s.key):
+            rows.append([InlineKeyboardButton(
+                MESSAGES["registration_approve_button"].format(member=svc.member_label),
+                callback_data=f"{CB_REG_APPROVE}:{registration_id}:{svc.key}")])
+        rows.append([InlineKeyboardButton(
+            MESSAGES["registration_reject_button"],
+            callback_data=f"{CB_REG_REJECT}:{registration_id}")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _strip_registration_buttons(self, query) -> None:
+        """Best-effort removal of the buttons on the card that was just tapped.
+
+        Only the tapper's own card. The other admins' cards are rewritten by
+        _settle_registration_cards, which the LOSER of a race deliberately does
+        not run -- the winner settles every card, including the loser's.
+        """
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as exc:
+            logger.warning("Could not strip the buttons on a settled registration "
+                           "card: %s", exc)
+
+    async def _handle_registration_callback(self, update: Update,
+                                            context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Approve / Not now on a registration card.
+
+        THE AWAITS ARE THE DESIGN. Between the parse and the atomic gate there is
+        not one await on the path that goes on to decide: every `await
+        query.answer(...)` below sits on a branch that returns immediately. A
+        yield point before the gate would let two taps both clear the cheap
+        status pre-check before either reached Mongo.
+        """
+        query = update.callback_query
+        admin_id = query.from_user.id
+        data = query.data or ""
+
+        # 1. AUTHORIZATION. THE FIRST STATEMENT OF THIS FUNCTION, and the sole
+        #    entry point to decide_registration anywhere in the codebase.
+        #
+        #    Deliberately the same string the membership gate uses, so a refusal
+        #    tells a rostered supporter and a total stranger exactly the same
+        #    thing. With REGISTRATION_ADMINS empty this refuses EVERYONE:
+        #    inertness gate #2, reading the same frozenset as gate #1.
+        #
+        #    Evaluated HERE, at DECISION time, not at fan-out time: an admin
+        #    removed from the allowlist between receiving a card and tapping it is
+        #    refused, and a card that leaks to anybody else is inert. D40.
+        if not is_registration_admin(admin_id):
+            await query.answer("You are not authorized to perform this action.",
+                               show_alert=True)
+            return
+
+        # 2. Parse. Approve carries a service, reject does not.
+        approving = data.startswith(CB_REG_APPROVE + ":")
+        parts = data.split(":", 2)
+        if approving:
+            if len(parts) != 3 or not parts[1] or not parts[2]:
+                await query.answer(MESSAGES["registration_gone"], show_alert=True)
+                return
+            registration_id, service_key = parts[1], parts[2]
+        else:
+            if len(parts) != 2 or not parts[1]:
+                await query.answer(MESSAGES["registration_gone"], show_alert=True)
+                return
+            registration_id, service_key = parts[1], None
+
+        # 3. Approve only: the service must EXIST. Deliberately NOT get_service(),
+        #    which falls back to HF for an unknown key -- a mangled or truncated
+        #    callback would then silently put somebody on the HF roster.
+        svc = None
+        if approving:
+            if service_key not in SERVICES:
+                logger.warning("Registration callback named an unknown service %r",
+                               service_key)
+                await query.answer(MESSAGES["registration_gone"], show_alert=True)
+                return
+            svc = SERVICES[service_key]
+
+        # 4. Records offline: nothing is written, nothing is sent, and the buttons
+        #    are deliberately LEFT LIVE so the very same tap works once Mongo is
+        #    back. D35.
+        if not db_mgr.db_available:
+            await query.answer(MESSAGES["registration_db_offline"], show_alert=True)
+            return
+
+        # 5. Resolved from Mongo on every callback -- there is no in-memory
+        #    registration index anywhere, which is why restore.py needs no new
+        #    pass and a redeploy leaves live buttons fully functional. D35.
+        reg = db_mgr.get_registration(registration_id)
+        if reg is None:
+            await query.answer(MESSAGES["registration_gone"], show_alert=True)
+            await self._strip_registration_buttons(query)
+            return
+
+        try:
+            applicant = int(reg['telegram_id'])
+        except (KeyError, TypeError, ValueError):
+            logger.error("Registration %s carries an unusable telegram_id %r",
+                         registration_id, reg.get('telegram_id'))
+            await query.answer(MESSAGES["registration_gone"], show_alert=True)
+            return
+
+        # 6. Self-decision guard. register_command already keeps an admin off their
+        #    own fan-out, but a STALE card from an earlier attempt could still be
+        #    tapped. Belt and braces on the one path that grants privilege to the
+        #    person doing the tapping. M29.
+        if applicant == admin_id:
+            await query.answer(MESSAGES["registration_self_decision"],
+                               show_alert=True)
+            return
+
+        # 7. Cheap pre-check. The atomic gate below is the real one; this exists so
+        #    the ordinary "somebody already handled it" case reads correctly and
+        #    the stale buttons go away.
+        if reg.get('status') != 'pending':
+            await query.answer(MESSAGES["registration_already_handled"],
+                               show_alert=True)
+            await self._strip_registration_buttons(query)
+            return
+
+        # 8. Cross-roster exclusivity, approve only. Membership is exclusive.
+        #    Checked against BOTH memory and Mongo: the in-memory roster is up to
+        #    300s stale, so somebody added by the CLI thirty seconds ago is
+        #    invisible to the memory check alone. Synchronous, so it stays inside
+        #    the pre-gate block. Nothing is decided and the buttons stay live --
+        #    the fix is out-of-band, and the admin should be able to retry. D37.
+        if approving:
+            clash = None
+            for other in SERVICES.values():
+                if other.key == svc.key:
+                    continue
+                in_other = applicant in other.roster
+                if not in_other:
+                    try:
+                        doc = db_mgr.get_member_profile_doc(
+                            applicant, collection=other.members_collection)
+                        in_other = bool(doc) and doc.get('active') is not False
+                    except Exception as exc:
+                        # Fall back to the memory answer and log; an exception here
+                        # must neither refuse nor wave somebody through silently.
+                        logger.warning("Could not check the '%s' roster for %s: %s",
+                                       other.key, applicant, exc)
+                if in_other:
+                    clash = other
+                    break
+            if clash is not None:
+                await query.answer(
+                    MESSAGES["registration_cross_roster"].format(
+                        member=clash.member_label),
+                    show_alert=True)
+                return
+
+        # 9. THE ATOMIC GATE. Synchronous, and immediately before the first await
+        #    of the winning path. None means THIS CALLER LOST: some other tap
+        #    already settled the row. Two simultaneous Approves, an Approve racing
+        #    a Reject, and a plain double-tap all arrive here, and the loser writes
+        #    no roster, sends the applicant NOTHING AT ALL, and only tidies its own
+        #    buttons away.
+        decided = db_mgr.decide_registration(
+            registration_id, admin_id,
+            'approved' if approving else 'rejected',
+            service_key if approving else None)
+        if decided is None:
+            await query.answer(MESSAGES["registration_already_handled"],
+                               show_alert=True)
+            await self._strip_registration_buttons(query)
+            return
+
+        # --- WINNER. Roster first, then the ack, then the applicant. ----------
+        write_failed = False
+        if approving:
+            try:
+                prior = db_mgr.get_member_profile_doc(
+                    applicant, collection=svc.members_collection)
+            except Exception as exc:
+                prior = None
+                logger.warning("Could not read the existing '%s' record for %s: %s",
+                               svc.key, applicant, exc)
+            if prior and prior.get('active') is False:
+                # A re-authorization is not the same event as a first approval and
+                # must be visible in the logs.
+                logger.warning("Registration %s RE-ACTIVATES %s on the '%s' roster; "
+                               "they had previously been deactivated",
+                               registration_id, applicant, svc.key)
+
+            # add_authorized_member is the existing idempotent upsert, so approving
+            # somebody a CLI add already created simply re-confirms them. It must
+            # come FIRST: mark_member_started does NOT upsert, and with no document
+            # there would be nothing for it to set.
+            if not db_mgr.add_authorized_member(
+                    applicant, username=reg.get('username'), active=True,
+                    collection=svc.members_collection):
+                write_failed = True
+                logger.error("Registration %s: could not add %s to the '%s' roster",
+                             registration_id, applicant, svc.key)
+            elif not db_mgr.mark_member_started(
+                    applicant, True, collection=svc.members_collection):
+                # /register is BY CONSTRUCTION a private message from the
+                # applicant, which is exactly the claim has_started_bot encodes.
+                # D39.
+                write_failed = True
+                logger.error("Registration %s: could not record has_started_bot for "
+                             "%s on '%s'", registration_id, applicant, svc.key)
+
+            # In memory too, so they can claim immediately instead of waiting out
+            # the 300s roster refresh. NOTE: .add() creates NO profile, so they are
+            # claim-authorized and PICKER-INVISIBLE until somebody sets a display
+            # name. That is the intended behaviour, not an oversight -- it is the
+            # staged-rollout lever for the whole picker feature. D38/R15.
+            # mark_started is a no-op while there is no profile; it matters on the
+            # re-activation path, where one already exists and would otherwise
+            # disagree with Mongo until the next refresh.
+            svc.roster.add(applicant)
+            svc.roster.mark_started(applicant, True)
+
+        # The first await of the winning path: a plain ack.
+        await query.answer()
+
+        notified = True
+        if approving:
+            text = MESSAGES["registration_approved"].format(member=svc.member_label)
+        else:
+            # VERBATIM from MESSAGES. No .format(), no concatenation, no
+            # interpolation of any kind: nothing the applicant reads may name or
+            # hint at who decided, or why. D44, and case (m) scans for it.
+            text = MESSAGES["registration_rejected"]
+        try:
+            await context.bot.send_message(chat_id=applicant, text=text)
+        except Exception as exc:
+            notified = False
+            logger.warning("Could not tell applicant %s the outcome of registration "
+                           "%s: %s", applicant, registration_id, exc)
+            if approving and self._looks_unreachable(exc):
+                # Self-healing, identical to D16: an approved supporter who has
+                # since blocked the bot must never be offered in the picker, and
+                # returns automatically the next time they message it. A block is
+                # not grounds to undo an approval, so the roster write STANDS.
+                try:
+                    db_mgr.mark_member_started(applicant, False,
+                                               collection=svc.members_collection)
+                except Exception as inner:
+                    logger.warning("Could not clear has_started_bot for %s: %s",
+                                   applicant, inner)
+                svc.roster.mark_started(applicant, False)
+
+        await self._settle_registration_cards(
+            context, decided, query.from_user, svc if approving else None,
+            notified, write_failed)
+
+    async def _settle_registration_cards(self, context, decided: dict, approver,
+                                         svc, notified: bool,
+                                         write_failed: bool) -> None:
+        """Rewrite EVERY admin's card to a settled state and strip its buttons.
+
+        NEVER RAISES. Each edit is wrapped individually, so one admin who has
+        since blocked the bot cannot stop the other admin's card being settled.
+        An admin whose original DM failed has no admin_messages entry and is
+        simply skipped -- there is no message to edit.
+
+        Naming the approver here is deliberate and safe: the audience is the
+        allowlist itself, and on a team that small, accountability for who granted
+        read access to crisis conversations is worth more than mutual anonymity
+        among the approvers. It never reaches the applicant --
+        registration_approved and registration_rejected carry no approver slot at
+        all, and nothing on this path sends to the applicant. D44.
+        """
+        name = (getattr(approver, "first_name", None)
+                or getattr(approver, "username", None)
+                or "admin %s" % getattr(approver, "id", "?"))
+        approver_text = html.escape(str(name))
+
+        if svc is not None:
+            footer = MESSAGES["registration_settled_approved"].format(
+                member=html.escape(svc.member_label), approver=approver_text)
+        else:
+            footer = MESSAGES["registration_settled_rejected"].format(
+                approver=approver_text)
+        if not notified:
+            footer += "\n" + MESSAGES["registration_settled_unreachable"]
+        if write_failed:
+            footer += "\n" + MESSAGES["registration_settled_write_failed"]
+
+        text = self._registration_card(decided, footer)
+        for entry in (decided.get('admin_messages') or []):
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=entry['admin_id'], message_id=entry['message_id'],
+                    text=text, reply_markup=None, parse_mode='HTML')
+            except Exception as exc:
+                logger.warning("Could not settle the registration card in admin "
+                               "%s's chat: %s", entry.get('admin_id'), exc)
+
     def _open_request_status_text(self, user_id: int) -> str:
         """One description of an existing open request, shared by /status and /chat.
 
@@ -601,6 +1156,25 @@ class BotHandlers:
                 or data.startswith(CB_PICK_LIST + ":")
                 or data.startswith(CB_PICK_SELECT + ":")):
             await self._handle_picker_callback(update, context)
+            return
+
+        # Registration approval. BEFORE the membership gate, with its own and
+        # strictly narrower gate inside _handle_registration_callback.
+        #
+        # Placing these after the gate would be wrong in BOTH directions. Wrong one
+        # way: a registration admin need not be on any roster at all -- the owner
+        # and the welfare director may be neither an HF nor a PSS member -- so the
+        # gate would refuse the only people entitled to decide. Wrong the other
+        # way: passing the gate proves only "is on SOME roster", which is not the
+        # authorization we want here. A rostered HF companion must not be able to
+        # approve a PSS supporter, and after this change no roster membership
+        # grants any approval power at all: claiming a conversation and granting
+        # somebody else the ability to read one are different privileges. So this
+        # goes before the gate carrying its own, exactly as svc_ and pk_* do for
+        # requesters. D40.
+        if (data.startswith(CB_REG_APPROVE + ":")
+                or data.startswith(CB_REG_REJECT + ":")):
+            await self._handle_registration_callback(update, context)
             return
 
         # Membership gate first, matching the original ordering: any non-svc action by a
