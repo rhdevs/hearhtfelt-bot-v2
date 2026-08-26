@@ -1286,6 +1286,59 @@ async def case_ab_the_real_mongo_filters_name_the_state_they_leave():
     print("OK  ab. the real Mongo filters each name the state they are leaving")
 
 
+async def case_ac_an_unusable_directed_clock_waits_instead_of_vanishing():
+    """A directed request whose `directed_at` is unusable must neither be messaged
+    about nor destroyed.
+
+    Treating it as infinitely old lands in the stale branch, which closes the row and
+    tells NOBODY -- a person in distress simply stops having a request. Treating it as
+    infinitely old and notifying is worse: that is messaging on a timestamp we already
+    know is wrong, which is what this sweep exists to prevent.
+
+    So the clock is repaired and the request waits, exactly as
+    restore._restore_pending does with the same bad value.
+    """
+    bot, sm, qm, handlers, stub = setup(supporters=1)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+    entry = config.queue_entries[queue_id]
+    assert entry['routing'] == 'directed'
+
+    for bad in (None, utcnow() + datetime.timedelta(days=2)):
+        entry['directed_at'] = bad
+        before = len(bot.sent)
+
+        assert await qm.sweep_directed_requests() == [], (
+            "an unusable clock is not an outcome to act on: %r" % (bad,))
+
+        assert queue_id in config.queue_entries, (
+            "the request must survive a clock we cannot read: %r" % (bad,))
+        assert config.queue_entries[queue_id]['routing'] == 'directed'
+        assert config.directed_by_member[supporter_id(0)] == queue_id
+        assert stub.ended.get(queue_id) is None, (
+            "never 'stale_startup_sweep' on a request that is not provably old",
+            stub.ended)
+        assert bot.sent[before:] == [], (
+            "and NOBODY is messaged on a timestamp we know is wrong: %r"
+            % (bot.sent[before:],))
+
+        repaired = config.queue_entries[queue_id]['directed_at']
+        assert repaired is not None and repaired <= utcnow(), (
+            "the clock is repaired to a real, ageing timestamp so this cannot loop "
+            "forever", repaired)
+
+    # And the repair does not disarm the lapse: wound past the window it hands back.
+    config.queue_entries[queue_id]['directed_at'] = (
+        utcnow() - datetime.timedelta(minutes=config.get_service("pss").directed_response_minutes + 5))
+    acted = await qm.sweep_directed_requests()
+    assert [a['outcome'] for a in acted] == ['lapsed'], acted
+    print("OK  ac. an unusable directed clock waits and is repaired, not silently destroyed")
+
+
 # --------------------------------------------------------------------------- runner
 CASES = [
     case_a_fork_appears_and_nothing_reaches_the_channel,
@@ -1315,6 +1368,7 @@ CASES = [
     case_y_a_handed_back_request_gets_a_fresh_window,
     case_z_availability_hides_the_busy_and_the_already_asked,
     case_ab_the_real_mongo_filters_name_the_state_they_leave,
+    case_ac_an_unusable_directed_clock_waits_instead_of_vanishing,
 ]
 
 
@@ -1332,7 +1386,7 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 24, (
+    assert len(CASES) >= 25, (
         "expected at least 24 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")

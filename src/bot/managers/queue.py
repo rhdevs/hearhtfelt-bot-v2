@@ -823,17 +823,30 @@ class QueueManager:
             target = entry.get('target_member_id')
 
             directed = ensure_aware_utc(entry.get('directed_at'))
-            if directed is None:
-                # Unusable clock. restore._restore_pending already repairs this at
-                # boot, so reaching here means something else wrote a bad value; we
-                # treat it as infinitely old, which lands in the SILENT branch below.
-                # Messaging on a timestamp we cannot trust is the failure this whole
+            if directed is None or directed > now:
+                # Unusable clock. REPAIR IT AND WAIT -- exactly what
+                # restore._restore_pending does with the same bad value, and for the
+                # same reason.
+                #
+                # The two obvious alternatives are both wrong. Treating it as
+                # infinitely old lands in the silent branch below and DESTROYS a live
+                # request: the requester is told nothing, ever, and one bad write
+                # across many rows quietly deletes all of them. Treating it as
+                # infinitely old but notifying is worse still -- that is messaging on
+                # a timestamp we know we cannot trust, which is the exact failure this
                 # sweep exists to prevent.
-                logger.warning("Directed request %s has no usable directed_at; "
-                               "closing it silently", queue_id)
-                idle = float('inf')
-            else:
-                idle = (now - directed).total_seconds() / 60.0
+                #
+                # Failing toward waiting sends nobody anything now, keeps the request
+                # alive, and lets it resolve normally one window from here. It cannot
+                # loop: the repaired value is a real timestamp that ages.
+                logger.warning("Directed request %s has an unusable directed_at (%r); "
+                               "treating it as just sent rather than messaging on a "
+                               "clock we cannot trust", queue_id,
+                               entry.get('directed_at'))
+                entry['directed_at'] = now
+                continue
+
+            idle = (now - directed).total_seconds() / 60.0
 
             if idle < svc.directed_response_minutes:
                 continue
