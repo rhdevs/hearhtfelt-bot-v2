@@ -52,6 +52,11 @@ def reset_state():
     config.queue_order.clear()
     config.used_anonymous_ids.clear()
     config.safety_logs.clear()
+    # Phase 5 indices. A suite that forgets these leaks a directed request or a
+    # rendered picker view into whatever runs next, and available_supporters()
+    # silently starts hiding people.
+    config.directed_by_member.clear()
+    config.picker_views.clear()
 
 
 def install(stub):

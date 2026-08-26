@@ -14,6 +14,10 @@ class UserState(Enum):
     WAITING_FOR_DESCRIPTION = "waiting_for_description"
     IN_QUEUE = "in_queue"
     IN_CONVERSATION = "in_conversation"
+    # The requester is at the supporter picker, or at the "what next?" prompt after a
+    # decline or a lapse. A request that has been DMed to one supporter deliberately
+    # reuses IN_QUEUE instead -- they ARE waiting -- so this is the only new state.
+    CHOOSING_SUPPORTER = "choosing_supporter"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID")
@@ -429,6 +433,18 @@ user_to_queue_map = {}    # user_id -> queue_id for fast queue lookups
 queue_order = []          # ordered list of queue_ids for position tracking
 user_to_service_map = {}  # user_id -> chosen service key (set at /chat or via the chooser)
 
+# member_id -> queue_id of the directed request currently sitting with them.
+# Rebuilt at boot by src/bot/restore.py. Feeds available_supporters(), which is why
+# a supporter holding one request is never offered a second.
+directed_by_member: Dict[int, str] = {}
+
+# requester_id -> {'queue_id', 'page', 'ids': [member_id, ...], 'rendered_at'}
+# What the requester last SAW, so a typed number maps to the person whose name was
+# next to that number. MEMORY ONLY, DELIBERATELY NOT PERSISTED: after a restart
+# there is no view, so a typed number is unrecognised and the picker re-renders.
+# Persisting it would let a stale number select a supporter the requester never saw.
+picker_views: Dict[int, dict] = {}
+
 # Anonymous ids are handed out by BOTH QueueManager and SessionManager. They must draw
 # from one set, or a session can be created with an id a queue entry already holds.
 used_anonymous_ids: Set[str] = set()
@@ -524,6 +540,69 @@ MESSAGES = {
     "photo_size_limit": "⚠️ Photo is too large. Please send a smaller image (max 10MB).",
     "photo_error": "❌ Unable to send photo. Please try again or use text instead."
 }
+
+
+def is_supporter_available(service_key: str, member_id: int) -> bool:
+    """True iff this member may be offered in, and DMed by, the picker right now.
+
+    Every clause is a reason a directed request would otherwise strand or double up.
+    Kept as one predicate so the picker, send_directed_request's re-check and the
+    tests all read the same rule -- two copies is how one of them loses a clause.
+    """
+    svc = get_service(service_key)
+    try:
+        member_int = int(member_id)
+    except (TypeError, ValueError):
+        return False
+
+    # 1. Authorized for this track. The roster already excludes active: False.
+    if member_int not in svc.roster:
+        return False
+
+    profile = svc.roster.profile(member_int)
+    if profile is None:
+        return False
+
+    # 2. A curated name to show. No name => nothing the picker can render.
+    if not profile.display_name:
+        return False
+
+    # 3. Telegram forbids a bot messaging a user who has never messaged it. Without
+    #    this the DM raises "bot can't initiate conversation" and the request strands
+    #    with the requester told nothing.
+    if not profile.has_started_bot:
+        return False
+
+    # 4. They said /unavailable.
+    if not profile.available:
+        return False
+
+    # 5. Already in a conversation. Survives a restart via restore._restore_active.
+    if member_int in user_to_session_map:
+        return False
+
+    # 6. Already holding a directed request. Never stack two on one person.
+    if member_int in directed_by_member:
+        return False
+
+    # 7. They are themselves waiting for support.
+    if member_int in user_to_queue_map:
+        return False
+
+    return True
+
+
+def available_supporters(service_key: str) -> List[MemberProfile]:
+    """Pickable supporters for a track, in a DETERMINISTIC, STABLE order.
+
+    Ordering matters more than it looks: the picker is paginated and the tap arrives
+    seconds after the render. Random or dict-insertion order would page-shift a
+    supporter between render and tap, and a typed number would then select somebody
+    the requester never chose. Never iterate a set here.
+    """
+    svc = get_service(service_key)
+    return [p for p in svc.roster.profiles()
+            if is_supporter_available(svc.key, p.telegram_id)]
 
 
 def help_request_text(service_key: Optional[str]) -> str:
