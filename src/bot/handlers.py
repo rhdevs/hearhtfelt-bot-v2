@@ -4,6 +4,7 @@ import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CallbackContext
 from config import (
+    SERVICES,
     UserState,
     user_states,
     user_to_service_map,
@@ -19,6 +20,7 @@ from config import (
 )
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager, SelfClaimError
+from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +29,104 @@ class BotHandlers:
         self.session_manager = session_manager
         self.queue_manager = queue_manager
     
+    @staticmethod
+    def _is_private_chat(update) -> bool:
+        """True only for a genuine one-to-one chat with the bot.
+
+        A callback tapped on a CHANNEL post does not prove a private chat exists, and
+        has_started_bot is precisely the claim "we are allowed to DM this person".
+        getattr, not attribute access: the existing test fakes have no effective_chat
+        at all, and a boot-time AttributeError here would take the bot down.
+        """
+        chat = getattr(update, "effective_chat", None)
+        return chat is not None and getattr(chat, "type", None) == "private"
+
+    def _record_bot_started(self, user_id: int) -> None:
+        """Record that this member has an open chat with the bot.
+
+        Mongo FIRST, memory second: the five-minute roster refresh replaces the
+        in-memory profile map wholesale from Mongo, so a memory-only write is
+        silently reverted within minutes and the supporter never becomes pickable.
+
+        The in-memory short-circuit keeps this a dict lookup rather than a Mongo
+        write on every single message a supporter sends.
+        """
+        for svc in SERVICES.values():
+            if user_id not in svc.roster:
+                continue
+            profile = svc.roster.profile(user_id)
+            if profile is not None and profile.has_started_bot:
+                continue
+            try:
+                db_mgr.mark_member_started(user_id, True,
+                                           collection=svc.members_collection)
+            except Exception as exc:
+                logger.warning("Could not record bot-started for member %s (%s): %s",
+                               user_id, svc.key, exc)
+            svc.roster.mark_started(user_id, True)
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         user_id = update.effective_user.id
         user_states[user_id] = UserState.IDLE
-        
-        await update.message.reply_text(MESSAGES["welcome"])
+
+        text = MESSAGES["welcome"]
+        # /available, /unavailable and /release are member-only, so they are
+        # deliberately NOT in set_my_commands -- that menu is the requester's
+        # surface. This addendum is how a supporter discovers them instead.
+        if self._is_private_chat(update) and is_any_member(user_id):
+            self._record_bot_started(user_id)
+            text = text + "\n\n" + MESSAGES["member_addendum"]
+
+        await update.message.reply_text(text)
+
+    async def available_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Member-only: appear on the list requesters choose from."""
+        await self._set_availability(update, True)
+
+    async def unavailable_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Member-only: stay off that list. Does NOT end an existing conversation and
+        does NOT hand back a directed request already sitting with them."""
+        await self._set_availability(update, False)
+
+    async def _set_availability(self, update: Update, available: bool) -> None:
+        user_id = update.effective_user.id
+
+        svc = next((s for s in SERVICES.values() if user_id in s.roster), None)
+        if svc is None:
+            # The SAME neutral string handle_message sends for gibberish. Confirming
+            # the command exists would tell a stranger who is on the roster.
+            await update.message.reply_text(MESSAGES["unknown_command"])
+            return
+
+        suffix = ""
+        if db_mgr.db_available:
+            written = False
+            try:
+                written = db_mgr.set_member_availability(
+                    user_id, available, collection=svc.members_collection)
+            except Exception as exc:
+                logger.warning("Could not persist availability for member %s: %s",
+                               user_id, exc)
+            if not written:
+                # Memory is deliberately NOT changed: a toggle the next roster
+                # refresh silently reverts is worse than a visible failure, because
+                # the supporter believes they are off the list and is not.
+                await update.message.reply_text(MESSAGES["availability_failed"])
+                return
+            svc.roster.set_available(user_id, available)
+        else:
+            svc.roster.set_available(user_id, available)
+            suffix = "\n\n" + MESSAGES["availability_memory_only"]
+
+        profile = svc.roster.profile(user_id)
+        if profile is None or not profile.display_name:
+            # The toggle was honoured; they just have nothing to render yet.
+            await update.message.reply_text(MESSAGES["availability_needs_profile"] + suffix)
+            return
+
+        text = MESSAGES["now_available"] if available else MESSAGES["now_unavailable"]
+        await update.message.reply_text(text + suffix)
     
     async def chat_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /chat (and its /help alias) to start a support request."""
@@ -189,7 +283,13 @@ class BotHandlers:
         user_id = update.effective_user.id
         message_text = update.message.text
         current_state = user_states.get(user_id, UserState.IDLE)
-        
+
+        # Backfill: ANY private message from a member proves the bot may DM them.
+        # Without this every supporter already on the roster is invisible in the
+        # picker until they happen to type /start again, which most never will.
+        if self._is_private_chat(update) and is_any_member(user_id):
+            self._record_bot_started(user_id)
+
         # Check if user is waiting for description
         if current_state == UserState.WAITING_FOR_DESCRIPTION:
             await self._handle_help_description(update, context, message_text)
@@ -204,9 +304,7 @@ class BotHandlers:
             return
         
         # Default response for messages when not in conversation or waiting for input
-        await update.message.reply_text(
-            "I'm not sure what you mean. Use /chat to start a conversation with a support member."
-        )
+        await update.message.reply_text(MESSAGES["unknown_command"])
     
     async def handle_sticker(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle and relay stickers during an active conversation"""

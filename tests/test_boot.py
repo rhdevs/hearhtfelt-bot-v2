@@ -51,10 +51,11 @@ FAKE_TOKEN = "123456789:AAEyTESTtokenTESTtokenTESTtokenTEST"
 HF_CHANNEL = "-1009000000001"
 PSS_CHANNEL = "-1009000000002"
 
-# The ten callbacks main() registers on the application.
+# Every callback main() registers on the application.
 HANDLER_CALLBACKS = (
     "start_command", "chat_command", "end_command", "status_command",
-    "cancel_command", "handle_message", "handle_sticker", "handle_photo",
+    "cancel_command", "available_command", "unavailable_command",
+    "handle_message", "handle_sticker", "handle_photo",
     "handle_callback_query", "handle_error",
 )
 
@@ -438,7 +439,7 @@ def test_shutdown_runs_the_finally_block():
     )
 
 
-def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
+def test_all_handler_callbacks_are_registered_against_real_ptb():
     """The fake Application records handlers, but CommandHandler / MessageHandler /
     CallbackQueryHandler / filters are the REAL PTB classes, so this is a live check
     that main()'s registration block still constructs under the installed version."""
@@ -477,17 +478,17 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
 
     app = app_holder.get("app")
     assert app is not None, "the fake Application was never built"
-    # 5 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
-    assert len(app.handlers) == 9, (
-        f"main() registered {len(app.handlers)} handlers, expected 9 "
-        f"(5 command, 3 message, 1 callback): {app.handlers!r}"
+    # 7 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
+    assert len(app.handlers) == 11, (
+        f"main() registered {len(app.handlers)} handlers, expected 11 "
+        f"(7 command, 3 message, 1 callback): {app.handlers!r}"
     )
     assert len(app.error_handlers) == 1, f"expected one error handler, got {app.error_handlers!r}"
 
     # WHICH callback is wired to WHICH handler, not just how many there are.
     # Counting handlers and collecting command names leaves every callback
     # identity unchecked: swapping handlers.handle_photo for handlers.handle_sticker
-    # in main.py keeps the count at 9 and the command set identical, so the suite
+    # in main.py keeps the count unchanged and the command set identical, so the suite
     # stayed green while every photo a requester sends went through the sticker
     # path. The same held for handle_message <-> handle_callback_query and for
     # handle_error <-> handle_message.
@@ -498,6 +499,8 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
         ("CommandHandler", "end_command"),
         ("CommandHandler", "status_command"),
         ("CommandHandler", "cancel_command"),
+        ("CommandHandler", "available_command"),
+        ("CommandHandler", "unavailable_command"),
         ("MessageHandler", "handle_message"),
         ("MessageHandler", "handle_sticker"),
         ("MessageHandler", "handle_photo"),
@@ -511,7 +514,11 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
 
     # The two singleton filters, by identity: a swap of the FILTERS rather than the
     # callbacks would leave the list above unchanged.
-    sticker_h, photo_h = app.handlers[6], app.handlers[7]
+    # HARD-CODED INDICES. They move every time a handler is added ahead of them,
+    # and a stale index still resolves to SOME handler, so the two asserts below
+    # would keep passing while testing the wrong objects. The ordered-pair list
+    # above is what pins them: keep the two in step.
+    sticker_h, photo_h = app.handlers[8], app.handlers[9]
     assert sticker_h.filters is filters.Sticker.ALL, (
         f"handle_sticker must be filtered on filters.Sticker.ALL, got {sticker_h.filters!r}"
     )
@@ -522,7 +529,8 @@ def test_all_ten_handler_callbacks_are_registered_against_real_ptb():
     commands = set()
     for h in app.handlers:
         commands |= set(getattr(h, "commands", ()) or ())
-    assert commands == {"start", "chat", "help", "end", "status", "cancel"}, (
+    assert commands == {"start", "chat", "help", "end", "status", "cancel",
+                        "available", "unavailable"}, (
         f"registered commands are {sorted(commands)}; /chat and its /help alias must "
         "both survive (main.py:117)"
     )

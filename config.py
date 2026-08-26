@@ -538,7 +538,45 @@ MESSAGES = {
     "session_expired": "⏱️ This conversation has been automatically closed due to inactivity. You can start a new conversation anytime with /chat. Take care! 💚",
     "session_expired_heartfelt": "⏱️ This conversation has been automatically closed due to inactivity. Thank you for your time helping someone today! 💚",
     "photo_size_limit": "⚠️ Photo is too large. Please send a smaller image (max 10MB).",
-    "photo_error": "❌ Unable to send photo. Please try again or use text instead."
+    "photo_error": "❌ Unable to send photo. Please try again or use text instead.",
+
+    # --- Phase 4: supporter availability ------------------------------------
+    # The neutral catch-all. handle_message sends it for anything it does not
+    # recognise, and the member-only commands send exactly this to a NON-member, so
+    # someone typing /available who is not on a roster cannot tell the command exists.
+    "unknown_command": (
+        "I'm not sure what you mean. Use /chat to start a conversation with a "
+        "support member."
+    ),
+    "member_addendum": (
+        "You're on a support roster, so you also have:\n"
+        "/available - appear on the list of supporters people can choose\n"
+        "/unavailable - stay off that list\n"
+        "/release - hand your current conversation back if you can't continue it"
+    ),
+    "now_available": (
+        "✅ You're on the list. People asking for support can choose you again."
+    ),
+    "now_unavailable": (
+        "✅ You're off the list, so nobody new can choose you.\n\n"
+        "This does NOT end a conversation you're already in, and it does not hand back "
+        "a request that has already been sent to you - use the Not right now button on "
+        "that request, or /release if the conversation has already started."
+    ),
+    "availability_needs_profile": (
+        "Saved. You won't appear on the list people choose from until an admin adds "
+        "your name to your supporter profile - ask them to set it up."
+    ),
+    "availability_failed": (
+        "⚠️ Sorry, that couldn't be saved just now, so nothing has changed. "
+        "Please try again in a few minutes."
+    ),
+    # Not in the plan's key list, but step 5 of P4.6 requires SAYING the toggle only
+    # lasts until restart when Mongo is down, and none of the listed keys can say it.
+    "availability_memory_only": (
+        "(Our records are offline right now, so this will only last until the bot "
+        "next restarts. Please set it again if it seems to have been forgotten.)"
+    ),
 }
 
 

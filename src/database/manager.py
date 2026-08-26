@@ -387,6 +387,100 @@ class DBManager:
             logger.error(f"Error deactivating authorized member {member_id}: {e}")
             return False
 
+    # --- supporter profiles (Phase 4) ---------------------------------------
+    #
+    # NONE of these upsert. The only creator of a roster entry stays
+    # add_authorized_member: a typo in --telegram-id here must fail loudly, not
+    # quietly authorize a stranger's Telegram id to claim conversations.
+
+    def set_member_profile(self, member_id: int, collection: str = None,
+                           display_name: str = None, blurb: str = None) -> bool:
+        """Set the picker label and/or the one free-text line, leaving the other alone."""
+        if not self.db_available:
+            return False
+
+        updates = {}
+        if display_name is not None:
+            updates['display_name'] = str(display_name).strip()
+        if blurb is not None:
+            updates['blurb'] = str(blurb).strip()
+        if not updates:
+            logger.error("set_member_profile called with nothing to set for %s", member_id)
+            return False
+
+        try:
+            coll = collection or self._authorized_collection
+            updates['updated_at'] = utcnow()
+            result = db_manager.db[coll].update_one(
+                {'telegram_id': int(member_id)},
+                {'$set': updates},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error setting profile for member {member_id}: {e}")
+            return False
+
+    def set_member_availability(self, member_id: int, available: bool,
+                                collection: str = None) -> bool:
+        """Toggle a supporter's availability.
+
+        Returns matched_count > 0, NOT modified_count: running /available when
+        already available changes nothing in Mongo but is a complete success, and
+        reporting it as a failure would send a supporter chasing a non-problem.
+        """
+        if not self.db_available:
+            return False
+
+        try:
+            coll = collection or self._authorized_collection
+            result = db_manager.db[coll].update_one(
+                {'telegram_id': int(member_id)},
+                {'$set': {'available': bool(available), 'updated_at': utcnow()}},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error setting availability for member {member_id}: {e}")
+            return False
+
+    def mark_member_started(self, member_id: int, started: bool = True,
+                            collection: str = None) -> bool:
+        """Record whether this member has an open chat with the bot.
+
+        Written when a member /starts or sends any private message, and CLEARED when
+        a directed DM comes back "bot can't initiate conversation" or "blocked" --
+        self-healing, so a supporter who blocks and later unblocks returns to the
+        picker on their next message rather than staying broken forever.
+        """
+        if not self.db_available:
+            return False
+
+        try:
+            coll = collection or self._authorized_collection
+            updates = {'has_started_bot': bool(started), 'updated_at': utcnow()}
+            if started:
+                updates['started_bot_at'] = utcnow()
+            result = db_manager.db[coll].update_one(
+                {'telegram_id': int(member_id)},
+                {'$set': updates},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error marking member {member_id} started: {e}")
+            return False
+
+    def get_member_profile_doc(self, member_id: int,
+                               collection: str = None) -> Optional[Dict[str, Any]]:
+        """One raw member document, for the CLI's confirmation output."""
+        if not self.db_available:
+            return None
+
+        try:
+            coll = collection or self._authorized_collection
+            return db_manager.db[coll].find_one({'telegram_id': int(member_id)})
+        except Exception as e:
+            logger.error(f"Error reading profile for member {member_id}: {e}")
+            return None
+
     def remove_authorized_member(self, member_id: int, collection: str = None) -> bool:
         """Completely remove an authorized member record from a service's collection."""
         if not self.db_available:

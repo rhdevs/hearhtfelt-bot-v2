@@ -80,11 +80,20 @@ async def main():
             return
         for svc in SERVICES.values():
             try:
-                members = db_mgr.get_authorized_members(collection=svc.members_collection)
-                if members is None:
-                    # DB error for this collection -> keep the current roster (no-op)
+                # include_inactive=False is MANDATORY and is the highest-risk line in
+                # Phase 4. get_authorized_member_records defaults to True, while the
+                # get_authorized_members call it replaces hard-filtered active != False.
+                # Omitting it silently re-authorizes every deactivated member on the
+                # next refresh -- a security regression with no user-visible symptom.
+                records = db_mgr.get_authorized_member_records(
+                    include_inactive=False,
+                    collection=svc.members_collection,
+                )
+                if records is None:
+                    # DB error for this collection -> keep the current roster (no-op).
+                    # None and [] mean different things: [] is a genuinely empty roster.
                     continue
-                if svc.roster.replace(members):
+                if svc.roster.replace_records(records):
                     logger.info("Roster '%s' updated from database (%d entries)", svc.key, len(svc.roster))
                 svc.roster.update_last_synced(time.time())
             except Exception as exc:
@@ -118,6 +127,10 @@ async def main():
     application.add_handler(CommandHandler("end", handlers.end_command))
     application.add_handler(CommandHandler("status", handlers.status_command))
     application.add_handler(CommandHandler("cancel", handlers.cancel_command))
+    # Member-only commands. Deliberately absent from BOT_COMMANDS: set_my_commands
+    # publishes ONE menu to every chat, and that menu is the requester's surface.
+    application.add_handler(CommandHandler("available", handlers.available_command))
+    application.add_handler(CommandHandler("unavailable", handlers.unavailable_command))
     
     # Message handler for regular messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))
