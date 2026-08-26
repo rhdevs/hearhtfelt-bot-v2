@@ -12,6 +12,12 @@ class DBManager:
     def __init__(self):
         self.db_available = False
         self._authorized_collection = 'heartfelt_members'
+        # A SEPARATE collection, never `sessions`. `sessions` is help-request
+        # state: src/bot/restore.py reads every status:'pending' row at boot and
+        # get_pending_sessions has no discriminator, so a registration row living
+        # there would be rehydrated as a help request and could DM a prospective
+        # volunteer "your place in the queue expired". Non-negotiable.
+        self._registration_collection = 'supporter_registrations'
         
     def initialize(self):
         """Initialize database connection"""
@@ -689,6 +695,234 @@ class DBManager:
         except Exception as e:
             logger.error(f"Error removing authorized member {member_id}: {e}")
             return False
+
+    # --- supporter registration (/register) ----------------------------------
+    #
+    # House shape throughout: `if not self.db_available: return <falsy>`, then a
+    # try whose except logs and returns the same falsy value. NOTHING here
+    # upserts -- add_authorized_member remains the only upsert in the members
+    # path, and a registration row is only ever created by create_registration.
+    #
+    # NO INDEX is created on this collection, deliberately. It is tiny (one row
+    # per person who ever asks), every query is bounded by a limit, and nothing
+    # else in this file creates an index either. Do not add one by reflex.
+
+    def create_registration(self, telegram_id: int, username: Optional[str] = None,
+                            first_name: Optional[str] = None,
+                            last_name: Optional[str] = None,
+                            attempt: int = 1) -> Optional[str]:
+        """Create a pending registration row and return its registration_id.
+
+        Created BEFORE the admin fan-out, so a crash mid-fan-out still leaves a
+        row that a surviving admin's DM can act on. The counterweight is
+        get_pending_registration + an empty admin_messages, which register_command
+        treats as "nobody was ever shown this" and supersedes.
+        """
+        if not self.db_available:
+            return None
+
+        try:
+            registration_id = str(uuid.uuid4())
+            now = utcnow()
+            db_manager.db[self._registration_collection].insert_one({
+                'registration_id': registration_id,
+                'telegram_id': int(telegram_id),
+                'username': username,
+                'first_name': first_name,
+                'last_name': last_name,
+                'status': 'pending',
+                'created_at': now,
+                'updated_at': now,
+                'decided_at': None,
+                'decided_by': None,
+                'decision_service': None,
+                'close_reason': None,
+                # Filled AFTER the fan-out, by set_registration_admin_messages.
+                # Its EMPTINESS is load-bearing: see register_command.
+                'admin_messages': [],
+                'notified_admin_ids': [],
+                'attempt': int(attempt),
+            })
+            return registration_id
+        except Exception as e:
+            logger.error(f"Error creating registration for {telegram_id}: {e}")
+            return None
+
+    def get_registration(self, registration_id: str) -> Optional[Dict[str, Any]]:
+        """One registration row by id. Every callback re-reads through this rather
+        than trusting anything held in memory -- there is no in-memory
+        registration index anywhere in this codebase (D35)."""
+        if not self.db_available:
+            return None
+
+        try:
+            return db_manager.db[self._registration_collection].find_one(
+                {'registration_id': registration_id})
+        except Exception as e:
+            logger.error(f"Error reading registration {registration_id}: {e}")
+            return None
+
+    def get_pending_registration(self, telegram_id: int) -> Optional[Dict[str, Any]]:
+        """The newest still-pending row for this person, if any.
+
+        The anti-spam gate, Mongo-backed so it survives a restart.
+        """
+        if not self.db_available:
+            return None
+
+        try:
+            return db_manager.db[self._registration_collection].find_one(
+                {'telegram_id': int(telegram_id), 'status': 'pending'},
+                sort=[('created_at', -1)])
+        except Exception as e:
+            logger.error(f"Error reading pending registration for {telegram_id}: {e}")
+            return None
+
+    def get_last_decided_registration(self, telegram_id: int) -> Optional[Dict[str, Any]]:
+        """The most recently DECIDED row for this person (approved or rejected).
+
+        'closed' is deliberately excluded: a row closed because nobody could be
+        DMed is not an answer, and must not start a cooldown.
+        """
+        if not self.db_available:
+            return None
+
+        try:
+            return db_manager.db[self._registration_collection].find_one(
+                {'telegram_id': int(telegram_id),
+                 'status': {'$in': ['approved', 'rejected']}},
+                sort=[('decided_at', -1)])
+        except Exception as e:
+            logger.error(f"Error reading last decision for {telegram_id}: {e}")
+            return None
+
+    def count_registrations(self, telegram_id: int) -> int:
+        """How many rows this person already has. Feeds `attempt`, which the admin
+        card renders as "Previous requests". 0 on any error -- an unusable count
+        must never block somebody from reaching a human."""
+        if not self.db_available:
+            return 0
+
+        try:
+            return db_manager.db[self._registration_collection].count_documents(
+                {'telegram_id': int(telegram_id)})
+        except Exception as e:
+            logger.error(f"Error counting registrations for {telegram_id}: {e}")
+            return 0
+
+    def set_registration_admin_messages(self, registration_id: str,
+                                        delivered: List[Dict[str, Any]]) -> bool:
+        """Record which admin DMs actually landed, and where.
+
+        Deliberately NOT filtered on status, for the same reason set_queue_message
+        isn't: those DMs physically exist whether or not somebody tapped a button
+        in the microsecond between send_message returning and this write. This is
+        the durable record that makes button-stripping work across a restart.
+        """
+        if not self.db_available:
+            return False
+
+        try:
+            pairs = [{'admin_id': int(d['admin_id']), 'message_id': int(d['message_id'])}
+                     for d in (delivered or [])]
+            result = db_manager.db[self._registration_collection].update_one(
+                {'registration_id': registration_id},
+                {'$set': {
+                    'admin_messages': pairs,
+                    'notified_admin_ids': [d['admin_id'] for d in pairs],
+                    'updated_at': utcnow(),
+                }},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error recording admin messages for registration "
+                         f"{registration_id}: {e}")
+            return False
+
+    def decide_registration(self, registration_id: str, admin_id: int, decision: str,
+                            service_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """THE GATE. pending -> approved|rejected, atomically, exactly once.
+
+        The {'status': 'pending'} clause IS the feature. Two admins tapping
+        Approve at the same moment both reach this; PyMongo is blocking, so this
+        runs to completion against the event loop, and exactly ONE of them gets a
+        document back. Only that caller may write a roster or message the
+        applicant. Remove the clause and both do: two roster writes and two DMs,
+        or an Approve and a Reject landing on the same person.
+
+        Same shape as claim_session / release_session / direct_session: one
+        find_one_and_update whose FILTER NAMES THE STATE BEING LEFT, called
+        synchronously before the caller's first await.
+        """
+        if decision not in ('approved', 'rejected'):
+            # Before touching Mongo: a typo'd decision must never reach a $set.
+            logger.error("decide_registration called with an invalid decision %r "
+                         "for %s", decision, registration_id)
+            return None
+
+        if not self.db_available:
+            return None
+
+        now = utcnow()
+        try:
+            return db_manager.db[self._registration_collection].find_one_and_update(
+                {'registration_id': registration_id, 'status': 'pending'},
+                {'$set': {
+                    'status': decision,
+                    'decided_by': int(admin_id),
+                    'decided_at': now,
+                    'decision_service': service_key,
+                    'updated_at': now,
+                }},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as e:
+            logger.error(f"Error deciding registration {registration_id} by "
+                         f"{admin_id}: {e}")
+            return None
+
+    def close_registration(self, registration_id: str,
+                           reason: str) -> Optional[Dict[str, Any]]:
+        """pending -> closed, atomically. Not a decision, and never notifies anyone.
+
+        Reasons: 'undeliverable' (no admin could be DMed at all), 'never_delivered'
+        (a previous attempt died between row creation and fan-out) and
+        'closed_by_admin' (the CLI escape hatch). Filtered on 'pending' for the
+        same reason decide_registration is: closing a row somebody has just
+        approved would erase the decision.
+        """
+        if not self.db_available:
+            return None
+
+        now = utcnow()
+        try:
+            return db_manager.db[self._registration_collection].find_one_and_update(
+                {'registration_id': registration_id, 'status': 'pending'},
+                {'$set': {
+                    'status': 'closed',
+                    'close_reason': reason,
+                    'updated_at': now,
+                }},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as e:
+            logger.error(f"Error closing registration {registration_id}: {e}")
+            return None
+
+    def list_registrations(self, status: Optional[str] = None,
+                           limit: int = 50) -> List[Dict[str, Any]]:
+        """Newest-first rows for the ops CLI. [] on error."""
+        if not self.db_available:
+            return []
+
+        try:
+            query = {'status': status} if status else {}
+            cursor = db_manager.db[self._registration_collection].find(query).sort(
+                'created_at', -1).limit(int(limit))
+            return list(cursor)
+        except Exception as e:
+            logger.error(f"Error listing registrations: {e}")
+            return []
 
     # MESSAGE MANAGEMENT
     
