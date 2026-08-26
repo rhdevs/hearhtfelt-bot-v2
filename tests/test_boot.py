@@ -32,6 +32,7 @@ import logging
 import os
 import sys
 from types import SimpleNamespace
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -279,7 +280,10 @@ PATCHED = ("Application", "SessionManager", "QueueManager", "SessionExpiryManage
            "BotHandlers", "db_mgr", "restore_state", "BOT_TOKEN")
 
 
-def _install(fakes, token=FAKE_TOKEN):
+def _install(fakes, token: Optional[str] = FAKE_TOKEN):
+    """`token=None` is deliberate: it drives test_no_token_returns_immediately.
+    Annotated Optional because Pyright otherwise infers `str` from the default and
+    flags the very case this helper exists to support."""
     saved = {name: getattr(main, name) for name in PATCHED}
     for name in PATCHED:
         if name == "BOT_TOKEN":
@@ -294,7 +298,11 @@ def _restore(saved):
         setattr(main, name, value)
 
 
-def _enable_services(hf_channel=HF_CHANNEL, pss_channel=PSS_CHANNEL):
+def _enable_services(hf_channel: Optional[str] = HF_CHANNEL,
+                     pss_channel: Optional[str] = PSS_CHANNEL):
+    """`channel=None` is deliberate: a service with no channel is not `runnable`,
+    which is what drives test_no_runnable_service_returns_immediately. Same Pyright
+    reason as _install for the Optional."""
     hf = config.SERVICES[ServiceType.HF.value]
     pss = config.SERVICES[ServiceType.PSS.value]
     hf.channel_id, hf.enabled = hf_channel, hf_channel is not None
