@@ -40,10 +40,34 @@ helper sees only "RHesident #1234".
 
 ## How It Works
 
-**Users:** `/chat` → describe issue → wait in queue → anonymous chat → `/end`  
-**Support Members:** Monitor the track's channel → click "Claim" → anonymous chat → `/end`
+**Users:** `/chat` → pick a track (HF or PSS, when more than one is enabled) →
+describe the issue → **on PSS, when `PSS_DIRECTED_ENABLED=true`**, choose "A
+specific peer supporter" or "Any available peer supporter" → wait in queue →
+anonymous chat → `/end`  
+**Support Members:** Monitor the track's channel (or, on PSS with a specific
+request, get DMed directly) → click "Claim" / "Accept" → anonymous chat →
+`/end`
+
+**The PSS fork** (off by default — see Configuration): after describing their
+request, a PSS requester is offered "A specific peer supporter" or "Any
+available peer supporter". Picking "any" behaves exactly like today — the
+request goes to the PSS channel and whoever is free claims it. Picking
+"specific" shows a numbered list of every active PSS supporter who has a name
+the bot can show; a supporter who can't be reached right now (not started the
+bot, marked `/unavailable`, already in a conversation, or already holding a
+directed request) is still listed, just marked `(busy)` and not pickable. The
+requester picks by tapping a name or typing its number; picking a busy one
+re-shows the list rather than creating a request. "Send to anyone instead" and
+"Cancel" are always on the list too, and if everyone is busy the list still
+shows with that made clear and the "anyone" route front and centre.
 
 **Commands:** `/start` `/chat` `/status` `/cancel` `/end`
+
+Support members additionally have: `/available` `/unavailable` `/release`
+`/name` (`/name` only does anything for PSS supporters today — it is silent
+for everyone else, HF members included). These are listed to a member in the
+bot's welcome message, not in the Telegram command menu — see "Joining the
+support team" below.
 
 `/help` is kept alive as an alias for `/chat` (posters and existing users still
 reach for it), but `/chat` is the primary command and the only one advertised in
@@ -71,6 +95,17 @@ numbers; a negative id is a channel id and is rejected and logged at boot). Unse
 the `/register` feature is completely inert. Read once at import, so changing it needs a
 container **recreate**, not a restart. See "Joining the support team" below.
 
+```bash
+PSS_DIRECTED_ENABLED=false  # optional; default false
+```
+
+`PSS_DIRECTED_ENABLED` turns on the "specific or anyone" fork on the PSS
+track (see "How It Works" above). **It defaults to `false`**, so PSS behaves
+exactly as it does today — straight to the channel — until an operator opts
+in. Read once at import like the other `PSS_*` variables, so flipping it also
+needs a container **recreate**, not a restart. See `HANDOFF.md` R11 for the
+full enable/rollback runbook.
+
 **config.py:**
 ```python
 DEFAULT_HEARTFELT_MEMBERS = [1522275008, 9876543210]
@@ -87,9 +122,11 @@ python3 -m src.database.utils stats                    # Session statistics
 python3 -m src.database.utils monthly                  # This month's sessions  
 python3 -m src.database.utils transcript --session-id  # Full conversation
 python3 -m src.database.utils admins --action list     # View Heartfelt admins
+python3 -m src.database.utils admins --action list --service pss   # View PSS supporters + their listed names
 python3 -m src.database.utils registrations --action list --status pending   # /register requests
 python3 -m src.database.utils admins --action add --telegram-id 123456789
 python3 -m src.database.utils admins --action remove --telegram-id 123456789
+python3 -m src.database.utils admins --action set-profile --service pss --telegram-id 123456789 --display-name "Sam"   # override the listed name; "" resets to their Telegram first name
 ```
 
 When the bot is running inside Docker, execute the same commands in the container:
