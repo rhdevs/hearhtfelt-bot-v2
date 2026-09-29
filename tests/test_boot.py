@@ -39,8 +39,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from config import ServiceType
+import datetime
+
+import telegram
 from telegram import BotCommand
-from telegram.ext import Application, CommandHandler, filters
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
+                          MessageHandler, TypeHandler, filters)
 
 import main
 
@@ -59,6 +63,7 @@ HANDLER_CALLBACKS = (
     "release_command", "register_command", "handle_message", "handle_sticker",
     "handle_photo",
     "handle_callback_query", "handle_error",
+    "name_command", "note_private_contact",
 )
 
 
@@ -176,6 +181,7 @@ def _make_fakes(events):
             self.bot = FakeBot()
             self.updater = FakeUpdater()
             self.handlers = []
+            self.groups = []        # the group each handler was added in, in step
             self.error_handlers = []
 
         # --- builder chain: Application.builder().token(t).build()
@@ -192,8 +198,9 @@ def _make_fakes(events):
 
             return _Builder()
 
-        def add_handler(self, handler):
+        def add_handler(self, handler, group=0):
             self.handlers.append(handler)
+            self.groups.append(group)
 
         def add_error_handler(self, handler):
             self.error_handlers.append(handler)
@@ -452,10 +459,10 @@ def test_shutdown_runs_the_finally_block():
     )
 
 
-def test_all_handler_callbacks_are_registered_against_real_ptb():
-    """The fake Application records handlers, but CommandHandler / MessageHandler /
-    CallbackQueryHandler / filters are the REAL PTB classes, so this is a live check
-    that main()'s registration block still constructs under the installed version."""
+def _boot_and_capture_app():
+    """Drive main() to polling against the fakes and return the Application it
+    built. CommandHandler / MessageHandler / CallbackQueryHandler / TypeHandler /
+    filters stay the REAL PTB classes."""
     events = []
     fakes = _make_fakes(events)
     catcher = _ErrorCatcher()
@@ -488,13 +495,19 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
         _restore(saved)
         _restore_services(svc_saved)
         logging.getLogger().removeHandler(catcher)
+    return app_holder.get("app")
 
-    app = app_holder.get("app")
+
+def test_all_handler_callbacks_are_registered_against_real_ptb():
+    """The fake Application records handlers, but CommandHandler / MessageHandler /
+    CallbackQueryHandler / filters are the REAL PTB classes, so this is a live check
+    that main()'s registration block still constructs under the installed version."""
+    app = _boot_and_capture_app()
     assert app is not None, "the fake Application was never built"
-    # 9 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
-    assert len(app.handlers) == 13, (
-        f"main() registered {len(app.handlers)} handlers, expected 13 "
-        f"(9 command, 3 message, 1 callback): {app.handlers!r}"
+    # 1 TypeHandler + 10 CommandHandlers + 3 MessageHandlers + 1 CallbackQueryHandler
+    assert len(app.handlers) == 15, (
+        f"main() registered {len(app.handlers)} handlers, expected 15 "
+        f"(1 type, 10 command, 3 message, 1 callback): {app.handlers!r}"
     )
     assert len(app.error_handlers) == 1, f"expected one error handler, got {app.error_handlers!r}"
 
@@ -507,6 +520,9 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
     # handle_error <-> handle_message.
     registered = [(type(h).__name__, h.callback.__name__) for h in app.handlers]
     assert registered == [
+        # FIRST, in group -1: the capture point for PSS supporters' has_started_bot
+        # and Telegram first name. It must see every update before anything else.
+        ("TypeHandler", "note_private_contact"),
         ("CommandHandler", "start_command"),
         ("CommandHandler", "chat_command"),
         ("CommandHandler", "end_command"),
@@ -518,11 +534,21 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
         # Registered unconditionally, so this list stays env-independent even
         # though the feature itself is inert without REGISTRATION_ADMIN_IDS. D41.
         ("CommandHandler", "register_command"),
+        # Not in BOT_COMMANDS, and silent to anyone who is not an active PSS
+        # supporter in a private chat.
+        ("CommandHandler", "name_command"),
         ("MessageHandler", "handle_message"),
         ("MessageHandler", "handle_sticker"),
         ("MessageHandler", "handle_photo"),
         ("CallbackQueryHandler", "handle_callback_query"),
     ], f"main() wired its handlers differently: {registered!r}"
+
+    # Group -1 for the capture hook, the default group 0 for everything else. A
+    # capture hook in group 0 would never run for any update another group-0
+    # handler takes -- i.e. for nearly all of them.
+    assert app.groups == [-1] + [0] * 14, f"handler groups: {app.groups!r}"
+    assert app.handlers[0].type is telegram.Update, (
+        f"the capture hook must match every Update, got {app.handlers[0].type!r}")
 
     assert app.error_handlers[0].__name__ == "handle_error", (
         f"the error handler must be handlers.handle_error, got "
@@ -531,11 +557,12 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
 
     # The two singleton filters, by identity: a swap of the FILTERS rather than the
     # callbacks would leave the list above unchanged.
-    # HARD-CODED INDICES. They move every time a handler is added ahead of them,
+    # HARD-CODED INDICES (the TypeHandler at 0 and /name at 10 pushed them to 12
+    # and 13). They move every time a handler is added ahead of them,
     # and a stale index still resolves to SOME handler, so the two asserts below
     # would keep passing while testing the wrong objects. The ordered-pair list
     # above is what pins them: keep the two in step.
-    sticker_h, photo_h = app.handlers[10], app.handlers[11]
+    sticker_h, photo_h = app.handlers[12], app.handlers[13]
     assert sticker_h.filters is filters.Sticker.ALL, (
         f"handle_sticker must be filtered on filters.Sticker.ALL, got {sticker_h.filters!r}"
     )
@@ -547,10 +574,51 @@ def test_all_handler_callbacks_are_registered_against_real_ptb():
     for h in app.handlers:
         commands |= set(getattr(h, "commands", ()) or ())
     assert commands == {"start", "chat", "help", "end", "status", "cancel",
-                        "available", "unavailable", "release", "register"}, (
+                        "available", "unavailable", "release", "register",
+                        "name"}, (
         f"registered commands are {sorted(commands)}; /chat and its /help alias must "
         "both survive (main.py:117)"
     )
+
+
+def test_an_unrecognised_command_reaches_no_handler():
+    """Pins the premise of /name's SILENT refusal.
+
+    name_command answers a non-supporter with nothing at all, because that is what
+    an unrecognised command gets: no registered handler accepts '/foo'. If someone
+    ever adds a catch-all (a CommandHandler fallback, a MessageHandler without
+    ~filters.COMMAND, ...), an unknown command starts getting a reply and /name's
+    silence becomes distinguishable from a command that does not exist -- so /name
+    must then be routed through that same catch-all. This test is what notices.
+    """
+    app = _boot_and_capture_app()
+    assert app is not None, "the fake Application was never built"
+
+    cmd = "/definitelynotacommand"
+    msg = telegram.Message(
+        message_id=1,
+        date=datetime.datetime.now(datetime.timezone.utc),
+        chat=telegram.Chat(id=1, type="private"),
+        from_user=telegram.User(id=1, first_name="X", is_bot=False),
+        text=cmd,
+        entities=(telegram.MessageEntity(type=telegram.MessageEntity.BOT_COMMAND,
+                                         offset=0, length=len(cmd)),),
+    )
+    upd = telegram.Update(update_id=1, message=msg)
+
+    for h in app.handlers:
+        if isinstance(h, TypeHandler):
+            # Matches everything by design; note_private_contact never replies
+            # (proven in test_supporter_names).
+            continue
+        if isinstance(h, CommandHandler):
+            assert "definitelynotacommand" not in h.commands, h.commands
+            continue
+        assert isinstance(h, (MessageHandler, CallbackQueryHandler)), h
+        assert not h.check_update(upd), (
+            f"{type(h).__name__}({h.callback.__name__}) accepts an unknown command, "
+            "so unknown commands are no longer answered with silence -- route "
+            "/name's refusal through the same path")
 
 
 # --------------------------------------------------------------- negative cases
@@ -764,8 +832,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 15, (
-        "expected at least 15 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 16, (
+        "expected at least 16 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

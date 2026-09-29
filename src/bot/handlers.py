@@ -40,10 +40,20 @@ from config import (
     default_service_key,
     get_service,
     help_request_text,
+    listed_name,
+    name_taken_by_other,
+    supporter_label,
+    supporter_name_problem,
 )
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager, SelfClaimError
 from src.database.manager import db_mgr
+from src.supporter_names import (
+    CAPTURED_NAME_MAX_LENGTH,
+    NAME_MAX_LENGTH,
+    RESET_KEYWORD,
+    clean_name,
+)
 from src.timeutil import ensure_aware_utc, format_hhmm, utcnow
 
 logger = logging.getLogger(__name__)
@@ -78,16 +88,248 @@ class BotHandlers:
         for svc in SERVICES.values():
             if user_id not in svc.roster:
                 continue
-            profile = svc.roster.profile(user_id)
-            if profile is not None and profile.has_started_bot:
+            self._record_started_on(svc, user_id)
+
+    def _record_started_on(self, svc, user_id) -> None:
+        """_record_bot_started for ONE track. Plain, not async, on purpose: nothing
+        may await between the Mongo write and the memory write (see
+        _record_first_name_on for why that matters)."""
+        profile = svc.roster.profile(user_id)
+        if profile is not None and profile.has_started_bot:
+            return
+        try:
+            db_mgr.mark_member_started(user_id, True,
+                                       collection=svc.members_collection)
+        except Exception as exc:
+            logger.warning("Could not record bot-started for member %s (%s): %s",
+                           user_id, svc.key, exc)
+        svc.roster.mark_started(user_id, True)
+
+    def _record_first_name_on(self, svc, user_id, first_name) -> None:
+        """Capture the Telegram first name this member's own private update carried.
+
+        It is the automatic listed name (a /name override always wins), so it is
+        refreshed on every contact and a rename on Telegram follows through.
+
+        Why the 5-minute roster refresh cannot clobber this: main.refresh_all_rosters
+        reads Mongo and replaces memory with no await in between, and this writes
+        Mongo FIRST and memory SECOND, also with no await in between. On one event
+        loop the two therefore run strictly one after the other, and either order
+        ends with the new name in both places. A failed Mongo write still updates
+        memory: the next refresh reverts it, and the next contact re-captures it, so
+        it self-heals rather than sticking.
+        """
+        captured = clean_name(first_name)[:CAPTURED_NAME_MAX_LENGTH].strip()
+        if not captured:
+            # Telegram always sends a first name. An empty one here is a malformed
+            # update, and it must never erase a good name we already have.
+            return
+        profile = svc.roster.profile(user_id)
+        if profile is not None and profile.telegram_first_name == captured:
+            # The hot path, taken on nearly every message: a dict lookup, no Mongo.
+            return
+
+        old_first = profile.telegram_first_name if profile else None
+        old_listed = listed_name(profile)
+        try:
+            db_mgr.set_member_first_name(user_id, captured,
+                                         collection=svc.members_collection)
+        except Exception as exc:
+            logger.warning("Could not record the Telegram first name of member %s "
+                           "(%s): %s", user_id, svc.key, exc)
+        # create_if_missing: a member approved by /register is roster.add()ed with
+        # no profile, and would otherwise stay unlisted until the next refresh.
+        svc.roster.set_first_name(user_id, captured, create_if_missing=True)
+        new_listed = listed_name(svc.roster.profile(user_id))
+        logger.info("%s supporter %s: Telegram first name %r -> %r (listed as %r -> %r)",
+                    svc.key, user_id, old_first, captured, old_listed, new_listed)
+        if new_listed == "" and clean_name(profile.display_name if profile else "") == "":
+            # The id only: the name itself is already on the line above.
+            logger.info("%s supporter %s cannot be listed under their Telegram first "
+                        "name; /name sets one", svc.key, user_id)
+
+    def _note_supporter_contact(self, user) -> None:
+        """THE capture point for tracks that list supporters by name: records
+        has_started_bot and the Telegram first name on every supporter_names track
+        this user is a member of.
+
+        HF (supporter_names False) is never touched here, which keeps HF
+        byte-identical: its has_started_bot backfill stays in handle_message and
+        start_command exactly as before.
+        """
+        for svc in SERVICES.values():
+            if not svc.supporter_names or user.id not in svc.roster:
                 continue
+            self._record_started_on(svc, user.id)
+            self._record_first_name_on(svc, user.id, getattr(user, "first_name", None))
+
+    async def note_private_contact(self, update, context) -> None:
+        """The group -1 TypeHandler callback. Group -1 runs before every other
+        handler for every update, so every private message, command or button tap
+        from a supporter refreshes what the bot knows about them -- whichever
+        handler then takes the update, and even when none does.
+
+        It replies to nobody, sends nothing and NEVER raises: an exception here
+        would reach handle_error on an update that is otherwise fine.
+        """
+        try:
+            if not self._is_private_chat(update):
+                return
+            user = getattr(update, "effective_user", None)
+            if user is None:
+                return
+            self._note_supporter_contact(user)
+        except Exception:
+            logger.warning("Supporter contact capture failed; continuing", exc_info=True)
+
+    # ------------------------------------------------------------------ /name
+    async def name_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/name: a PSS supporter sees, sets or resets the name students see.
+
+        Deliberately absent from set_my_commands, and SILENT to everybody else.
+        """
+        user = getattr(update, "effective_user", None)
+        message = getattr(update, "message", None)
+        if user is None or message is None:
+            return
+
+        svc = next((s for s in SERVICES.values()
+                    if s.supporter_names and user.id in s.roster), None)
+        if svc is None or not self._is_private_chat(update):
+            # No reply, no send, no DB call. This is EXACTLY what an unrecognised
+            # command gets: main.py registers no handler for those, and
+            # handle_message is filtered on ~filters.COMMAND, so '/foo' is answered
+            # with silence. Replying MESSAGES['unknown_command'] here would make
+            # /name distinguishable from a command that does not exist, and so tell
+            # a stranger that a supporter roster exists. Students, HF-only members,
+            # deactivated members and every group/channel land here. test_boot's
+            # unknown-command guard pins the premise: if a catch-all is ever
+            # added, /name must be routed through it.
+            logger.debug("/name ignored for user %s (not an active named-track "
+                         "supporter in a private chat)", user.id)
+            return
+
+        # So the answer reflects their CURRENT Telegram first name, even though the
+        # group -1 hook normally got there first.
+        self._note_supporter_contact(user)
+
+        # message.text, NOT context.args: args are whitespace-split, which would
+        # silently turn "Sam\nLee" into "Sam Lee" and hide the newline the rules
+        # reject. "/name@botname Sam" splits the same way.
+        raw = message.text or ""
+        parts = raw.split(None, 1)
+        arg = parts[1] if len(parts) > 1 else ""
+
+        # Every reply in this flow is PLAIN TEXT, no parse_mode: a name is
+        # supporter-typed text and must never be interpreted as markup.
+        if not arg.strip():
+            await message.reply_text(self._name_status_text(svc, user.id))
+            return
+        if arg.strip().casefold() == RESET_KEYWORD:
+            await self._reset_name(message, svc, user.id)
+            return
+        await self._set_name(message, svc, user.id, arg)
+
+    def _name_status_text(self, svc, user_id) -> str:
+        profile = svc.roster.profile(user_id)
+        name = listed_name(profile)
+        label = supporter_label(svc.key, user_id) or name
+        if not name:
+            text = MESSAGES["name_current_none"]
+        elif clean_name(profile.display_name):
+            text = MESSAGES["name_current_chosen"].format(name=label)
+        else:
+            text = MESSAGES["name_current_telegram"].format(name=label)
+        if name and label != name:
+            text += "\n\n" + MESSAGES["name_suffix_note"]
+        if not (svc.runnable and svc.directed_enabled):
+            text += "\n\n" + MESSAGES["name_list_off_note"]
+        return text
+
+    def _write_display_name(self, svc, user_id, new):
+        """Mongo FIRST, memory SECOND, no await anywhere in here.
+
+        Returns (reply_key_or_None, suffix, old_chosen_from_mongo_or_None).
+        reply_key 'missing' means: answer with SILENCE (not an active member in
+        Mongo, the same path as the unknown-command refusal). Memory is changed only
+        when the write landed, so a refresh can never silently undo a name the
+        supporter was told was saved.
+        """
+        if db_mgr.db_available:
             try:
-                db_mgr.mark_member_started(user_id, True,
-                                           collection=svc.members_collection)
+                outcome, before = db_mgr.set_member_display_name(
+                    user_id, new, collection=svc.members_collection)
             except Exception as exc:
-                logger.warning("Could not record bot-started for member %s (%s): %s",
+                logger.warning("Could not save the chosen name of member %s (%s): %s",
                                user_id, svc.key, exc)
-            svc.roster.mark_started(user_id, True)
+                outcome, before = "error", None
+            if outcome == "missing":
+                logger.info("%s /name from %s refused: not an active member in the "
+                            "database", svc.key, user_id)
+                return "missing", "", None
+            if outcome != "ok":
+                return "availability_failed", "", None
+            svc.roster.set_display_name(user_id, new)
+            return None, "", (before or {}).get("display_name")
+        if not svc.roster.set_display_name(user_id, new):
+            return "availability_failed", "", None
+        return None, "\n\n" + MESSAGES["availability_memory_only"], None
+
+    async def _set_name(self, message, svc, user_id, arg) -> None:
+        problem = supporter_name_problem(arg)
+        if problem:
+            await message.reply_text(MESSAGES[problem])
+            return
+        new = clean_name(arg)
+        profile = svc.roster.profile(user_id)
+        if profile is not None and clean_name(profile.display_name) == new:
+            await message.reply_text(MESSAGES["name_unchanged"])
+            return
+        if name_taken_by_other(svc.key, user_id, new):
+            await message.reply_text(MESSAGES["name_taken"])
+            return
+
+        old_listed = listed_name(profile)
+        old_chosen = clean_name(profile.display_name) if profile else ""
+        failure, suffix, stored_before = self._write_display_name(svc, user_id, new)
+        if failure == "missing":
+            return
+        if failure:
+            await message.reply_text(MESSAGES[failure])
+            return
+        old_chosen = stored_before or old_chosen
+        new_listed = listed_name(svc.roster.profile(user_id)) or new
+        logger.info("%s supporter %s changed their listed name: %r -> %r "
+                    "(chosen name %r -> %r)",
+                    svc.key, user_id, old_listed, new_listed, old_chosen, new)
+        await message.reply_text(
+            MESSAGES["name_saved"].format(name=supporter_label(svc.key, user_id) or new)
+            + suffix)
+
+    async def _reset_name(self, message, svc, user_id) -> None:
+        profile = svc.roster.profile(user_id)
+        if profile is None or clean_name(profile.display_name) == "":
+            await message.reply_text(MESSAGES["name_reset_nothing"])
+            return
+
+        old_listed = listed_name(profile)
+        old_chosen = clean_name(profile.display_name)
+        failure, suffix, stored_before = self._write_display_name(svc, user_id, "")
+        if failure == "missing":
+            return
+        if failure:
+            await message.reply_text(MESSAGES[failure])
+            return
+        old_chosen = stored_before or old_chosen
+        new_listed = listed_name(svc.roster.profile(user_id))
+        logger.info("%s supporter %s changed their listed name: %r -> %r "
+                    "(chosen name %r -> %r)",
+                    svc.key, user_id, old_listed, new_listed, old_chosen, "")
+        if new_listed:
+            label = supporter_label(svc.key, user_id) or new_listed
+            await message.reply_text(MESSAGES["name_reset_done"].format(name=label) + suffix)
+        else:
+            await message.reply_text(MESSAGES["name_reset_done_no_name"] + suffix)
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -119,7 +361,14 @@ class BotHandlers:
         # surface. This addendum is how a supporter discovers them instead.
         if self._is_private_chat(update) and is_any_member(user_id):
             self._record_bot_started(user_id)
-            text = text + "\n\n" + MESSAGES["member_addendum"]
+            # A member of a track that lists supporters by name also has /name.
+            # An HF-only member's text is byte-identical to before. `enabled`, the
+            # same gate is_any_member applies, so a switched-off PSS track does not
+            # change what an HF member who is also on its roster is told.
+            named = any(s.enabled and s.supporter_names and user_id in s.roster
+                        for s in SERVICES.values())
+            text = text + "\n\n" + MESSAGES[
+                "member_addendum_named" if named else "member_addendum"]
 
         await update.message.reply_text(text)
 
@@ -163,6 +412,18 @@ class BotHandlers:
             suffix = "\n\n" + MESSAGES["availability_memory_only"]
 
         profile = svc.roster.profile(user_id)
+        if svc.supporter_names:
+            # A named track lists everyone with a name and marks the busy ones, and
+            # the name defaults to the Telegram first name -- so "no name" means
+            # "nothing usable", which the supporter fixes themselves with /name.
+            if profile is None or not listed_name(profile):
+                await update.message.reply_text(MESSAGES["availability_needs_name"] + suffix)
+                return
+            text = (MESSAGES["now_available_named"] if available
+                    else MESSAGES["now_unavailable_named"])
+            await update.message.reply_text(text + suffix)
+            return
+
         if profile is None or not profile.display_name:
             # The toggle was honoured; they just have nothing to render yet.
             await update.message.reply_text(MESSAGES["availability_needs_profile"] + suffix)

@@ -310,6 +310,10 @@ def test_bot_command_menu():
     # recruitment command to somebody who opened this bot in distress is the
     # wrong thing to put in front of them. Discovery is out-of-band. D42/R13.
     assert "register" not in [c.command for c in main.BOT_COMMANDS]
+    # /name is absent for a stronger reason: it is SILENT to everyone who is not an
+    # active PSS supporter, exactly like a command that does not exist. Listing it
+    # would announce to every student that a supporter roster is behind the bot.
+    assert "name" not in [c.command for c in main.BOT_COMMANDS]
     for c in main.BOT_COMMANDS:
         # Telegram's constraints: names [a-z0-9_]{1,32}, descriptions 1-256 chars.
         assert 1 <= len(c.command) <= 32

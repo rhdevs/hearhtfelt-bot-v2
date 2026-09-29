@@ -550,6 +550,104 @@ def test_k_profile_and_profiles_return_copies():
     assert plist2[0].fields == {"pronoun": "she"}, plist2[0].fields
 
 
+# --------------------------------------------------------------------------- (l)/(m)
+class _NamesRecordingDb:
+    """Just enough db_mgr for /start and /available on either track."""
+
+    def __init__(self):
+        self.db_available = True
+        self.calls = []
+
+    def mark_member_started(self, member_id, started=True, collection=None):
+        self.calls.append(('mark_member_started', member_id, collection))
+        return True
+
+    def set_member_first_name(self, member_id, first_name, collection=None):
+        self.calls.append(('set_member_first_name', member_id, first_name, collection))
+        return True
+
+    def set_member_availability(self, member_id, available, collection=None):
+        self.calls.append(('set_member_availability', member_id, available, collection))
+        return True
+
+
+def _private_update(user_id, replies, first_name="M"):
+    async def reply_text(t, **kw):
+        replies.append(t)
+
+    user = SimpleNamespace(id=user_id, username=None, first_name=first_name, last_name=None)
+    return SimpleNamespace(effective_user=user,
+                           message=SimpleNamespace(text="/start", reply_text=reply_text),
+                           callback_query=None,
+                           effective_chat=SimpleNamespace(id=user_id, type="private"))
+
+
+def test_l_start_addendum_names_name_only_on_a_named_track():
+    reset_state()
+    hf = config.SERVICES[ServiceType.HF.value]
+    pss = config.SERVICES[ServiceType.PSS.value]
+    HF_ONLY, PSS_MEMBER = 8601, 8602
+    hf.roster.replace_records([{'telegram_id': HF_ONLY, 'display_name': 'H',
+                                'has_started_bot': True}])
+    pss.roster.replace_records([{'telegram_id': PSS_MEMBER, 'has_started_bot': True}])
+
+    saved_enabled = pss.enabled
+    pss.enabled = True      # is_any_member only counts ENABLED tracks
+    real_db = handlers_mod.db_mgr
+    handlers_mod.db_mgr = _NamesRecordingDb()
+    try:
+        handlers = handlers_mod.BotHandlers(object(), object())
+        ctx = SimpleNamespace(bot=None, args=[])
+        replies = []
+        asyncio.run(handlers.start_command(_private_update(PSS_MEMBER, replies), ctx))
+        assert replies == [MESSAGES["welcome"] + "\n\n" + MESSAGES["member_addendum_named"]], replies
+
+        replies.clear()
+        asyncio.run(handlers.start_command(_private_update(HF_ONLY, replies), ctx))
+        # BYTE-IDENTICAL to before the named track existed.
+        assert replies == [MESSAGES["welcome"] + "\n\n" + MESSAGES["member_addendum"]], replies
+
+        # On BOTH rosters but with PSS switched off: still the HF wording.
+        pss.roster.replace_records([{'telegram_id': HF_ONLY, 'has_started_bot': True}])
+        pss.enabled = False
+        replies.clear()
+        asyncio.run(handlers.start_command(_private_update(HF_ONLY, replies), ctx))
+        assert replies == [MESSAGES["welcome"] + "\n\n" + MESSAGES["member_addendum"]], replies
+    finally:
+        pss.enabled = saved_enabled
+        handlers_mod.db_mgr = real_db
+
+
+def test_m_pss_availability_uses_the_named_copy():
+    reset_state()
+    pss = config.SERVICES[ServiceType.PSS.value]
+    MID = 8701
+    # No override, and a Telegram first name that fails the rules: nothing to list.
+    pss.roster.replace_records([{'telegram_id': MID, 'has_started_bot': True,
+                                 'telegram_first_name': 'Alex (he/him)'}])
+    real_db = handlers_mod.db_mgr
+    handlers_mod.db_mgr = _NamesRecordingDb()
+    try:
+        handlers = handlers_mod.BotHandlers(object(), object())
+        ctx = SimpleNamespace(bot=None)
+        replies = []
+        asyncio.run(handlers.available_command(_private_update(MID, replies), ctx))
+        assert replies == [MESSAGES["availability_needs_name"]], replies
+
+        pss.roster.set_first_name(MID, 'Robin')
+        replies.clear()
+        asyncio.run(handlers.available_command(_private_update(MID, replies), ctx))
+        assert replies == [MESSAGES["now_available_named"]], replies
+        assert pss.roster.profile(MID).available is True
+
+        replies.clear()
+        asyncio.run(handlers.unavailable_command(_private_update(MID, replies), ctx))
+        assert replies == [MESSAGES["now_unavailable_named"]], replies
+        assert pss.roster.profile(MID).available is False
+    finally:
+        handlers_mod.db_mgr = real_db
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
@@ -559,8 +657,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 11, (
-        "expected at least 11 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 13, (
+        "expected at least 13 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

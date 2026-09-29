@@ -663,6 +663,418 @@ def case_m_the_real_mongo_writers():
     print("OK  m. the real writers: exact filters, BEFORE, no upsert, four outcomes")
 
 
+# --------------------------------------------------------------------------- capture + /name
+# From here on the cases drive the REAL BotHandlers. NamesStubDB is installed as
+# handlers_mod.db_mgr (and main.db_mgr for the refresh cases); the driver below
+# restores the real ones.
+
+def install(stub):
+    handlers_mod.db_mgr = stub
+    main.db_mgr = stub
+    return stub
+
+
+def seed_pss(stub, *docs):
+    """Put the same documents in the stub's Mongo AND in the in-memory roster."""
+    for d in docs:
+        stub.put(PSS_COLL, d)
+    return pss_roster([dict(d) for d in docs])
+
+
+def make_handlers():
+    bot = FakeBot()
+    h = handlers_mod.BotHandlers(SimpleNamespace(bot=bot), SimpleNamespace(bot=bot))
+    return h, bot, SimpleNamespace(bot=bot, args=[])
+
+
+def set_track(runnable=True, directed=True):
+    pss = config.SERVICES['pss']
+    pss.enabled = runnable
+    pss.channel_id = PSS_CHANNEL
+    pss.directed_enabled = directed
+    return pss
+
+
+def write_calls(stub):
+    return stub.called('set_member_display_name')
+
+
+async def case_n_capture_on_a_private_update():
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = seed_pss(stub, member_doc(1001, has_started_bot=False))
+    h, bot, ctx = make_handlers()
+    rec = Rec()
+
+    await h.note_private_contact(text_update(1001, 'hi', rec, first_name='Robin'), ctx)
+    assert stub.calls == [
+        ('mark_member_started', 1001, True, PSS_COLL),
+        ('set_member_first_name', 1001, 'Robin', PSS_COLL),
+    ], stub.calls
+    prof = pss.roster.profile(1001)
+    assert (prof.telegram_first_name, prof.has_started_bot) == ('Robin', True), prof
+    assert rec.replies == [] and bot.sent == [], "the hook never replies or sends"
+
+    # The hot path: nothing changed, so nothing is written.
+    stub.calls.clear()
+    await h.note_private_contact(text_update(1001, 'again', rec, first_name='Robin'), ctx)
+    assert stub.calls == [], stub.calls
+
+    # A Telegram rename follows through, with one write and one INFO line.
+    with catching(logging.INFO) as log:
+        await h.note_private_contact(text_update(1001, 'x', rec, first_name='Rob'), ctx)
+    assert stub.calls == [('set_member_first_name', 1001, 'Rob', PSS_COLL)], stub.calls
+    assert pss.roster.profile(1001).telegram_first_name == 'Rob'
+    assert [r for r in log.records if r.levelno == logging.INFO
+            and all(bit in r.getMessage() for bit in ('1001', "'Robin'", "'Rob'"))], \
+        log.messages()
+    assert rec.replies == [] and bot.sent == []
+    print("OK  n. a private update captures started + first name; unchanged is free; a rename logs")
+
+
+async def case_o_capture_scope_leaves_everything_else_alone():
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = seed_pss(stub, member_doc(1101, has_started_bot=False))
+    hf = config.SERVICES['hf']
+    hf_doc = member_doc(1102, display_name='H', has_started_bot=False)
+    stub.put(HF_COLL, hf_doc)
+    hf.roster.replace_records([dict(hf_doc)])
+    h, bot, ctx = make_handlers()
+    rec = Rec()
+
+    updates = [
+        ('group chat', text_update(1101, 'hi', rec, chat_type='group')),
+        ('channel callback', cb_update(1101, 'x', rec, chat_type='channel')),
+        ('no effective_chat', text_update(1101, 'hi', rec, with_chat=False)),
+        ('HF-only member', text_update(1102, 'hi', rec)),
+        ('non-member', text_update(1199, 'hi', rec)),
+    ]
+    for label, upd in updates:
+        await h.note_private_contact(upd, ctx)
+        assert stub.calls == [], (label, stub.calls)
+        assert rec.replies == [] and rec.answers == [] and bot.sent == [], label
+    assert pss.roster.profile(1101).telegram_first_name == ''
+    assert pss.roster.profile(1101).has_started_bot is False
+    # HF byte-identical: the hook does not even record HF's has_started_bot (that
+    # backfill still lives in handle_message / start_command, as before).
+    assert hf.roster.profile(1102).telegram_first_name == ''
+    assert hf.roster.profile(1102).has_started_bot is False
+    assert pss.roster.profile(1199) is None
+    print("OK  o. groups, channels, chatless updates, HF-only members and strangers are untouched")
+
+
+async def case_p_a_failing_write_never_breaks_the_hook():
+    reset_state()
+
+    class Exploding(NamesStubDB):
+        def set_member_first_name(self, *a, **kw):
+            raise RuntimeError("mongo down")
+
+    stub = install(Exploding())
+    pss = seed_pss(stub, member_doc(1151))
+    h, bot, ctx = make_handlers()
+    rec = Rec()
+    with catching(logging.WARNING) as log:
+        await h.note_private_contact(text_update(1151, 'hi', rec, first_name='Robin'), ctx)
+    assert pss.roster.profile(1151).telegram_first_name == 'Robin', \
+        "memory still updates; the next contact re-writes Mongo"
+    assert any(r.levelno == logging.WARNING for r in log.records), log.messages()
+    assert rec.replies == [] and bot.sent == []
+
+    # And the outer guard: even an exception from the capture itself is swallowed.
+    def boom(user):
+        raise RuntimeError("bug")
+    h._note_supporter_contact = boom
+    with catching(logging.WARNING) as log:
+        await h.note_private_contact(text_update(1151, 'hi', rec), ctx)
+    assert any(r.levelno == logging.WARNING for r in log.records), log.messages()
+    print("OK  p. a failed Mongo write or a bug in the capture never raises out of the hook")
+
+
+async def case_q_a_just_approved_member_is_listed_on_first_contact():
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = pss_roster([])
+    stub.put(PSS_COLL, member_doc(1201, has_started_bot=False))
+    pss.roster.add(1201)                      # what registration approval does
+    assert pss.roster.profile(1201) is None
+    assert config.available_supporters('pss') == []
+
+    h, _bot, ctx = make_handlers()
+    await h.note_private_contact(text_update(1201, 'hello', Rec(), first_name='Robin'), ctx)
+    got = [p.telegram_id for p in config.available_supporters('pss')]
+    assert got == [1201], got
+    assert config.supporter_label('pss', 1201) == 'Robin'
+    print("OK  q. a member approved minutes ago is listed as soon as they message the bot")
+
+
+async def case_r_the_roster_refresh_does_not_clobber_names():
+    import ast
+    import inspect
+    import textwrap
+
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = seed_pss(stub, member_doc(1301))
+    h, _bot, ctx = make_handlers()
+
+    await h.note_private_contact(text_update(1301, 'hi', Rec(), first_name='Robin'), ctx)
+    await main.refresh_all_rosters()
+    assert pss.roster.profile(1301).telegram_first_name == 'Robin'
+    assert config.supporter_label('pss', 1301) == 'Robin'
+
+    rec = Rec()
+    await h.name_command(text_update(1301, '/name Sam', rec, first_name='Robin'), ctx)
+    assert rec.replies[-1][0] == MESSAGES['name_saved'].format(name='Sam'), rec.replies
+    await main.refresh_all_rosters()
+    assert config.supporter_label('pss', 1301) == 'Sam'
+
+    # Structural guard for the argument above: the refresh reads and replaces with
+    # no await inside its per-track loop, and both writers are plain functions, so
+    # neither can interleave with the other on one event loop.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main.refresh_all_rosters)))
+    loops = [n for n in ast.walk(tree) if isinstance(n, ast.For)]
+    assert loops, "refresh_all_rosters no longer loops over the tracks; re-check this guard"
+    for loop in loops:
+        for stmt in loop.body:
+            awaits = [n for n in ast.walk(stmt) if isinstance(n, ast.Await)]
+            assert not awaits, "an await inside refresh_all_rosters' loop can clobber a capture"
+    assert not inspect.iscoroutinefunction(handlers_mod.BotHandlers._record_first_name_on)
+    assert not inspect.iscoroutinefunction(handlers_mod.BotHandlers._record_started_on)
+    print("OK  r. a captured name and a /name override both survive the 5-minute refresh")
+
+
+async def case_s_name_is_silent_to_everyone_else():
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = seed_pss(stub, member_doc(1401, first_name='Robin'))
+    hf = config.SERVICES['hf']
+    hf.roster.replace_records([member_doc(1402, display_name='H', first_name='H')])
+    stub.put(HF_COLL, member_doc(1402, display_name='H'))
+    stub.put(PSS_COLL, member_doc(1403, first_name='Gone', active=False))
+    h, bot, ctx = make_handlers()
+
+    for label, uid, kw in (
+        ('student non-member', 1499, {}),
+        ('HF-only member', 1402, {}),
+        ('deactivated member', 1403, {}),
+        ('PSS member in a group', 1401, {'chat_type': 'group'}),
+        ('PSS member, no chat', 1401, {'with_chat': False}),
+    ):
+        for text in ('/name', '/name Sam', '/name reset'):
+            rec = Rec()
+            await h.name_command(text_update(uid, text, rec, **kw), ctx)
+            assert rec.replies == [], (label, text, rec.replies)
+            assert bot.sent == [], (label, text)
+            assert stub.calls == [], (label, text, stub.calls)
+
+    # Deactivated in Mongo but still in this process's memory (up to 5 minutes).
+    stub.members[PSS_COLL][1401]['active'] = False
+    rec = Rec()
+    await h.name_command(text_update(1401, '/name Sam', rec), ctx)
+    assert rec.replies == [] and bot.sent == [], rec.replies
+    assert pss.roster.profile(1401).display_name == ''
+    assert config.supporter_label('pss', 1401) == 'Robin'
+    print("OK  s. /name answers students, HF, deactivated, groups and chatless updates with silence")
+
+
+async def case_t_name_shows_the_current_name():
+    reset_state()
+    stub = install(NamesStubDB())
+    seed_pss(stub,
+             member_doc(1501, first_name='Robin'),
+             member_doc(1502, display_name='Sam', first_name='Sammy'),
+             member_doc(1503, first_name='Alex (he/him)'))
+    h, _bot, ctx = make_handlers()
+    set_track(runnable=True, directed=True)
+
+    async def show(uid, first):
+        rec = Rec()
+        await h.name_command(text_update(uid, '/name', rec, first_name=first), ctx)
+        assert len(rec.replies) == 1, rec.replies
+        return rec.replies[0][0]
+
+    assert await show(1501, 'Robin') == MESSAGES['name_current_telegram'].format(name='Robin')
+    assert await show(1502, 'Sammy') == MESSAGES['name_current_chosen'].format(name='Sam')
+    assert await show(1503, 'Alex (he/him)') == MESSAGES['name_current_none']
+
+    # A collision: every member of it is numbered, and told why.
+    seed_pss(stub, member_doc(1504, first_name='Robin'), member_doc(1505, first_name='Robin'))
+    assert await show(1504, 'Robin') == (
+        MESSAGES['name_current_telegram'].format(name='Robin (1)')
+        + '\n\n' + MESSAGES['name_suffix_note'])
+
+    # The list is not live yet: say so, but still show the name they WILL have.
+    seed_pss(stub, member_doc(1501, first_name='Robin'))
+    base = MESSAGES['name_current_telegram'].format(name='Robin')
+    set_track(runnable=True, directed=False)
+    assert await show(1501, 'Robin') == base + '\n\n' + MESSAGES['name_list_off_note']
+    set_track(runnable=False, directed=True)
+    assert await show(1501, 'Robin') == base + '\n\n' + MESSAGES['name_list_off_note']
+    set_track(runnable=True, directed=True)
+    assert await show(1501, 'Robin') == base
+    assert write_calls(stub) == [], "showing never writes"
+    print("OK  t. /name alone shows the listed name, its source, the suffix and the list-off note")
+
+
+async def case_u_name_sets_an_override_memory_before_reply():
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = seed_pss(stub, member_doc(1601, first_name='Robin'))
+    h, _bot, ctx = make_handlers()
+    set_track()
+
+    seen = []
+
+    async def reply_text(t, reply_markup=None, **kw):
+        # At CALL time, before the await completes: memory is already written.
+        assert pss.roster.profile(1601).display_name == 'Sam Lee', \
+            "memory must be updated before the reply is awaited"
+        seen.append((t, kw))
+
+    upd = text_update(1601, '/name   Sam   Lee ', Rec())
+    upd.message.reply_text = reply_text
+    with catching(logging.INFO) as log:
+        await h.name_command(upd, ctx)
+
+    assert write_calls(stub) == [('set_member_display_name', 1601, 'Sam Lee', PSS_COLL)], \
+        stub.calls
+    assert seen == [(MESSAGES['name_saved'].format(name='Sam Lee'), {})], \
+        "plain text: no parse_mode or any other kwarg"
+    assert stub.members[PSS_COLL][1601]['display_name'] == 'Sam Lee'
+    lines = [m for m in log.messages()
+             if '1601' in m and "'Robin'" in m and "'Sam Lee'" in m]
+    assert lines, log.messages()
+    assert config.supporter_label('pss', 1601) == 'Sam Lee'
+    print("OK  u. /name <text> writes Mongo once, then memory, then replies, and logs old -> new")
+
+
+NAME_REJECTIONS = (
+    ('/name Sam\nLee', 'name_multiline'),
+    ('/name ​Sam', 'name_invisible_chars'),
+    ('/name Sam‮', 'name_invisible_chars'),
+    ('/name ' + 'x' * 33, 'name_too_long'),
+    ('/name sam@x', 'name_has_at'),
+    ('/name t.me/sam', 'name_looks_like_link'),
+    ('/name Call 91234567', 'name_has_phone'),
+    ('/name <b>Sam</b>', 'name_bad_chars'),
+    ('/name Sam (2)', 'name_bad_chars'),
+    ('/name 1234', 'name_numeric'),
+    ('/name \U0001F33B', 'name_needs_letter'),
+    ('/name Cancel', 'name_reserved'),
+    ('/name busy', 'name_reserved'),
+)
+
+
+async def case_v_name_rejections_are_specific_and_write_nothing():
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = seed_pss(stub, member_doc(1701, first_name='Robin'))
+    h, _bot, ctx = make_handlers()
+    for text, key in NAME_REJECTIONS:
+        rec = Rec()
+        await h.name_command(text_update(1701, text, rec), ctx)
+        assert rec.replies == [(MESSAGES[key], None)], (text, rec.replies)
+        assert write_calls(stub) == [], (text, stub.calls)
+        prof = pss.roster.profile(1701)
+        assert (prof.display_name, config.listed_name(prof)) == ('', 'Robin'), (text, prof)
+    print("OK  v. every rejected /name gets its exact reason and changes nothing")
+
+
+async def case_w_name_taken_by_another_supporter():
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = seed_pss(stub, member_doc(1801, first_name='Alex'),
+                   member_doc(1802, first_name='Robin'))
+    h, _bot, ctx = make_handlers()
+    for text in ('/name alex', '/name ALEX', '/name Аlex'):   # the last is Cyrillic А
+        rec = Rec()
+        await h.name_command(text_update(1802, text, rec), ctx)
+        assert rec.replies == [(MESSAGES['name_taken'], None)], (text, rec.replies)
+        assert write_calls(stub) == [], text
+    rec = Rec()
+    await h.name_command(text_update(1802, '/name Alexa', rec), ctx)
+    assert rec.replies[-1][0] == MESSAGES['name_saved'].format(name='Alexa'), rec.replies
+    assert pss.roster.profile(1802).display_name == 'Alexa'
+    print("OK  w. a name another supporter is listed under (any case, homoglyphs) is refused")
+
+
+async def case_x_setting_the_same_name_again_is_a_no_op():
+    reset_state()
+    stub = install(NamesStubDB())
+    seed_pss(stub, member_doc(1851, display_name='Sam', first_name='Robin'))
+    h, _bot, ctx = make_handlers()
+    rec = Rec()
+    await h.name_command(text_update(1851, '/name  Sam ', rec), ctx)
+    assert rec.replies == [(MESSAGES['name_unchanged'], None)], rec.replies
+    assert write_calls(stub) == []
+    print("OK  x. re-setting the current chosen name writes nothing")
+
+
+async def case_y_reset_and_the_botname_form():
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = seed_pss(stub,
+                   member_doc(1901, display_name='Sam', first_name='Robin'),
+                   member_doc(1902, display_name='Sam2', first_name='Alex (he/him)'),
+                   member_doc(1903, first_name='Mei'),
+                   member_doc(1904, display_name='Zed', first_name='Kim'))
+    h, _bot, ctx = make_handlers()
+
+    rec = Rec()
+    with catching(logging.INFO) as log:
+        await h.name_command(text_update(1901, '/name reset', rec, first_name='Robin'), ctx)
+    assert rec.replies == [(MESSAGES['name_reset_done'].format(name='Robin'), None)], rec.replies
+    assert write_calls(stub) == [('set_member_display_name', 1901, '', PSS_COLL)], stub.calls
+    assert pss.roster.profile(1901).display_name == ''
+    assert [m for m in log.messages() if '1901' in m and "'Sam'" in m and "'Robin'" in m], \
+        log.messages()
+
+    rec = Rec()
+    await h.name_command(text_update(1902, '/name reset', rec, first_name='Alex (he/him)'), ctx)
+    assert rec.replies == [(MESSAGES['name_reset_done_no_name'], None)], rec.replies
+
+    stub.calls.clear()
+    rec = Rec()
+    await h.name_command(text_update(1903, '/name reset', rec, first_name='Mei'), ctx)
+    assert rec.replies == [(MESSAGES['name_reset_nothing'], None)], rec.replies
+    assert write_calls(stub) == []
+
+    rec = Rec()
+    await h.name_command(text_update(1904, '/name RESET', rec, first_name='Kim'), ctx)
+    assert rec.replies == [(MESSAGES['name_reset_done'].format(name='Kim'), None)], rec.replies
+
+    rec = Rec()
+    await h.name_command(text_update(1903, '/name@hearhtfelt_companion_bot Sam', rec,
+                                     first_name='Mei'), ctx)
+    assert rec.replies == [(MESSAGES['name_saved'].format(name='Sam'), None)], rec.replies
+    assert pss.roster.profile(1903).display_name == 'Sam'
+    print("OK  y. reset goes back to the Telegram name (or says there is none); /name@bot works")
+
+
+async def case_z_write_failures():
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = seed_pss(stub, member_doc(1951, first_name='Robin'))
+    h, _bot, ctx = make_handlers()
+
+    stub.force_display_outcome = 'error'
+    rec = Rec()
+    await h.name_command(text_update(1951, '/name Sam', rec), ctx)
+    assert rec.replies == [(MESSAGES['availability_failed'], None)], rec.replies
+    assert pss.roster.profile(1951).display_name == '', "memory unchanged on a failed write"
+
+    stub.force_display_outcome = None
+    stub.db_available = False
+    rec = Rec()
+    await h.name_command(text_update(1951, '/name Sam', rec), ctx)
+    assert rec.replies == [(MESSAGES['name_saved'].format(name='Sam') + '\n\n'
+                            + MESSAGES['availability_memory_only'], None)], rec.replies
+    assert pss.roster.profile(1951).display_name == 'Sam'
+    print("OK  z. a Mongo error changes nothing; Mongo offline saves in memory and says so")
+
+
 CASES = [
     case_a_accepted_names,
     case_b_rejected_names_give_their_exact_key,
@@ -677,6 +1089,19 @@ CASES = [
     case_k_name_taken_by_other,
     case_l_reserved_words_cover_the_bots_own_ui,
     case_m_the_real_mongo_writers,
+    case_n_capture_on_a_private_update,
+    case_o_capture_scope_leaves_everything_else_alone,
+    case_p_a_failing_write_never_breaks_the_hook,
+    case_q_a_just_approved_member_is_listed_on_first_contact,
+    case_r_the_roster_refresh_does_not_clobber_names,
+    case_s_name_is_silent_to_everyone_else,
+    case_t_name_shows_the_current_name,
+    case_u_name_sets_an_override_memory_before_reply,
+    case_v_name_rejections_are_specific_and_write_nothing,
+    case_w_name_taken_by_another_supporter,
+    case_x_setting_the_same_name_again_is_a_no_op,
+    case_y_reset_and_the_botname_form,
+    case_z_write_failures,
 ]
 
 
@@ -691,8 +1116,8 @@ if __name__ == "__main__":
     # A driver that discovers its own tests reports success when it discovers
     # NOTHING. A refactor, a rename, an import shadow or a bad merge all reach that
     # state. Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 13, (
-        "expected at least 13 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 26, (
+        "expected at least 26 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )
