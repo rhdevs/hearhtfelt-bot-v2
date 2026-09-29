@@ -21,6 +21,7 @@ from config import (
     is_supporter_available,
     picker_views,
     queue_entries,
+    supporter_label,
     queue_order,
     user_states,
     user_to_queue_map,
@@ -558,6 +559,10 @@ class QueueManager:
             return 'gone'
 
         svc = get_service(entry.get('service'))
+        # KILL SWITCH: a picker button rendered before PSS_DIRECTED_ENABLED was
+        # turned off must not DM anyone.
+        if not svc.directed_enabled:
+            return 'busy'
         try:
             member_int = int(member_id)
         except (TypeError, ValueError):
@@ -592,8 +597,7 @@ class QueueManager:
             user_states[requester_id] = UserState.IN_QUEUE
         # ------------------------------------------------------------------------
 
-        profile = svc.roster.profile(member_int)
-        member_name = profile.display_name if profile is not None else ""
+        member_name = supporter_label(svc.key, member_int)
 
         description = entry.get('description') or ''
         text = MESSAGES["directed_request"].format(
@@ -892,8 +896,7 @@ class QueueManager:
             if target is None:
                 continue
 
-            profile = svc.roster.profile(target)
-            name = profile.display_name if profile is not None else ""
+            name = supporter_label(svc.key, target)
 
             if await self.undirect(queue_id, target, reason='timeout'):
                 # Only the winner speaks to the requester.

@@ -39,7 +39,7 @@ BLAME_WORDS = ("declin", "rejected", "dropped", "abandoned", "gave up",
 NO_BLAME_KEYS = (
     "comfort_question", "comfort_specific_button", "comfort_anyone_button",
     "picker_nobody_free", "picker_lost_view", "picker_not_a_number",
-    "picker_busy", "picker_unreachable", "picker_header", "picker_hint",
+    "picker_busy", "picker_busy_marker", "picker_header", "picker_hint",
     "directed_sent", "directed_unavailable", "next_step_question",
     "directed_status", "choosing_status", "choosing_expired", "directed_gone",
 )
@@ -184,6 +184,7 @@ def test_phase_five_and_six_templates_render():
         "directed_status": MESSAGES["directed_status"].format(name="Alex"),
         "directed_sent": MESSAGES["directed_sent"].format(name="Alex"),
         "picker_page": MESSAGES["picker_page"].format(page=2, pages=3),
+        "picker_busy": MESSAGES["picker_busy"].format(name="Alex"),
         "directed_request": MESSAGES["directed_request"].format(
             description="a thing", window="24 hours"),
     }
@@ -192,6 +193,39 @@ def test_phase_five_and_six_templates_render():
         assert text.strip(), key
     assert "Alex" in rendered["directed_unavailable"]
     assert "Page 2 of 3" == rendered["picker_page"]
+    assert "Alex" in rendered["picker_busy"]
+
+
+def test_picker_labels_are_the_approved_wording():
+    """The user approved these exact words. A casual rewording is a product change."""
+    assert MESSAGES["comfort_specific_button"] == "A specific peer supporter"
+    assert MESSAGES["comfort_anyone_button"] == "Any available peer supporter"
+    assert MESSAGES["picker_anyone_button"] == "Send to anyone instead"
+    assert MESSAGES["picker_cancel_button"] == "Cancel"
+    assert MESSAGES["picker_busy_marker"] == "(busy)"
+
+
+def test_html_picker_copy_is_parse_safe():
+    """These go out with parse_mode HTML. A literal <, > or & in the copy itself
+    would be read as markup and the whole message rejected by Telegram."""
+    for key in ("picker_header", "picker_hint", "picker_page", "picker_nobody_free",
+                "picker_lost_view", "picker_not_a_number", "picker_busy",
+                "picker_busy_marker", "directed_sent"):
+        for ch in "<>&":
+            assert ch not in MESSAGES[key], (key, ch, MESSAGES[key])
+
+
+def test_every_button_label_is_a_reserved_name():
+    """A supporter named "Cancel" or "(busy)" would be indistinguishable from the
+    bot's own buttons and markers on the list."""
+    import config
+    from src.supporter_names import name_key
+    labels = {k: v for k, v in MESSAGES.items()
+              if k.endswith("_button") and isinstance(v, str)}
+    labels["picker_busy_marker"] = MESSAGES["picker_busy_marker"]
+    assert len(labels) >= 10, labels
+    for key, value in labels.items():
+        assert name_key(value) in config.RESERVED_NAME_KEYS, (key, value)
 
 
 def test_member_addendum_names_the_member_only_commands():
@@ -330,8 +364,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 16, (
-        "expected at least 16 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 19, (
+        "expected at least 19 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

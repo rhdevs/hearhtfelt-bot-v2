@@ -328,8 +328,9 @@ def _restore_pending(docs, queue_manager, stats, dry_run) -> None:
                 entry['routing'] = 'choosing'
 
             if target is not None and target in directed_by_member:
-                # Should be unreachable: available_supporters() excludes anyone already
-                # in this index, so two live requests cannot name the same supporter.
+                # Should be unreachable: is_supporter_available() treats anyone already
+                # in this index as busy, and send_directed_request refuses them, so
+                # two live requests cannot name the same supporter.
                 # Keep the OLDER one (docs arrive created_at ASC) and say so loudly.
                 logger.warning(
                     "Pending %s targets member %s who already holds request %s; "

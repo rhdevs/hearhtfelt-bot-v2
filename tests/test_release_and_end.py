@@ -477,11 +477,16 @@ async def case_e_release_on_directed_provenance_never_touches_the_channel():
     assert datas == ["pk_l:0", "pk_o", "pk_x"], datas
     assert_no_blame(to_requester, "the requester")
 
-    # And the picker really does exclude the person who just released.
+    # And the picker really does refuse the person who just released: listed, but
+    # marked busy with no button -- the reason is never shown.
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
-    text = [t for t, _m in rec.replies][-1]
-    assert "Sup %d" % MEMBER not in text, text
+    text, markup = rec.replies[-1]
+    assert "Sup %d (busy)" % MEMBER in text, text
     assert "Sup %d" % SECOND_MEMBER in text, text
+    assert "Sup %d (busy)" % SECOND_MEMBER not in text, text
+    datas = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "pk_s:%d" % MEMBER not in datas, datas
+    assert "pk_s:%d" % SECOND_MEMBER in datas, datas
     print("OK  e. /release on a directed request stays off the channel and re-offers the choice")
 
 

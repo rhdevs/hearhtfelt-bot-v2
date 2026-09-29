@@ -18,7 +18,6 @@ from config import (
     CB_PICK_SELECT,
     SERVICES,
     UserState,
-    available_supporters,
     picker_views,
     user_states,
     user_to_queue_map,
@@ -40,8 +39,11 @@ from config import (
     default_service_key,
     get_service,
     help_request_text,
+    directed_fork_offered,
     listed_name,
     name_taken_by_other,
+    omitted_supporters,
+    picker_entries,
     supporter_label,
     supporter_name_problem,
 )
@@ -1237,8 +1239,8 @@ class BotHandlers:
             return MESSAGES["choosing_status"]
         if routing == 'directed':
             # Discloses only the supporter this requester chose themselves.
-            profile = svc.roster.profile(entry.get('target_member_id'))
-            name = profile.display_name if profile is not None else svc.member_label
+            name = (supporter_label(svc.key, entry.get('target_member_id'))
+                    or svc.member_label)
             return MESSAGES["directed_status"].format(name=name)
         return MESSAGES["queue_status"].format(member=svc.member_label)
 
@@ -1382,13 +1384,16 @@ class BotHandlers:
 
         user_telehandle = f"@{update.effective_user.username}" if update.effective_user.username else None
 
-        # THE FORK. `if options:` is load-bearing in three separate ways: no pickable
-        # supporters means no dead-end UI, means HF (directed_enabled False) never
-        # reaches it, and means the pre-Phase-5 suites -- whose rosters are bare ints
-        # with no display names -- keep driving the original path below untouched.
+        # THE FORK: "a specific peer supporter" or "any available peer supporter".
+        # Shown iff directed mode is on for the track AND at least one listable
+        # supporter (active, with a known name) exists other than the requester.
+        # It is shown EVEN WHEN ALL OF THEM ARE BUSY: the list then marks every one
+        # busy and puts send-to-anyone first, which is honest and still one tap from
+        # the channel. HF (directed_enabled False) never reaches it, and neither do
+        # the pre-Phase-5 suites, whose rosters are bare ints with no names -- they
+        # keep driving the original path below untouched.
         svc = get_service(service_key)
-        options = available_supporters(svc.key) if svc.directed_enabled else []
-        if options:
+        if directed_fork_offered(svc.key, user_id):
             # The Mongo row is created BEFORE the question, so a restart mid-question
             # is recoverable rather than a request that quietly never existed.
             queue_id = self.queue_manager.add_to_queue(
@@ -1611,58 +1616,93 @@ class BotHandlers:
 
     async def _render_picker(self, query, context, user_id: int, queue_id: str,
                              page: int, note: str = "") -> bool:
-        """Render one page of choosable supporters. False when there is nobody to show.
+        """Render one page of the supporter list. False when nobody can be shown.
 
-        Numbers are 1-based and PAGE-LOCAL, and the view is recorded BEFORE the
-        message is sent so a very fast reply cannot race the record and be read
-        against the previous page.
+        EVERY listable supporter is shown, numbered; anyone who cannot be asked
+        right now carries the one busy marker and no button, whatever the reason.
+        Numbers are 1-based and PAGE-LOCAL and cover busy entries too, so a typed
+        number means what is on screen; send_directed_request's live re-check is
+        what refuses a busy one. The view is recorded BEFORE the message is sent so
+        a very fast reply cannot race the record and be read against the previous
+        page.
+
+        `note` is already HTML-safe (its {name} was escaped by the caller) and is
+        deliberately NOT escaped again here.
         """
         entry = self.queue_manager.get_queue_entry(queue_id)
         if entry is None:
             return False
 
         svc = get_service(entry.get('service'))
-        declined = set(entry.get('declined_by') or [])
-        options = [p for p in available_supporters(svc.key)
-                   if p.telegram_id not in declined]
+        # KILL SWITCH: with directed mode off, a picker button rendered before the
+        # switch was flipped must not show a single name.
+        entries = (picker_entries(svc.key, requester_id=user_id,
+                                  declined=entry.get('declined_by') or [])
+                   if svc.directed_enabled else [])
 
-        if not options:
+        if svc.directed_enabled:
+            omitted = omitted_supporters(svc.key)
+            if omitted:
+                # Ids only -- these are exactly the people with no usable name. A
+                # supporter who expected to be listed must be findable in the logs.
+                logger.info("%d %s roster member(s) left off the list for want of a "
+                            "usable name: %s", len(omitted), svc.key, omitted)
+
+        prefix = (note + "\n\n") if note else ""
+
+        if not entries:
             # NEVER render an empty list: a picker with no names is a dead end with no
             # way out but /cancel.
             picker_views.pop(user_id, None)
             await self._send_or_edit(
-                query, context, user_id, MESSAGES["picker_nobody_free"],
+                query, context, user_id, prefix + MESSAGES["picker_nobody_free"],
                 InlineKeyboardMarkup([
                     [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
                                           callback_data=CB_PICK_OPEN)],
                     [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
                                           callback_data=CB_PICK_CANCEL)],
-                ]))
+                ]), parse_mode='HTML')
             return False
 
+        anyone_free = any(free for _profile, _label, free in entries)
+
         page_size = max(1, svc.picker_page_size)
-        pages = max(1, (len(options) + page_size - 1) // page_size)
+        pages = max(1, (len(entries) + page_size - 1) // page_size)
         try:
             page = int(page)
         except (TypeError, ValueError):
             page = 0
         page = max(0, min(page, pages - 1))
-        chunk = options[page * page_size:(page + 1) * page_size]
+        chunk = entries[page * page_size:(page + 1) * page_size]
 
+        # Name only. The blurb stays in the data and the CLI but is never shown.
         lines = []
-        for number, profile in enumerate(chunk, start=1):
-            lines.append(f"{number}. {html.escape(profile.display_name)}")
-            if profile.blurb:
-                lines.append(f"   {html.escape(profile.blurb)}")
+        for number, (_profile, label, free) in enumerate(chunk, start=1):
+            line = f"{number}. {html.escape(label)}"
+            if not free:
+                line += " " + html.escape(MESSAGES["picker_busy_marker"])
+            lines.append(line)
 
-        text = ((note + "\n\n") if note else "") + MESSAGES["picker_header"] + "\n\n"
-        text += "\n".join(lines) + "\n\n" + MESSAGES["picker_hint"]
+        text = prefix
+        if not anyone_free:
+            text += MESSAGES["picker_nobody_free"] + "\n\n"
+        text += MESSAGES["picker_header"] + "\n\n" + "\n".join(lines)
+        if anyone_free:
+            text += "\n\n" + MESSAGES["picker_hint"]
         if pages > 1:
             text += "\n" + MESSAGES["picker_page"].format(page=page + 1, pages=pages)
 
-        rows = [[InlineKeyboardButton(f"{number}. {profile.display_name}"[:60],
-                                      callback_data=f"{CB_PICK_SELECT}:{profile.telegram_id}")]
-                for number, profile in enumerate(chunk, start=1)]
+        anyone_row = [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
+                                           callback_data=CB_PICK_OPEN)]
+        rows = []
+        if not anyone_free:
+            # Nobody can be picked, so the way forward goes first, where it is seen.
+            rows.append(anyone_row)
+        # Buttons for the FREE only. Button text is plain -- no parse mode applies.
+        rows.extend(
+            [InlineKeyboardButton(f"{number}. {label}"[:60],
+                                  callback_data=f"{CB_PICK_SELECT}:{profile.telegram_id}")]
+            for number, (profile, label, free) in enumerate(chunk, start=1) if free)
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton(MESSAGES["picker_back_button"],
@@ -1672,16 +1712,17 @@ class BotHandlers:
                                             callback_data=f"{CB_PICK_LIST}:{page + 1}"))
         if nav:
             rows.append(nav)
-        rows.append([InlineKeyboardButton(MESSAGES["picker_anyone_button"],
-                                          callback_data=CB_PICK_OPEN)])
+        if anyone_free:
+            rows.append(anyone_row)
         rows.append([InlineKeyboardButton(MESSAGES["picker_cancel_button"],
                                           callback_data=CB_PICK_CANCEL)])
 
-        # RECORD BEFORE SENDING.
+        # RECORD BEFORE SENDING. Busy ids included, so a typed number lines up with
+        # the numbered list on screen.
         picker_views[user_id] = {
             'queue_id': queue_id,
             'page': page,
-            'ids': [p.telegram_id for p in chunk],
+            'ids': [profile.telegram_id for profile, _label, _free in chunk],
             'rendered_at': utcnow(),
         }
 
@@ -1789,9 +1830,7 @@ class BotHandlers:
 
         if outcome == 'ok':
             entry = self.queue_manager.get_queue_entry(queue_id)
-            svc = get_service(entry.get('service')) if entry else None
-            profile = svc.roster.profile(member_id) if svc is not None else None
-            name = profile.display_name if profile is not None else ""
+            name = supporter_label(entry.get('service'), member_id) if entry else ""
             picker_views.pop(user_id, None)
             await self._send_or_edit(
                 query, context, user_id,
@@ -1804,14 +1843,22 @@ class BotHandlers:
                 ]), parse_mode='HTML')
             return
 
-        if outcome == 'busy':
-            await self._render_picker(query, context, user_id, queue_id, 0,
-                                      MESSAGES["picker_busy"])
-            return
-
-        if outcome == 'unreachable':
-            await self._render_picker(query, context, user_id, queue_id, 0,
-                                      MESSAGES["picker_unreachable"])
+        if outcome in ('busy', 'unreachable'):
+            # ONE wording for every reason, so a decline, a /unavailable, a
+            # conversation and an unreachable chat are indistinguishable. Re-render
+            # the page they were looking at, not page one.
+            # With directed mode switched off (the kill switch) not even the note
+            # may carry a name: the render below shows none either.
+            entry = self.queue_manager.get_queue_entry(queue_id)
+            svc = get_service(entry.get('service')) if entry is not None else None
+            name = (supporter_label(svc.key, member_id)
+                    if svc is not None and svc.directed_enabled else "") or "That person"
+            view = picker_views.get(user_id)
+            page = (view.get('page', 0)
+                    if view is not None and view.get('queue_id') == queue_id else 0)
+            await self._render_picker(
+                query, context, user_id, queue_id, page,
+                MESSAGES["picker_busy"].format(name=html.escape(name)))
             return
 
         # 'gone'. Two very different situations reach here, and directed_gone --
@@ -1875,10 +1922,8 @@ class BotHandlers:
 
         # --- declining -------------------------------------------------------
         entry = self.queue_manager.get_queue_entry(queue_id)
-        name = ""
-        if entry is not None:
-            profile = get_service(entry.get('service')).roster.profile(user_id)
-            name = profile.display_name if profile is not None else ""
+        # Unescaped on purpose: _offer_next_step sends plain text.
+        name = supporter_label(entry.get('service'), user_id) if entry is not None else ""
 
         if not await self.queue_manager.undirect(queue_id, user_id, reason='declined',
                                                  notify_member=False):

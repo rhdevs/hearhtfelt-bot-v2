@@ -19,6 +19,7 @@ Run directly: `python tests/test_directed_requests.py`
 
 import asyncio
 import datetime
+import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -394,12 +395,16 @@ async def case_a_fork_appears_and_nothing_reaches_the_channel():
     assert text == config.MESSAGES["comfort_question"], text
     datas = sorted(b.callback_data for row in markup.inline_keyboard for b in row)
     assert datas == ["pk_l:0", "pk_o"], datas
+    texts = [b.text for row in markup.inline_keyboard for b in row]
+    assert texts == [config.MESSAGES["comfort_specific_button"],
+                     config.MESSAGES["comfort_anyone_button"]] == [
+        "A specific peer supporter", "Any available peer supporter"], texts
     print("OK  a. the fork appears, the row is 'choosing', and the channel sees nothing")
 
 
 async def case_b_no_pickable_supporters_means_no_fork():
-    """THE LOAD-BEARING PROPERTY. A roster of bare ints has no display names, so
-    available_supporters() is empty, so the fork never fires -- which is exactly why
+    """THE LOAD-BEARING PROPERTY. A roster of bare ints has no names at all, so there
+    are no listable supporters, so the fork never fires -- which is exactly why
     test_pss_flow.py and test_restore.py needed nothing but a reset_state() clear."""
     bot, sm, qm, handlers, stub = setup(supporters=0)
     config.SERVICES["pss"].roster.replace([supporter_id(0)])
@@ -449,8 +454,8 @@ async def case_d_picker_renders_and_records_what_was_shown():
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     text, markup = rec.replies[-1]
     assert config.MESSAGES["picker_header"] in text, text
-    assert "1. Alex" in text and "2. Alex" in text and "3. bea" in text, text
-    assert "Second-year." in text, "a blurb renders under its name"
+    assert "1. Alex (1)" in text and "2. Alex (2)" in text and "3. bea" in text, text
+    assert "Second-year." not in text, "the list is names only; a blurb is never shown"
     assert config.MESSAGES["picker_page"].split("{")[0] not in text, \
         "a single page must not print a page counter"
 
@@ -460,7 +465,7 @@ async def case_d_picker_renders_and_records_what_was_shown():
     # casefold ordering, id tiebreak: Alex(3001), Alex(3002), bea(3000)
     assert view['ids'] == [supporter_id(1), supporter_id(2), supporter_id(0)], view['ids']
     labels = [b.text for row in markup.inline_keyboard for b in row]
-    assert labels[:3] == ["1. Alex", "2. Alex", "3. bea"], labels
+    assert labels[:3] == ["1. Alex (1)", "2. Alex (2)", "3. bea"], labels
     print("OK  d. the picker renders in a stable order and records exactly what it showed")
 
 
@@ -663,10 +668,13 @@ async def case_j_a_failed_dm_rolls_everything_back():
     assert not [s for s in bot.sent if s[0] == PSS_CHANNEL], \
         "a DM that never landed must not produce a channel note"
 
-    text, _m = rec.replies[-1]
-    assert config.MESSAGES["picker_unreachable"] in text, text
-    assert "Sup 00" not in text, "and the unreachable supporter is off the list"
-    assert "Sup 01" in text
+    text, markup = rec.replies[-1]
+    assert config.MESSAGES["picker_busy"].format(name="Sup 00") in text, (
+        "an unreachable chat reads EXACTLY like busy, so the reason never shows", text)
+    assert "1. Sup 00 (busy)" in text and "2. Sup 01" in text, text
+    assert "2. Sup 01 (busy)" not in text, text
+    datas = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "pk_s:%d" % supporter_id(0) not in datas, datas
 
     # THE REQUESTER MUST BE PUT BACK TOO. send_directed_request moves them to
     # IN_QUEUE before the await; a rollback that returns the ROW to 'choosing' but
@@ -677,14 +685,21 @@ async def case_j_a_failed_dm_rolls_everything_back():
         config.user_states.get(REQUESTER))
     assert entry['waiting_since'] is not None
 
-    # Prove it behaviourally, not just by the enum: the number the picker just told
-    # them to type must still select somebody.
+    # Prove it behaviourally, not just by the enum. '1' is the now-busy Sup 00: it
+    # is still numbered, so it is read as a pick, and refused like any busy one.
     before = stub.count('direct_session')
     await handlers.handle_message(text_update(REQUESTER, "1", rec), ctx)
-    reply = rec.replies[-1][0]
+    reply = bot.texts_to(REQUESTER)[-1]
     assert reply != config.MESSAGES["unknown_command"], (
         "the picker asked for a number and the bot answered 'I'm not sure what you "
         "mean'", reply)
+    assert stub.count('direct_session') == before, (
+        "a typed number for a busy entry must create nothing", stub.calls)
+    assert config.MESSAGES["picker_busy"].format(name="Sup 00") in reply, reply
+    assert "1. Sup 00 (busy)" in reply, reply
+
+    # ... and the number the picker lists as free must still select somebody.
+    await handlers.handle_message(text_update(REQUESTER, "2", rec), ctx)
     assert stub.count('direct_session') == before + 1, (
         "a typed number after a failed send must reach the ONE send path", stub.calls)
     assert config.queue_entries[queue_id]['target_member_id'] == supporter_id(1), (
@@ -849,14 +864,34 @@ async def case_p_a_repick_never_offers_the_decliner_again():
         cb_update(supporter_id(0), "dr_d:%s" % queue_id, rec), ctx)
 
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
-    text, _m = rec.replies[-1]
-    assert "Sup 00" not in text, text
-    assert "Sup 01" in text and "Sup 02" in text, text
-    assert config.picker_views[REQUESTER]['ids'] == [supporter_id(1), supporter_id(2)]
+    text, markup = rec.replies[-1]
+    assert "1. Sup 00 (busy)" in text, text
+    assert "2. Sup 01\n" in text and "3. Sup 02\n" in text, text
+    assert config.picker_views[REQUESTER]['ids'] == [
+        supporter_id(0), supporter_id(1), supporter_id(2)]
+    selects = [b.callback_data for row in markup.inline_keyboard for b in row
+               if b.callback_data.startswith("pk_s:")]
+    assert selects == ["pk_s:%d" % supporter_id(1), "pk_s:%d" % supporter_id(2)], selects
 
-    # And the send path refuses them even if a stale button is tapped.
+    # A stale (or forged) button for the decliner, through the real handler.
+    before_direct = stub.count('direct_session')
+    before_dms = len(bot.texts_to(supporter_id(0)))
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+    assert stub.count('direct_session') == before_direct, stub.calls
+    assert len(bot.texts_to(supporter_id(0))) == before_dms, "no second DM to them"
+    note = config.MESSAGES["picker_busy"].format(name="Sup 00")
+    assert note in rec.replies[-1][0], rec.replies[-1][0]
+
+    # A typed '1' is the same thing.
+    await handlers.handle_message(text_update(REQUESTER, "1", rec), ctx)
+    assert stub.count('direct_session') == before_direct, stub.calls
+    assert len(bot.texts_to(supporter_id(0))) == before_dms
+    assert note in bot.texts_to(REQUESTER)[-1], bot.texts_to(REQUESTER)[-1]
+
+    # And the send path refuses them directly too.
     assert await qm.send_directed_request(queue_id, supporter_id(0)) == 'busy'
-    print("OK  p. a re-pick excludes the decliner, and a stale button for them is refused")
+    print("OK  p. a re-pick marks the decliner busy; no tap or number can reach them")
 
 
 async def case_q_a_lapsed_request_comes_back_after_the_window():
@@ -1349,6 +1384,354 @@ async def case_ac_an_unusable_directed_clock_waits_instead_of_vanishing():
     print("OK  ac. an unusable directed clock waits and is repaired, not silently destroyed")
 
 
+# --------------------------------------------------------------------------- the list
+# The words that would give away WHY somebody is not free. None of them may reach
+# the requester alongside a supporter's name.
+REASON_WORDS = ("conversation", "unavailable", "started", "declin", "waiting", "reach")
+
+
+class LogCatcher(logging.Handler):
+    """Collects records at or above INFO, so a case can assert a log line."""
+
+    def __init__(self):
+        logging.Handler.__init__(self, logging.INFO)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def messages(self):
+        return [r.getMessage() for r in self.records]
+
+
+def list_lines(text):
+    """The numbered lines of a rendered list, exactly as sent."""
+    return [line for line in text.split("\n") if line[:1].isdigit()]
+
+
+def callback_datas(markup):
+    return [b.callback_data for row in markup.inline_keyboard for b in row]
+
+
+async def case_ad_directed_off_means_no_fork_and_no_list():
+    """PSS_DIRECTED_ENABLED is the rollout lever and the kill switch. Off, PSS is the
+    channel exactly as before -- and a picker already sitting in somebody's chat
+    must stop showing names and stop DMing anyone, at once."""
+    bot, sm, qm, handlers, stub = setup(supporters=2)
+    pss = config.SERVICES["pss"]
+    pss.directed_enabled = False
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+
+    queue_id = config.user_to_queue_map[REQUESTER]
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    assert config.user_states[REQUESTER] == UserState.IN_QUEUE
+    posts = [s for s in bot.sent if s[0] == PSS_CHANNEL]
+    assert len(posts) == 1 and posts[0][2] is not None, posts
+    assert rec.replies[-1][0] == config.MESSAGES["queue_added"]
+    assert config.MESSAGES["comfort_question"] not in requester_texts(bot, rec)
+
+    # The kill switch, flipped under a requester already at the list.
+    pss.directed_enabled = True
+    other = REQUESTER + 1
+    rec2 = Rec()
+    await ask_for_help(handlers, rec2, ctx, user_id=other)
+    assert rec2.replies[-1][0] == config.MESSAGES["comfort_question"]
+    await handlers.handle_callback_query(cb_update(other, "pk_l:0", rec2), ctx)
+    assert config.MESSAGES["picker_header"] in rec2.replies[-1][0]
+
+    pss.directed_enabled = False
+    await handlers.handle_callback_query(cb_update(other, "pk_l:0", rec2), ctx)
+    text, markup = rec2.replies[-1]
+    assert text == config.MESSAGES["picker_nobody_free"], text
+    assert "Sup" not in text, text
+    assert callback_datas(markup) == ["pk_o", "pk_x"], callback_datas(markup)
+
+    before = stub.count('direct_session')
+    await handlers.handle_callback_query(
+        cb_update(other, "pk_s:%d" % supporter_id(0), rec2), ctx)
+    assert stub.count('direct_session') == before, stub.calls
+    assert not bot.texts_to(supporter_id(0)), "the kill switch DMs nobody"
+    assert "Sup" not in rec2.replies[-1][0], rec2.replies[-1][0]
+    print("OK  ad. directed mode off => no fork, and a live picker shows no names and DMs nobody")
+
+
+async def case_ae_the_requesters_own_entry_never_counts_or_shows():
+    bot, sm, qm, handlers, stub = setup(supporters=0)
+    pss = config.SERVICES["pss"]
+    rae = {'telegram_id': REQUESTER, 'display_name': "Rae", 'blurb': "",
+           'available': True, 'has_started_bot': True, 'active': True}
+    pss.roster.replace_records([rae])
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    assert config.user_states[REQUESTER] == UserState.IN_QUEUE, (
+        "a supporter asking for help must not be forked onto a list of only themselves")
+    assert config.queue_entries[config.user_to_queue_map[REQUESTER]]['routing'] == 'open'
+    assert config.MESSAGES["comfort_question"] not in [t for t, _m in rec.replies]
+
+    await handlers.cancel_command(text_update(REQUESTER, "/cancel", rec), ctx)
+    assert REQUESTER not in config.user_to_queue_map
+
+    pss.roster.replace_records([rae, supporter_doc(0)])
+    await ask_for_help(handlers, rec, ctx)
+    assert rec.replies[-1][0] == config.MESSAGES["comfort_question"], rec.replies[-1]
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    text, markup = rec.replies[-1]
+    assert "Sup 00" in text and "Rae" not in text, text
+    assert "pk_s:%d" % REQUESTER not in callback_datas(markup)
+    assert config.picker_views[REQUESTER]['ids'] == [supporter_id(0)]
+    print("OK  ae. the requester never counts towards the fork and never sees themselves")
+
+
+async def case_af_everyone_busy_still_forks_and_the_list_says_so():
+    bot, sm, qm, handlers, stub = setup(supporters=2, available=False)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    assert rec.replies[-1][0] == config.MESSAGES["comfort_question"], rec.replies[-1]
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    text, markup = rec.replies[-1]
+    nobody = text.find(config.MESSAGES["picker_nobody_free"])
+    header = text.find(config.MESSAGES["picker_header"])
+    assert 0 <= nobody < header, text
+    assert "1. Sup 00 (busy)" in text and "2. Sup 01 (busy)" in text, text
+    assert config.MESSAGES["picker_hint"] not in text, (
+        "'tap a name' with no name to tap is a dead end", text)
+
+    rows = markup.inline_keyboard
+    assert [(b.text, b.callback_data) for b in rows[0]] == [
+        (config.MESSAGES["picker_anyone_button"], "pk_o")], rows[0]
+    assert not [d for d in callback_datas(markup) if d.startswith("pk_s:")]
+    assert [(b.text, b.callback_data) for b in rows[-1]] == [
+        (config.MESSAGES["picker_cancel_button"], "pk_x")], rows[-1]
+    assert config.picker_views[REQUESTER]['ids'] == [supporter_id(0), supporter_id(1)]
+
+    before = stub.count('direct_session')
+    await handlers.handle_message(text_update(REQUESTER, "1", rec), ctx)
+    assert stub.count('direct_session') == before, stub.calls
+    reply = bot.texts_to(REQUESTER)[-1]
+    assert config.MESSAGES["picker_busy"].format(name="Sup 00") in reply, reply
+    assert "1. Sup 00 (busy)" in reply, reply
+    print("OK  af. everyone busy still forks; the list says so and leads with send-to-anyone")
+
+
+async def case_ag_every_busy_reason_looks_the_same():
+    bot, sm, qm, handlers, stub = setup(supporters=0)
+    config.SERVICES["pss"].roster.replace_records([
+        supporter_doc(0),                           # free: the control
+        supporter_doc(1, has_started_bot=False),
+        supporter_doc(2, available=False),
+        supporter_doc(3),
+        supporter_doc(4),
+        supporter_doc(5),
+        supporter_doc(6),
+    ])
+    config.user_to_session_map[supporter_id(3)] = "someone-elses-session"
+    config.directed_by_member[supporter_id(4)] = "someone-elses-request"
+    config.user_to_queue_map[supporter_id(5)] = "their-own-request"
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    config.queue_entries[queue_id]['declined_by'] = [supporter_id(6)]
+    stub.docs[queue_id]['declined_by'] = [supporter_id(6)]
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    text, markup = rec.replies[-1]
+    assert list_lines(text) == ["1. Sup 00"] + [
+        "%d. Sup %02d (busy)" % (k + 1, k) for k in range(1, 7)], list_lines(text)
+    for word in REASON_WORDS:
+        assert word not in text.lower(), (word, text)
+    selects = [d for d in callback_datas(markup) if d.startswith("pk_s:")]
+    assert selects == ["pk_s:%d" % supporter_id(0)], selects
+
+    for k in range(1, 7):
+        member = supporter_id(k)
+        before_direct = stub.count('direct_session')
+        await handlers.handle_callback_query(
+            cb_update(REQUESTER, "pk_s:%d" % member, rec), ctx)
+        assert stub.count('direct_session') == before_direct, (k, stub.calls)
+        assert not bot.texts_to(member), (k, bot.texts_to(member))
+        reply = rec.replies[-1][0]
+        assert reply.split("\n\n")[0] == config.MESSAGES["picker_busy"].format(
+            name="Sup %02d" % k), (k, reply)
+        for word in REASON_WORDS:
+            assert word not in reply.lower(), (k, word, reply)
+
+    # A DM that fails is one more reason, and it reads EXACTLY like the others.
+    bot.fail_for[str(supporter_id(0))] = "Forbidden: bot was blocked by the user"
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+    reply = rec.replies[-1][0]
+    assert reply.split("\n\n")[0] == config.MESSAGES["picker_busy"].format(
+        name="Sup 00"), reply
+    assert "1. Sup 00 (busy)" in reply, reply
+    print("OK  ag. every reason for busy -- a failed DM included -- reads identically")
+
+
+async def case_ah_names_come_from_telegram_collide_visibly_and_are_escaped():
+    bot, sm, qm, handlers, stub = setup(supporters=0)
+    base = {'blurb': "", 'available': True, 'has_started_bot': True, 'active': True}
+    config.SERVICES["pss"].roster.replace_records([
+        dict(base, telegram_id=3000, display_name="", telegram_first_name="Alex"),
+        dict(base, telegram_id=3001, display_name="Alex"),
+        dict(base, telegram_id=3002, display_name="",
+             telegram_first_name="Alex (he/him)"),
+        dict(base, telegram_id=3003, display_name="bea", blurb="Second-year."),
+        dict(base, telegram_id=3004, display_name="O'Brien"),
+    ])
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+
+    catcher = LogCatcher()
+    root = logging.getLogger()
+    previous = root.level
+    root.addHandler(catcher)
+    root.setLevel(logging.INFO)
+    try:
+        await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    finally:
+        root.removeHandler(catcher)
+        root.setLevel(previous)
+
+    text, markup = rec.replies[-1]
+    assert list_lines(text) == ["1. Alex (1)", "2. Alex (2)", "3. bea",
+                                "4. O&#x27;Brien"], list_lines(text)
+    assert "Second-year." not in text and "he/him" not in text, text
+    assert any("3002" in m and "left off the list" in m for m in catcher.messages()), \
+        catcher.messages()
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert "4. O'Brien" in labels, labels
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_s:3004", rec), ctx)
+    sent = rec.replies[-1][0]
+    assert sent.startswith(config.MESSAGES["directed_sent"].split("{")[0]), sent
+    assert "O&#x27;Brien" in sent, sent
+
+    await handlers.status_command(text_update(REQUESTER, "/status", rec), ctx)
+    assert "O'Brien" in rec.replies[-1][0], rec.replies[-1][0]
+
+    notes = [t for c, t, _m in bot.sent if c == PSS_CHANNEL]
+    assert notes and "O&#x27;Brien" in notes[-1], notes
+    print("OK  ah. Telegram names list, collisions are numbered, and names are escaped")
+
+
+async def case_ai_hf_is_untouched_when_pss_forks():
+    reset_state()
+    hf = config.SERVICES["hf"]
+    pss = config.SERVICES["pss"]
+    hf.channel_id, hf.enabled = HF_CHANNEL, True
+    pss.channel_id, pss.enabled = PSS_CHANNEL, True
+    pss.directed_enabled = True
+    hf.roster.replace_records([])
+    pss.roster.replace_records([supporter_doc(0), supporter_doc(1)])
+    assert {s.key for s in config.enabled_services()} == {"hf", "pss"}
+    assert config.directed_fork_offered("pss", REQUESTER), "PSS WOULD fork"
+
+    stub = StubDB()
+    install(stub)
+    bot = FakeBot()
+    handlers = BotHandlers(SessionManager(bot), QueueManager(bot))
+    rec = Rec()
+    ctx = ctx_for(bot)
+
+    await handlers.chat_command(text_update(REQUESTER, "/chat", rec), ctx)
+    await handlers.handle_callback_query(cb_update(REQUESTER, "svc_hf", rec), ctx)
+    await handlers.handle_message(
+        text_update(REQUESTER, "I could use someone to talk to", rec), ctx)
+
+    assert [t for t, _m in rec.replies] == [
+        config.MESSAGES["choose_service"], config.help_request_text("hf"),
+        config.MESSAGES["queue_added"]], [t for t, _m in rec.replies]
+    queue_id = config.user_to_queue_map[REQUESTER]
+    entry = config.queue_entries[queue_id]
+    assert entry['service'] == 'hf' and entry['routing'] == 'open', entry
+    posts = [s for s in bot.sent if s[0] == HF_CHANNEL]
+    assert len(posts) == 1 and posts[0][2] is not None, posts
+    assert not [s for s in bot.sent if s[0] == PSS_CHANNEL]
+    assert config.MESSAGES["comfort_question"] not in requester_texts(bot, rec)
+    print("OK  ai. HF is byte-identical while PSS forks")
+
+
+def simulate_restart(bot, stub, also_sessions=False):
+    """Memory is lost; the roster and Mongo are not. New managers on the same bot."""
+    for d in (config.queue_entries, config.user_to_queue_map, config.user_states,
+              config.picker_views, config.directed_by_member):
+        d.clear()
+    config.queue_order.clear()
+    if also_sessions:
+        config.active_sessions.clear()
+        config.user_to_session_map.clear()
+    sm = SessionManager(bot)
+    qm = QueueManager(bot)
+    handlers = BotHandlers(sm, qm)
+    install(stub)
+    before = len(bot.sent)
+    restore_state(qm, sm)
+    assert len(bot.sent) == before, ("restore itself sends nothing", bot.sent[before:])
+    return sm, qm, handlers
+
+
+async def case_aj_a_restart_at_the_fork_keeps_both_buttons_working():
+    bot, sm, qm, handlers, stub = setup(supporters=2)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+
+    sm, qm, handlers = simulate_restart(bot, stub)
+    assert config.user_states[REQUESTER] == UserState.CHOOSING_SUPPORTER
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    text, _m = rec.replies[-1]
+    assert "1. Sup 00" in text and "2. Sup 01" in text, text
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
+    posts = [s for s in bot.sent if s[0] == PSS_CHANNEL and s[2] is not None]
+    assert len(posts) == 1, posts
+    assert posts[0][2].inline_keyboard[0][0].callback_data == "claim_%s" % queue_id
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    assert config.MESSAGES["queue_added"] in bot.texts_to(REQUESTER)
+    print("OK  aj. after a restart at the fork, both buttons still work")
+
+
+async def case_ak_a_restart_at_the_list_never_guesses_and_keeps_busy_honest():
+    bot, sm, qm, handlers, stub = setup(supporters=3)
+    now = utcnow()
+    stub.docs['act-6000'] = {
+        'session_id': 'act-6000', 'user_id': 6000, 'service': 'pss',
+        'status': 'active', 'description': 'ongoing',
+        'anonymous_user_id': 'RHesident #6000', 'created_at': now,
+        'claimed_at': now, 'last_activity_at': now,
+        'heartfelt_member_id': supporter_id(2), 'routing': 'open',
+    }
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    assert "3. Sup 02\n" in rec.replies[-1][0], "free before the restart"
+
+    sm, qm, handlers = simulate_restart(bot, stub, also_sessions=True)
+    assert config.user_to_session_map.get(supporter_id(2)) == 'act-6000'
+
+    before = stub.count('direct_session')
+    await handlers.handle_message(text_update(REQUESTER, "1", rec), ctx)
+    assert stub.count('direct_session') == before, "no view => nobody is selected"
+    reply = bot.texts_to(REQUESTER)[-1]
+    assert config.MESSAGES["picker_lost_view"] in reply, reply
+    assert "3. Sup 02 (busy)" in reply, reply
+
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+    assert stub.count('direct_session') == before + 1, stub.calls
+    assert len(bot.texts_to(supporter_id(0))) == 1, bot.texts_to(supporter_id(0))
+    print("OK  ak. a restart at the list never guesses, and the restored busy stay busy")
+
+
 # --------------------------------------------------------------------------- runner
 CASES = [
     case_a_fork_appears_and_nothing_reaches_the_channel,
@@ -1379,6 +1762,14 @@ CASES = [
     case_z_availability_hides_the_busy_and_the_already_asked,
     case_ab_the_real_mongo_filters_name_the_state_they_leave,
     case_ac_an_unusable_directed_clock_waits_instead_of_vanishing,
+    case_ad_directed_off_means_no_fork_and_no_list,
+    case_ae_the_requesters_own_entry_never_counts_or_shows,
+    case_af_everyone_busy_still_forks_and_the_list_says_so,
+    case_ag_every_busy_reason_looks_the_same,
+    case_ah_names_come_from_telegram_collide_visibly_and_are_escaped,
+    case_ai_hf_is_untouched_when_pss_forks,
+    case_aj_a_restart_at_the_fork_keeps_both_buttons_working,
+    case_ak_a_restart_at_the_list_never_guesses_and_keeps_busy_honest,
 ]
 
 
@@ -1396,8 +1787,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 25, (
-        "expected at least 24 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 36, (
+        "expected at least 36 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

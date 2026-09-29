@@ -870,38 +870,49 @@ MESSAGES = {
     # "rejected", never anything that distinguishes the two. The requester learns only
     # that the person they chose is not free. tests/test_directed_requests.py case (o)
     # scans every requester-bound string in this file's flows for regressions.
+    #
+    # BUSY PEOPLE ARE LISTED, NOT HIDDEN. Everyone on the roster with a usable name
+    # appears, numbered; anyone who cannot be asked right now carries the one
+    # picker_busy_marker and no button. The marker is the same for every reason --
+    # not started the bot, /unavailable, in a conversation, holding a request, or
+    # already asked for this one -- and a failed DM reads exactly like "busy" too, so
+    # the requester can never work out WHY somebody is not free.
     "comfort_question": (
         "Before I pass this on - would you like to talk to someone in particular, "
         "or is anyone who's free okay?"
     ),
-    "comfort_specific_button": "I'd like to choose someone",
-    "comfort_anyone_button": "Anyone who's free",
+    "comfort_specific_button": "A specific peer supporter",
+    "comfort_anyone_button": "Any available peer supporter",
 
     "picker_header": "I'm comfortable talking to...",
     "picker_hint": "Tap a name below, or reply with its number.",
     "picker_page": "Page {page} of {pages}",
-    "picker_anyone_button": "Anyone who's free (usually faster)",
-    "picker_cancel_button": "Cancel my request",
+    "picker_anyone_button": "Send to anyone instead",
+    "picker_cancel_button": "Cancel",
     "picker_back_button": "Back",
     "picker_next_button": "Next",
     "picker_choose_else_button": "Choose someone else",
 
+    "picker_busy_marker": "(busy)",
+
     "picker_nobody_free": (
-        "Nobody is free to be chosen right now. You can ask anyone who's free instead - "
-        "your message goes to the whole support team - or cancel the request."
+        "Nobody on the list is free right now. You can send your request to anyone "
+        "who's free instead - your message goes to the whole support team - or "
+        "cancel it."
     ),
     # Shown when we have no record of what this person was last looking at, which is
     # exactly the state after a restart. We re-render rather than guess, because a
     # stale number must never select somebody the requester never saw.
-    "picker_lost_view": "Here's the list again.",
+    "picker_lost_view": "Here's the list to choose from.",
     "picker_not_a_number": (
         "Sorry, I didn't catch that. Please tap a name below, or reply with just the "
         "number next to it."
     ),
-    "picker_busy": "That person has just become unavailable. Please choose someone else.",
-    "picker_unreachable": (
-        "Sorry, I couldn't reach them just now, so they're off the list for this "
-        "request. Please choose someone else."
+    # {name} is HTML-escaped by the caller: this is sent with parse_mode HTML. There
+    # is deliberately no separate "couldn't reach them" wording -- see above.
+    "picker_busy": (
+        "{name} isn't free right now. Please choose someone else, or send your "
+        "request to anyone instead."
     ),
 
     "directed_sent": (
@@ -918,7 +929,7 @@ MESSAGES = {
         "If you're free, tap Accept. If not, tap Not right now - the request goes "
         "straight back to them and they can choose again. They are not told why.\n\n"
         "If there's no answer within {window}, it goes back to them automatically.\n"
-        "(You can use /unavailable any time to stay off the list.)"
+        "(You can use /unavailable any time to show as busy on the list.)"
     ),
     "directed_accept_button": "Accept",
     "directed_decline_button": "Not right now",
