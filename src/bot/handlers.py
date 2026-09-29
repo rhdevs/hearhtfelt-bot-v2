@@ -1134,10 +1134,14 @@ class BotHandlers:
                              "%s on '%s'", registration_id, applicant, svc.key)
 
             # In memory too, so they can claim immediately instead of waiting out
-            # the 300s roster refresh. NOTE: .add() creates NO profile, so they are
-            # claim-authorized and PICKER-INVISIBLE until somebody sets a display
-            # name. That is the intended behaviour, not an oversight -- it is the
-            # staged-rollout lever for the whole picker feature. D38/R15.
+            # the 300s roster refresh. NOTE: .add() creates NO profile, so they
+            # become LISTABLE (once the fork is on for this track) under their
+            # Telegram first name from their next private message -- captured by
+            # note_private_contact, the same capture point that records
+            # has_started_bot -- or under a name they choose with /name. An admin
+            # override via `set-profile --display-name` still works too. The
+            # staged-rollout lever is now PSS_DIRECTED_ENABLED (R11), not the
+            # absence of a name.
             # mark_started is a no-op while there is no profile; it matters on the
             # re-activation path, where one already exists and would otherwise
             # disagree with Mongo until the next refresh.
@@ -1149,7 +1153,10 @@ class BotHandlers:
 
         notified = True
         if approving:
-            text = MESSAGES["registration_approved"].format(member=svc.member_label)
+            # HF's copy is byte-identical: HF never sets supporter_names, so this
+            # always picks registration_approved for that track.
+            key = 'registration_approved_named' if svc.supporter_names else 'registration_approved'
+            text = MESSAGES[key].format(member=svc.member_label)
         else:
             # VERBATIM from MESSAGES. No .format(), no concatenation, no
             # interpolation of any kind: nothing the applicant reads may name or

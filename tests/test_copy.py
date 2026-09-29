@@ -51,7 +51,7 @@ REGISTRATION_APPLICANT_KEYS = (
     "registration_private_only", "registration_submitted",
     "registration_already_pending", "registration_already_member",
     "registration_cooldown", "registration_approved", "registration_rejected",
-    "registration_unavailable",
+    "registration_unavailable", "registration_approved_named",
 )
 
 # Substrings that would tell an applicant a PERSON judged them, and invite the
@@ -159,13 +159,11 @@ def test_requester_facing_copy_never_blames_a_supporter():
     keys = [k for k in NO_BLAME_KEYS if k in MESSAGES]
     keys += [k for k in MESSAGES if k.startswith("released_")]
     keys += [k for k in REGISTRATION_APPLICANT_KEYS if k in MESSAGES]
-    # Raised from 15 in step with the pool this scan walks. The three sources
-    # above currently supply 17 + 3 + 8 = 28 keys; at 15 the floor had drifted
-    # to thirteen keys of slack, so more than half the requester-facing copy
-    # could have vanished from MESSAGES without this guard noticing. Zero
-    # headroom is the convention in this file: raise it when the pool grows,
-    # never lower it.
-    assert len(keys) >= 28, (
+    # Raised from 28 in step with the pool this scan walks: registration_approved_named
+    # joined REGISTRATION_APPLICANT_KEYS (P4), so the three sources above now
+    # supply 17 + 3 + 9 = 29 keys. Zero headroom is the convention in this file:
+    # raise it when the pool grows, never lower it.
+    assert len(keys) >= 29, (
         "far fewer requester-facing keys than expected (%d); this scan would be "
         "nearly vacuous: %s" % (len(keys), sorted(keys)))
     for key in keys:
@@ -310,6 +308,8 @@ def test_registration_templates_render():
     rendered = {
         "registration_approved": MESSAGES["registration_approved"].format(
             member="Support Volunteer"),
+        "registration_approved_named": MESSAGES["registration_approved_named"].format(
+            member="Support Volunteer"),
         "registration_approve_button": MESSAGES["registration_approve_button"].format(
             member="Support Volunteer"),
         "registration_cross_roster": MESSAGES["registration_cross_roster"].format(
@@ -323,12 +323,14 @@ def test_registration_templates_render():
         assert "{" not in text and "}" not in text, (key, text)
         assert text.strip(), key
     assert "Support Volunteer" in rendered["registration_approved"]
+    assert "Support Volunteer" in rendered["registration_approved_named"]
     assert "Alex" in rendered["registration_settled_rejected"]
 
     # And every registration value is a plain, non-empty str -- the admin-facing
     # ones included, since they are sent with parse_mode='HTML'.
     registration_keys = [k for k in MESSAGES if k.startswith("registration_")]
-    assert len(registration_keys) >= 20, (
+    # Raised 20 -> 23 in P4: registration_approved_named joined the existing 22.
+    assert len(registration_keys) >= 23, (
         "far fewer registration keys than expected (%d); this scan would be "
         "nearly vacuous: %s" % (len(registration_keys), sorted(registration_keys)))
     for key in registration_keys:

@@ -133,11 +133,15 @@ Two things to know before switching it on:
   flag for admins -- the send attempt IS the check. If nobody can be reached the
   applicant is told honestly that the request was not submitted, and an ERROR naming
   the ids appears in `docker logs`.
-- **Approval is only half the job.** An approved supporter can claim from their
-  channel immediately, but has no display name, so they are invisible in the picker
-  until somebody runs
+- **An approved supporter can claim immediately, and is listed by name on their
+  first private message.** On a track where people choose a supporter by name
+  (PSS), there is no admin step: their Telegram first name is captured the
+  moment they message the bot, and that is what shows on the list. They can
+  choose something else themselves with `/name`, or an admin can override it with
   `admins --action set-profile --service pss --telegram-id <id> --display-name "<name>"`.
-  That is deliberate, and it is the staged-rollout lever for the whole picker feature.
+  The staged-rollout lever for the whole picker feature is `PSS_DIRECTED_ENABLED`
+  (off by default; set it once the roster is ready for real students), not a
+  missing name.
 
 ## Deployment
 

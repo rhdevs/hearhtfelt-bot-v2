@@ -24,6 +24,7 @@ Run directly: `python tests/test_supporter_names.py`
 
 import asyncio
 import contextlib
+import io
 import logging
 import os
 import sys
@@ -1075,6 +1076,65 @@ async def case_z_write_failures():
     print("OK  z. a Mongo error changes nothing; Mongo offline saves in memory and says so")
 
 
+async def case_aa_the_cli_lists_labelled_names_with_collision_suffixes():
+    """The ops CLI (`admins --action list`) describes the new name model truthfully:
+    a collision is numbered and its source tagged, an unlisted member says so
+    without hinting why, and the third column still reads NOT SET (HANDOFF R10)."""
+    reset_state()
+    stub = NamesStubDB()
+    utils_mod.db_mgr = stub
+    stub.put(PSS_COLL, member_doc(10, display_name='Alex', first_name='Whoever'))
+    stub.put(PSS_COLL, member_doc(20, first_name='Alex'))
+    stub.put(PSS_COLL, member_doc(30, first_name='Alex (he/him)'))
+    stub.put(PSS_COLL, member_doc(40, first_name='Anyone', active=False))
+    stub.put(PSS_COLL, member_doc(50, first_name='Casey', has_started_bot=False))
+
+    dump = io.StringIO()
+    with contextlib.redirect_stdout(dump):
+        utils_mod.manage_authorized_members('list', service='pss', include_inactive=True)
+    out = dump.getvalue()
+
+    assert 'Alex (1) [chosen]' in out, out
+    assert 'Alex (2) [telegram]' in out, out
+    assert '- [no usable name]' in out, out
+    assert '- [inactive]' in out, out
+    assert 'NOT SET' in out, out
+    assert "telegram first name: 'Alex (he/him)'" in out, out
+    print("OK  aa. the CLI list labels collisions, tags their source, and keeps "
+          "the NOT SET column")
+
+
+async def case_ab_the_cli_set_profile_validates_and_cleans():
+    """set-profile runs the same name rules /name does, refuses BEFORE writing,
+    and cleans whitespace on the way in; '' is exempt (it only ever resets)."""
+    reset_state()
+    stub = NamesStubDB()
+    utils_mod.db_mgr = stub
+    stub.put(PSS_COLL, member_doc(999, first_name='Robin'))
+
+    dump = io.StringIO()
+    with contextlib.redirect_stdout(dump):
+        utils_mod.manage_authorized_members(
+            'set-profile', telegram_id=999, service='pss', display_name='Sam@x')
+    assert MESSAGES['name_has_at'] in dump.getvalue(), dump.getvalue()
+    assert stub.called('set_member_profile') == [], stub.calls
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        utils_mod.manage_authorized_members(
+            'set-profile', telegram_id=999, service='pss',
+            display_name='  Sam   Lee ')
+    calls = stub.called('set_member_profile')
+    assert calls and calls[-1][3] == 'Sam Lee', calls
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        utils_mod.manage_authorized_members(
+            'set-profile', telegram_id=999, service='pss', display_name='')
+    calls = stub.called('set_member_profile')
+    assert calls[-1][3] == '', calls
+    print("OK  ab. set-profile refuses an invalid name before writing, cleans "
+          "whitespace, and '' resets")
+
+
 CASES = [
     case_a_accepted_names,
     case_b_rejected_names_give_their_exact_key,
@@ -1102,6 +1162,8 @@ CASES = [
     case_x_setting_the_same_name_again_is_a_no_op,
     case_y_reset_and_the_botname_form,
     case_z_write_failures,
+    case_aa_the_cli_lists_labelled_names_with_collision_suffixes,
+    case_ab_the_cli_set_profile_validates_and_cleans,
 ]
 
 
@@ -1116,8 +1178,8 @@ if __name__ == "__main__":
     # A driver that discovers its own tests reports success when it discovers
     # NOTHING. A refactor, a rename, an import shadow or a bad merge all reach that
     # state. Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 26, (
-        "expected at least 26 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 28, (
+        "expected at least 28 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

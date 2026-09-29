@@ -9,7 +9,8 @@ import argparse
 from typing import Optional
 from src.database.manager import db_mgr
 from src.timeutil import UTC, ensure_aware_utc, utcnow
-from config import get_service
+from config import get_service, AuthorizedMembersStore, MESSAGES, listed_name, supporter_name_problem
+from src.supporter_names import clean_name, disambiguate
 
 def get_anonymous_name(session_doc, for_user_type='user'):
     """Helper to get anonymous display name from session document"""
@@ -151,13 +152,32 @@ def manage_authorized_members(action: str, telegram_id: Optional[int] = None,
 
         print(f"\n💚 Authorized Members — {label} ({svc.key})")
         print("-" * 40)
+
+        # Labels (with collision suffixes) are computed over ACTIVE records only --
+        # an inactive member is never shown to a requester and must never occupy a
+        # collision slot an active one would otherwise get. Built once, over every
+        # active record this listing has (not just the ones about to be printed),
+        # so the suffixes here match what listed_name/disambiguate would show a
+        # requester right now.
+        active_profiles = {}
+        for doc in records:
+            if doc.get('active', True) is False:
+                continue
+            profile = AuthorizedMembersStore._profile_from_doc(doc)
+            if profile is not None:
+                active_profiles[profile.telegram_id] = profile
+        labels = disambiguate(
+            (p.telegram_id, listed_name(p)) for p in active_profiles.values()
+            if listed_name(p))
+
         for doc in records:
             member_id = doc.get('telegram_id')
-            status = 'active' if doc.get('active', True) else 'inactive'
+            is_active = doc.get('active', True) is not False
+            status = 'active' if is_active else 'inactive'
             # available absent means available -- do not invert this.
             avail = 'available' if doc.get('available', True) else 'unavailable'
+            # The third column still reads 'NOT SET': HANDOFF R10 relies on it.
             started = 'started' if doc.get('has_started_bot') else 'NOT SET'
-            display_name_val = doc.get('display_name') or '-'
             username_val = doc.get('username')
             # username_display already carries its own '@' (or is a bare '-' when
             # absent), so it is not preceded by a separate literal '@' below --
@@ -167,10 +187,25 @@ def manage_authorized_members(action: str, telegram_id: Optional[int] = None,
                 username_display = username_val if str(username_val).startswith('@') else f"@{username_val}"
             else:
                 username_display = '-'
-            print(f"{member_id}: {status:8} | {avail:11} | {started:7} | {display_name_val} | {username_display}")
+
+            if not is_active:
+                listed_display = '- [inactive]'
+            else:
+                profile = active_profiles.get(member_id)
+                label = labels.get(member_id) if profile is not None else None
+                if label:
+                    source = '[chosen]' if clean_name(doc.get('display_name')) else '[telegram]'
+                    listed_display = f'{label} {source}'
+                else:
+                    listed_display = '- [no usable name]'
+
+            print(f"{member_id}: {status:8} | {avail:11} | {started:7} | {listed_display} | {username_display}")
+            tg = doc.get('telegram_first_name')
+            if tg:
+                print(f"   telegram first name: {tg!r}")
             blurb_val = doc.get('blurb')
             if blurb_val:
-                print(f"   {blurb_val}")
+                print(f"   blurb (never shown to requesters): {blurb_val}")
         return
 
     if telegram_id is None:
@@ -211,6 +246,18 @@ def manage_authorized_members(action: str, telegram_id: Optional[int] = None,
         if display_name is None and blurb is None:
             print("❌ --display-name or --blurb is required for set-profile")
             return
+        if display_name is not None:
+            # clean_name first, so trailing/collapsed whitespace never reaches the
+            # rule check or the write -- the same normalisation /name applies.
+            # "" (the reset form) is exempt from the rule check on purpose: it is
+            # never rejected, because it can only ever CLEAR the override.
+            cleaned = clean_name(display_name)
+            if cleaned:
+                problem = supporter_name_problem(cleaned)
+                if problem:
+                    print(f"❌ {MESSAGES[problem]}")
+                    return
+            display_name = cleaned
         success = db_mgr.set_member_profile(telegram_id, collection=collection, display_name=display_name, blurb=blurb)
         if success:
             print(f"✅ Updated profile for {label} {telegram_id}")
@@ -222,6 +269,11 @@ def manage_authorized_members(action: str, telegram_id: Optional[int] = None,
                 print(f"   available:      {doc.get('available', True)}")
                 print(f"   has_started_bot: {doc.get('has_started_bot', False)}")
                 print(f"   active:         {doc.get('active', True)}")
+                print(f"   telegram first name: {doc.get('telegram_first_name') or '-'}")
+                profile = AuthorizedMembersStore._profile_from_doc(doc)
+                print(f"   listed as:       {listed_name(profile) or '-'}")
+                print("   (a name another active member already goes by is numbered "
+                      "in `admins --action list`)")
         else:
             print(f"❌ Failed to update profile for {label} {telegram_id}")
     elif action == 'set-started':
@@ -320,7 +372,9 @@ def main():
                         help='Include inactive members when listing admins')
     parser.add_argument('--service', choices=['hf', 'pss'], default='hf',
                         help='Which service roster to manage (default: hf)')
-    parser.add_argument('--display-name', help='Picker display name to set for set-profile')
+    parser.add_argument('--display-name',
+                        help="Chosen name shown to students (overrides their Telegram "
+                             "first name); '' resets to the Telegram first name")
     parser.add_argument('--blurb', help='One-line free-text blurb to set for set-profile')
     parser.add_argument('--registration-id', help='Registration ID for registrations command')
     parser.add_argument('--status', choices=['pending', 'approved', 'rejected', 'closed'], default='pending',

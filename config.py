@@ -1036,6 +1036,19 @@ MESSAGES = {
         "Use /available when you're free to take a conversation, /unavailable when "
         "you're not, and /release if you ever need to hand a conversation back."
     ),
+    # PSS's approval copy: names now default automatically (no admin step), so this
+    # tells the applicant about /name instead of promising someone else will set
+    # them up. Kept applicant-facing and decider-free like registration_approved
+    # (D44): no 'admin', '@', 'approved by', 'reviewed' or 'decided'. HF still gets
+    # registration_approved, untouched, above.
+    "registration_approved_named": (
+        "Good news - you've been added to the support team as a {member}. 💚\n\n"
+        "You can pick up requests from your team's channel straight away. When "
+        "people choose a supporter by name, they'll see your Telegram first name - "
+        "send /name to see it or to choose a different one.\n\n"
+        "Use /available when you're free to take a conversation, /unavailable when "
+        "you're not, and /release if you ever need to hand a conversation back."
+    ),
     # NEVER interpolated, NEVER .format()ted, sent verbatim. No reason, no name,
     # no id, nothing traceable to a person. See D44 and case (m).
     "registration_rejected": (
@@ -1057,8 +1070,10 @@ MESSAGES = {
     # nothing above may. That asymmetry is the whole of D44.
     "registration_card_title": "🆕 Supporter registration request",
     "registration_card_note": (
-        "Approving adds them to that roster straight away. They will not appear in "
-        "the list people choose from until someone sets a display name."
+        "Approving adds them to that roster straight away. On a track where people "
+        "choose a supporter by name, they'll be listed under their Telegram first "
+        "name once they next message the bot, and can change it themselves with "
+        "/name."
     ),
     "registration_approve_button": "✅ Approve as {member}",
     # Admin-facing only. A track with no channel, or switched off, still accepts

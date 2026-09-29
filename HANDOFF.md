@@ -305,14 +305,23 @@ column reads `NOT SET` for anyone who has not. There is an admin override
 and if it does not the directed request fails and the requester is asked to choose
 again. Prefer asking the supporter to press /start.
 
-**R11 — the picker is invisible until profiles exist, which is the rollout lever.**
-A supporter only appears in the picker once they have a `display_name`. With no
-display names anywhere, `available_supporters()` is empty, the fork never fires,
-and the bot behaves exactly as it does today. So the feature rolls out one
-supporter at a time via
-`python -m src.database.utils admins --action set-profile --service pss --telegram-id <id> --display-name "<name>" [--blurb "<one line>"]`.
-Rollback is either `--display-name ""` for one person, or `PSS_DIRECTED_ENABLED=false`
-in the environment (container recreate) to disable the whole fork.
+**R11 — `PSS_DIRECTED_ENABLED` is now the ONLY rollout lever; a missing
+`display_name` no longer hides anyone.** A supporter's listed name defaults
+automatically to their Telegram first name, captured the moment they next send
+the bot any private message or command (the same capture point that records
+`has_started_bot`, refreshed on every contact). There is no admin step: a
+supporter with no `/name` override and no captured first name is simply
+omitted from the list (and logged), not made permanently invisible by design.
+This means the picker fork can show a real supporter the instant they message
+the bot, which is why `PSS_DIRECTED_ENABLED` defaults to **False** (env
+opt-in) — production's PSS roster holds a test account, and merging with the
+old default would put it in front of real students at once. Roll the fork out
+by setting `PSS_DIRECTED_ENABLED=true` (container recreate) once the roster is
+ready, not by withholding display names. A supporter can still choose or
+change what they are shown as with `/name` (private chat, PSS roster only), or
+an admin can set an override with
+`python -m src.database.utils admins --action set-profile --service pss --telegram-id <id> --display-name "<name>" [--blurb "<one line>"]`
+— `--display-name ""` resets it back to their Telegram first name.
 
 **R12 — `/release` requires Mongo.** The request's description lives only on the
 session document; `active_sessions` has never carried one. With Mongo down,
@@ -346,14 +355,18 @@ is then rewritten to a settled state with its buttons stripped, from the
 redeploy. With Mongo down nothing is decided and the buttons are deliberately left
 live, so the same tap works once it is back.
 
-**R15 — approval is only half the job.** An approved supporter can claim from their
-track's channel immediately, but has **no display name**, so they are invisible in the
-picker (R11 is unchanged). Finish the job with
+**R15 — an approved supporter can claim immediately, and is listed by name as
+soon as the bot has one for them.** They can claim from their track's channel
+the moment they are approved. Whether they are *listed by name* (once the
+fork is on for that track, R11) follows automatically: as soon as they send
+the bot any private message, their Telegram first name is captured and they
+appear. There is nothing an admin needs to do for the ordinary case. If they
+should be shown under something else, they can send `/name <text>` themselves,
+or an admin can set an override with
 `python -m src.database.utils admins --action set-profile --service pss --telegram-id <id> --display-name "<name>"`.
-Registration deliberately does not invent a display name from the Telegram profile:
-that would put an unvetted, self-chosen, potentially de-anonymising string in front of
-people in distress, and would destroy the "no display name ⇒ invisible" rollout lever.
-Audit with `registrations --action list --status approved` (the row shows
+The applicant's approval message (`registration_approved_named` on a
+name-listed track) tells them about `/name` directly. Audit with
+`registrations --action list --status approved` (the row shows
 `decided_by`). Clear a row nobody can act on with `registrations --action close`.
 There is deliberately **no CLI approve**: it would bypass the atomic gate and the
 applicant notification. To add somebody out-of-band use `admins --action add`, then
