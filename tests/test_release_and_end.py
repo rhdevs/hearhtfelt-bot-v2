@@ -277,6 +277,9 @@ def build(pickable, db_available=True, extra_members=()):
     pss = config.SERVICES[ServiceType.PSS.value]
     hf.channel_id, hf.enabled = HF_CHANNEL, False
     pss.channel_id, pss.enabled = PSS_CHANNEL, True
+    # Directed mode is OFF by default now (PSS_DIRECTED_ENABLED_DEFAULT); the
+    # directed-provenance cases need it, so opt in explicitly.
+    pss.directed_enabled = True
     hf.roster.replace_records([])
 
     ids = [MEMBER] + list(extra_members)
@@ -686,7 +689,7 @@ if __name__ == "__main__":
     hf = config.SERVICES[ServiceType.HF.value]
     pss = config.SERVICES[ServiceType.PSS.value]
     saved = (hf.channel_id, hf.enabled, pss.channel_id, pss.enabled,
-             pss.closing_extra, pss.closing_extra_member)
+             pss.closing_extra, pss.closing_extra_member, pss.directed_enabled)
     try:
         asyncio.run(run())
         print("\nAll %d release/end assertions passed!" % len(CASES))
@@ -694,7 +697,7 @@ if __name__ == "__main__":
         (handlers_mod.db_mgr, queue_mod.db_mgr, session_mod.db_mgr,
          restore_mod.db_mgr, expiry_mod.db_mgr) = real
         (hf.channel_id, hf.enabled, pss.channel_id, pss.enabled,
-         pss.closing_extra, pss.closing_extra_member) = saved
+         pss.closing_extra, pss.closing_extra_member, pss.directed_enabled) = saved
         # replace_records([]) FIRST: replace() with the same id set is a no-op that
         # keeps existing profiles.
         hf.roster.replace_records([])

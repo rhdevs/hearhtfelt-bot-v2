@@ -236,7 +236,7 @@ warning. `tests/test_service_config.py` asserts the invariant.
 **R6 — CI now gates deploys.**
 The `test` job in `.github/workflows/deploy.yml` runs first, and
 `build-and-push` (and therefore `deploy`) `needs: test`, so a red suite blocks
-the deploy. It runs the thirteen suites listed in §6 below, in that order.
+the deploy. It runs the fourteen suites listed in §6 below, in that order.
 `tests/test_db_integration.py` is deliberately excluded: it needs a live Mongo
 and it **writes documents** — there must never be a `MONGODB_URI` secret in the
 test job. It also now refuses to run at all unless `ALLOW_DB_INTEGRATION_TEST=1`
@@ -374,6 +374,7 @@ python tests/test_service_config.py      # registry/parity + timer invariants
 python tests/test_copy.py                # requester-facing copy guards
 python tests/test_pss_flow.py            # full HF+PSS flow w/ fake bot (no DB)
 python tests/test_member_profiles.py     # supporter profiles + availability rules
+python tests/test_supporter_names.py     # supporter names: rules, labels, capture, /name
 python tests/test_directed_requests.py   # the PSS directed-support flow
 python tests/test_release_and_end.py     # requester-only /end, and /release
 python tests/test_registration.py        # self-service /register + admin approval

@@ -223,6 +223,7 @@ python tests/test_service_config.py      # service registry + timer invariants
 python tests/test_copy.py                # requester-facing copy guards
 python tests/test_pss_flow.py            # full HF+PSS flow with a fake bot
 python tests/test_member_profiles.py     # supporter profiles + availability rules
+python tests/test_supporter_names.py     # supporter names: rules, labels, capture, /name
 python tests/test_directed_requests.py   # the PSS directed-support flow
 python tests/test_release_and_end.py     # requester-only /end, and /release
 python tests/test_registration.py        # self-service /register + admin approval

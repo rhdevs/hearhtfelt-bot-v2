@@ -1,7 +1,7 @@
 import datetime
 import uuid
 import logging
-from typing import Iterable, Optional, List, Dict, Any
+from typing import Iterable, Optional, List, Dict, Any, Tuple
 from pymongo import ReturnDocument
 from src.database.connection import db_manager
 from src.timeutil import ensure_aware_utc, utcnow
@@ -669,6 +669,72 @@ class DBManager:
         except Exception as e:
             logger.error(f"Error marking member {member_id} started: {e}")
             return False
+
+    def set_member_first_name(self, member_id: int, first_name: str,
+                              collection: str = None) -> bool:
+        """Record the Telegram first name a member's own private message carried.
+
+        Written from the same capture point as mark_member_started, on every
+        private interaction, so the automatic listed name follows a rename. It is
+        only the FALLBACK: a /name override (display_name) always wins. No upsert --
+        a stranger who messages the bot must never create a roster document.
+        """
+        if not self.db_available:
+            return False
+
+        try:
+            coll = collection or self._authorized_collection
+            now = utcnow()
+            result = db_manager.db[coll].update_one(
+                {'telegram_id': int(member_id)},
+                {'$set': {
+                    'telegram_first_name': str(first_name),
+                    'telegram_first_name_at': now,
+                    'updated_at': now,
+                }},
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error(f"Error recording first name for member {member_id}: {e}")
+            return False
+
+    def set_member_display_name(self, member_id: int, display_name: str,
+                                collection: str = None) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """The supporter's own /name: set (or, with "", clear) the chosen-name override.
+
+        ONE atomic call whose filter names the state it requires -- an ACTIVE
+        member. The active clause is what refuses a member deactivated in Mongo but
+        still in this process's memory for up to 5 minutes, until the next roster
+        refresh. ReturnDocument.BEFORE, so the old -> new log line comes from the
+        same read that made the write, not a second racing one.
+
+        Returns (outcome, before_doc):
+          ('ok', doc)        written; doc is the document as it was BEFORE
+          ('missing', None)  no active member with this id
+          ('offline', None)  Mongo not available; nothing was attempted
+          ('error', None)    the call raised; logged
+        """
+        if not self.db_available:
+            return ('offline', None)
+
+        try:
+            coll = collection or self._authorized_collection
+            now = utcnow()
+            before = db_manager.db[coll].find_one_and_update(
+                {'telegram_id': int(member_id), 'active': {'$ne': False}},
+                {'$set': {
+                    'display_name': str(display_name),
+                    'display_name_set_at': now,
+                    'updated_at': now,
+                }},
+                return_document=ReturnDocument.BEFORE,
+            )
+        except Exception as e:
+            logger.error(f"Error setting display name for member {member_id}: {e}")
+            return ('error', None)
+        if before is None:
+            return ('missing', None)
+        return ('ok', before)
 
     def get_member_profile_doc(self, member_id: int,
                                collection: str = None) -> Optional[Dict[str, Any]]:

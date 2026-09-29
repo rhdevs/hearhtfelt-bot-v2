@@ -8,6 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# A PURE module (re/unicodedata/typing only) that never imports config, so there is
+# no cycle: the name rules stay testable without the bot's state.
+from src.supporter_names import NAME_MAX_LENGTH, clean_name, disambiguate, name_key, name_problem
+
 class UserState(Enum):
     IDLE = "idle"
     WAITING_FOR_SERVICE = "waiting_for_service"   # only entered when >=2 services are runnable
@@ -43,17 +47,26 @@ PSS_CLOSING_NOTE  = os.getenv("PSS_CLOSING_NOTE", "")    # -> the REQUESTER's cl
 
 @dataclass
 class MemberProfile:
-    """SHAPE-STABLE ON PURPOSE. The stakeholder has NOT decided what appears next to
-    a supporter's name or who curates it. `blurb` is the one free-text line the picker
-    renders today; `fields` carries every OTHER key on the Mongo doc verbatim. When the
-    answer arrives it either fills `blurb` or names a key already in `fields` -- one line
-    in the renderer, no migration, no backfill. DO NOT invent profile content here."""
+    """SHAPE-STABLE ON PURPOSE. `fields` carries every key on the Mongo doc that is
+    not a typed attribute or bookkeeping, verbatim, so new profile content needs no
+    migration or backfill. DO NOT invent profile content here.
+
+    The name a requester sees is NEVER read off one attribute: it is
+    listed_name(profile) -- the chosen-name override if there is a valid one, else
+    the automatically captured Telegram first name, else nothing (not listed).
+    `blurb` stays in the data and the admin CLI but is NEVER rendered to a requester:
+    the picker shows names only."""
     telegram_id: int
-    display_name: str = ""            # picker label. EMPTY => not pickable.
-    blurb: str = ""
+    # The CHOSEN-NAME OVERRIDE, set by the supporter's own /name or by the admin CLI
+    # `set-profile --display-name`. "" means no override, NOT "not listable".
+    display_name: str = ""
+    blurb: str = ""                   # data/CLI only; never shown to a requester
     available: bool = True
     has_started_bot: bool = False     # False => the bot may NOT DM them
     username: Optional[str] = None
+    # Captured automatically from the supporter's OWN private messages/commands to
+    # the bot, refreshed on every one. The listed-name fallback; no admin involved.
+    telegram_first_name: str = ""
     fields: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -62,7 +75,8 @@ class MemberProfile:
 # verbatim, which is the whole point of D14.
 _PROFILE_KEYS = ("telegram_id", "display_name", "blurb", "available",
                  "has_started_bot", "username", "active", "_id",
-                 "created_at", "updated_at", "started_bot_at")
+                 "created_at", "updated_at", "started_bot_at",
+                 "telegram_first_name", "telegram_first_name_at", "display_name_set_at")
 
 
 class AuthorizedMembersStore:
@@ -95,8 +109,8 @@ class AuthorizedMembersStore:
 
         A bare-id roster carries no profile data, so every profile for a departed
         member is dropped and no new one is created. Members who arrive this way have
-        `display_name == ""`: authorized to claim, invisible in the picker. That is
-        what keeps the pre-Phase-4 suites driving today's un-forked code path.
+        no profile and therefore no known name: authorized to claim, never listed.
+        That is what keeps the pre-Phase-4 suites driving today's un-forked path.
         """
         new_members = self._normalize(member_ids)
         with self._lock:
@@ -126,6 +140,7 @@ class AuthorizedMembersStore:
             # messaging first, so guessing True here strands a real request.
             has_started_bot=bool(doc.get('has_started_bot', False)),
             username=doc.get('username'),
+            telegram_first_name=str(doc.get('telegram_first_name') or "").strip(),
             fields={k: v for k, v in doc.items() if k not in _PROFILE_KEYS},
         )
 
@@ -187,6 +202,49 @@ class AuthorizedMembersStore:
             if stored is None:
                 return False
             stored.available = bool(available)
+            return True
+
+    def set_display_name(self, member_id, display_name) -> bool:
+        """In-memory only. The chosen-name override ("" clears it). False when this
+        member has no profile."""
+        try:
+            member_int = int(member_id)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            stored = self._profiles.get(member_int)
+            if stored is None:
+                return False
+            stored.display_name = str(display_name)
+            return True
+
+    def set_first_name(self, member_id, first_name, create_if_missing: bool = False) -> bool:
+        """In-memory only. The captured Telegram first name.
+
+        False when this member has no profile -- unless `create_if_missing` and the
+        id IS a member, in which case a minimal profile is created. ONLY the
+        private-contact capture passes the flag: a member who just messaged the bot
+        privately HAS started it, and that caller wrote Mongo first. It closes the
+        window after a registration approval, whose roster.add() creates no profile,
+        so the new supporter would otherwise stay unlisted until the next refresh.
+        A non-member returns False even with the flag.
+        """
+        try:
+            member_int = int(member_id)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            stored = self._profiles.get(member_int)
+            if stored is not None:
+                stored.telegram_first_name = str(first_name)
+                return True
+            if not create_if_missing or member_int not in self._members:
+                return False
+            self._profiles[member_int] = MemberProfile(
+                telegram_id=member_int,
+                has_started_bot=True,
+                telegram_first_name=str(first_name),
+            )
             return True
 
     def mark_started(self, member_id, started: bool = True) -> bool:
@@ -305,7 +363,7 @@ STALE_NOTIFY_GRACE_MINUTES = _env_int("STALE_NOTIFY_GRACE_MINUTES", 120)
 # grants strangers the ability to read messages from students in crisis. Unset =>
 # empty frozenset => the feature is COMPLETELY INERT: /register answers with the
 # same neutral string handle_message sends for gibberish, and every rg_* callback
-# is refused. Same staged-rollout property as the picker's display_name (D38/R11):
+# is refused. Same staged-rollout property as PSS_DIRECTED_ENABLED (R11):
 # the code ships, the behaviour does not, until somebody deliberately sets an env
 # var and RECREATES the container (this is read once, at import). See runbook R13.
 #
@@ -416,12 +474,25 @@ class Service:
     picker_page_size: int = 8
     closing_extra: str = ""                 # appended to the REQUESTER's closing msg
     closing_extra_member: str = ""          # appended to the MEMBER's closing msg
+    # True => this track shows supporters to requesters BY NAME, captures each
+    # member's Telegram first name, offers /name and uses the *_named copy. PSS
+    # only; HF MUST stay False, which is what keeps HF byte-identical. Last, and
+    # defaulted, for the same reason as everything above.
+    supporter_names: bool = False
 
     @property
     def runnable(self) -> bool:
         # A service is only offered/posted-to when enabled AND fully configured with a channel.
         return bool(self.enabled and self.channel_id)
 
+
+# ROLLOUT SAFETY. Production's PSS roster holds a test account, and names now default
+# automatically to each supporter's Telegram first name -- so the old R11 lever ("no
+# display_name => invisible in the picker") no longer exists: merging with this True
+# would put that account in front of real students at once. PSS_DIRECTED_ENABLED is
+# now the ONLY switch, and it is off unless deliberately set. Read at import, so the
+# container must be RECREATED (not restarted) for a change to take effect.
+PSS_DIRECTED_ENABLED_DEFAULT = False
 
 SERVICES: Dict[str, Service] = {
     ServiceType.HF.value: Service(
@@ -460,11 +531,12 @@ SERVICES: Dict[str, Service] = {
                                        # is unactionable noise at 3am. See D4.
         # Directed support is a PSS feature. HF leaves every one of these at its
         # default, so HF's behaviour is provably unchanged.
-        directed_enabled=_env_bool("PSS_DIRECTED_ENABLED", True),
+        directed_enabled=_env_bool("PSS_DIRECTED_ENABLED", PSS_DIRECTED_ENABLED_DEFAULT),
         directed_response_minutes=1440,
         picker_page_size=8,
         closing_extra=PSS_CLOSING_NOTE,
         closing_extra_member=PSS_FOLLOWUP_NOTE,
+        supporter_names=True,
     ),
 }
 
@@ -688,6 +760,109 @@ MESSAGES = {
         "next restarts. Please set it again if it seems to have been forgotten.)"
     ),
 
+    # --- Supporter names (/name) ---------------------------------------------
+    # EVERY value here is SUPPORTER-facing and PLAIN TEXT: they are sent with no
+    # parse mode. The *_named variants replace the Phase 4 wording on a track with
+    # supporter_names=True, where the list shows everyone and marks the busy ones
+    # rather than hiding them. The rejection keys match
+    # src/supporter_names.REJECTION_KEYS one for one.
+    "member_addendum_named": (
+        "You're on a support roster, so you also have:\n"
+        "/available - show as free on the list people choose from\n"
+        "/unavailable - show as busy on that list\n"
+        "/name - see or change the name shown there\n"
+        "/release - hand your current conversation back if you can't continue it"
+    ),
+    "now_available_named": (
+        "✅ You're marked as free on the list again, so people asking for support can "
+        "choose you."
+    ),
+    "now_unavailable_named": (
+        "✅ You're marked as busy on the list, so nobody new can choose you. Your name "
+        "still shows, with (busy) next to it.\n\n"
+        "This does NOT end a conversation you're already in, and it does not hand back "
+        "a request that has already been sent to you - use the Not right now button on "
+        "that request, or /release if the conversation has already started."
+    ),
+    "availability_needs_name": (
+        "Saved. You won't appear on the list people choose from until the bot has a "
+        "name it can show for you. Send /name followed by the name you'd like - for "
+        "example: /name Sam"
+    ),
+    "name_current_chosen": (
+        "People choosing a peer supporter see you as: {name}\n\n"
+        "This is a chosen name. To change it, send /name followed by the new one - for "
+        "example: /name Sam\n"
+        "To go back to your Telegram first name, send /name reset"
+    ),
+    "name_current_telegram": (
+        "People choosing a peer supporter see you as: {name}\n\n"
+        "That's your Telegram first name. To show a different name, send /name "
+        "followed by the name you'd like - for example: /name Sam"
+    ),
+    "name_current_none": (
+        "People choosing a peer supporter can't see you on the list yet, because "
+        "there's no name the bot can show for you. Send /name followed by the name "
+        "you'd like them to see - for example: /name Sam"
+    ),
+    "name_suffix_note": (
+        "Someone else on the list has the same name, so a number is shown after yours "
+        "to tell you apart. You can choose a different name with /name."
+    ),
+    "name_list_off_note": (
+        "(People can't choose a supporter by name yet. This is the name they'll see "
+        "once they can.)"
+    ),
+    "name_saved": "✅ Done. People choosing a peer supporter will now see you as: {name}",
+    "name_reset_done": (
+        "✅ Done. People choosing a peer supporter will now see your Telegram first "
+        "name: {name}"
+    ),
+    "name_reset_done_no_name": (
+        "✅ Done. Your chosen name has been removed. The bot can't show your Telegram "
+        "first name on the list, so you won't appear there until you choose a name "
+        "with /name."
+    ),
+    "name_reset_nothing": "You don't have a chosen name, so there's nothing to reset.",
+    "name_unchanged": "That's already your name on the list, so nothing has changed.",
+    "name_taken": (
+        "Another peer supporter on the list already goes by that name, or one that "
+        "looks almost the same. Please choose a different one - adding an initial "
+        "usually works."
+    ),
+    "name_multiline": "Please keep your name on one line.",
+    "name_invisible_chars": (
+        "That name contains invisible or formatting characters. Please type it again "
+        "using ordinary letters."
+    ),
+    "name_empty": "Please type the name you'd like after /name - for example: /name Sam",
+    "name_too_long": "That name is too long. Please keep it to 32 characters or fewer.",
+    "name_has_at": (
+        "Names can't contain @, so they can't look like a Telegram username or an "
+        "email address."
+    ),
+    "name_looks_like_link": (
+        "Names can't look like a web address. If your name has a full stop in it, put "
+        "a space after it."
+    ),
+    "name_has_phone": (
+        "Names can't contain long runs of digits, so they can't look like a phone "
+        "number."
+    ),
+    "name_bad_chars": (
+        "Names can only use letters, numbers, spaces, emoji and the punctuation - ' . "
+        "Please try again."
+    ),
+    "name_numeric": (
+        "A name can't be just a number - people pick from the list by typing numbers, "
+        "so it would be confusing."
+    ),
+    "name_needs_letter": "Please include at least one letter in your name.",
+    "name_reserved": (
+        "That's a word the bot uses on its own buttons and messages, so it would be "
+        "confusing on the list. Please choose another name."
+    ),
+
     # --- Phase 5: choosing a specific supporter ------------------------------
     #
     # WORDING RULE FOR EVERYTHING THE REQUESTER SEES: a decline and a 24-hour silence
@@ -904,6 +1079,31 @@ MESSAGES = {
 }
 
 
+# Words a supporter may not be LISTED as: each would read as the bot's own UI next
+# to a number a student types ("3. Cancel", "4. Anyone"), or as an authority.
+_RESERVED_NAME_WORDS = (
+    'busy', '(busy)', 'free', 'available', 'unavailable', 'anyone', 'anybody', 'any',
+    'someone', 'somebody', 'everyone', 'everybody', 'nobody', 'no one', 'none', 'all',
+    'cancel', 'back', 'next', 'reset', 'clear', 'remove', 'delete', 'claim', 'accept',
+    'decline', 'yes', 'no', 'ok', 'okay', 'admin', 'administrator', 'moderator', 'mod',
+    'bot', 'the bot', 'care network', 'care network bot', 'support', 'support team',
+    'supporter', 'peer supporter', 'team', 'staff', 'welfare', 'counsellor',
+    'counselor', 'help', 'unknown', 'anonymous', 'rhesident',
+)
+
+# Derived from MESSAGES and SERVICES, so a new or renamed *_button, member label or
+# track name is covered automatically -- there is no second list to forget.
+RESERVED_NAME_KEYS: FrozenSet[str] = frozenset(
+    k for k in (
+        [name_key(w) for w in _RESERVED_NAME_WORDS]
+        + [name_key(v) for key, v in MESSAGES.items()
+           if key.endswith('_button') and isinstance(v, str)]
+        + [name_key(s.member_label) for s in SERVICES.values()]
+        + [name_key(s.display_name) for s in SERVICES.values()]
+    ) if k
+)
+
+
 def closing_text(service_key: Optional[str], for_member: bool) -> str:
     """The closing message for one side of a conversation, per track.
 
@@ -939,8 +1139,9 @@ def is_supporter_available(service_key: str, member_id: int) -> bool:
     if profile is None:
         return False
 
-    # 2. A curated name to show. No name => nothing the picker can render.
-    if not profile.display_name:
+    # 2. No name a requester could be shown. Names now default to the Telegram
+    #    first name, so this means "no valid override AND no usable first name".
+    if not listed_name(profile):
         return False
 
     # 3. Telegram forbids a bot messaging a user who has never messaged it. Without
@@ -969,16 +1170,155 @@ def is_supporter_available(service_key: str, member_id: int) -> bool:
 
 
 def available_supporters(service_key: str) -> List[MemberProfile]:
-    """Pickable supporters for a track, in a DETERMINISTIC, STABLE order.
+    """Pickable supporters for a track, in a DETERMINISTIC, STABLE order: by listed
+    label, then telegram_id (the listable_supporters order).
 
     Ordering matters more than it looks: the picker is paginated and the tap arrives
     seconds after the render. Random or dict-insertion order would page-shift a
     supporter between render and tap, and a typed number would then select somebody
     the requester never chose. Never iterate a set here.
+
+    Kept for existing callers and tests; from P3 on the picker uses picker_entries,
+    which also lists the busy ones.
     """
     svc = get_service(service_key)
-    return [p for p in svc.roster.profiles()
+    return [p for p, _label in listable_supporters(svc.key)
             if is_supporter_available(svc.key, p.telegram_id)]
+
+
+# --- Listed names ----------------------------------------------------------------
+# Everything below reads MESSAGES and SERVICES at CALL time.
+
+def supporter_name_problem(raw) -> Optional[str]:
+    """name_problem with the bot's own reserved words. The one validator for /name,
+    the CLI and listed_name, so what a supporter can set and what gets shown can
+    never disagree."""
+    return name_problem(raw, RESERVED_NAME_KEYS)
+
+
+def listed_name(profile: Optional[MemberProfile]) -> str:
+    """The name a requester would see for this supporter, before collision numbering.
+
+    "" means NOT LISTED. Precedence: a chosen-name override (display_name), else the
+    captured Telegram first name. An override that fails the rules gives "" -- it
+    NEVER falls back to the real first name, because somebody who chose an override
+    may have done so precisely so that their real name is not shown.
+    """
+    if profile is None:
+        return ""
+    override = clean_name(profile.display_name)
+    if override:
+        return override if supporter_name_problem(override) is None else ""
+    auto = clean_name(profile.telegram_first_name)
+    # A Telegram first name can run to 64 chars. Shorten rather than drop: the
+    # supporter never typed it for us and would not know why they had vanished.
+    if len(auto) > NAME_MAX_LENGTH:
+        auto = auto[:NAME_MAX_LENGTH].rstrip()
+    if auto and supporter_name_problem(auto) is None:
+        return auto
+    return ""
+
+
+def supporter_labels(service_key: str) -> Dict[int, str]:
+    """member_id -> the label a requester sees (collisions numbered), for every
+    roster member with a listed name. Members without one are simply absent."""
+    svc = get_service(service_key)
+    entries = []
+    for p in svc.roster.profiles():
+        # roster.remove() leaves the profile behind; membership is the authority.
+        if p.telegram_id not in svc.roster:
+            continue
+        name = listed_name(p)
+        if name:
+            entries.append((p.telegram_id, name))
+    return disambiguate(entries)
+
+
+def supporter_label(service_key: str, member_id) -> str:
+    """This member's label, or "" when unlisted (or the id is unusable)."""
+    try:
+        member_int = int(member_id)
+    except (TypeError, ValueError):
+        return ""
+    return supporter_labels(service_key).get(member_int, "")
+
+
+def listable_supporters(service_key: str) -> List[Tuple[MemberProfile, str]]:
+    """(profile, label) for every labelled member, busy or not, sorted by
+    (label.casefold(), telegram_id). Never iterate a set here -- see
+    available_supporters for why the order is load-bearing."""
+    svc = get_service(service_key)
+    labels = supporter_labels(svc.key)
+    out = [(p, labels[p.telegram_id]) for p in svc.roster.profiles()
+           if p.telegram_id in labels]
+    out.sort(key=lambda pair: (pair[1].casefold(), pair[0].telegram_id))
+    return out
+
+
+def omitted_supporters(service_key: str) -> List[int]:
+    """Sorted ids on the roster with NO label (bare ids included), so they can be
+    logged: a supporter who expected to be listed must be findable in the logs."""
+    svc = get_service(service_key)
+    labels = supporter_labels(svc.key)
+    return [m for m in svc.roster.snapshot() if m not in labels]
+
+
+def name_taken_by_other(service_key: str, member_id, name) -> bool:
+    """True iff some OTHER roster member is currently LISTED under a name that
+    name_key-matches `name`. Only listed names count: another member's invalid raw
+    text, or a Telegram name hidden behind their own override, is shown to nobody
+    and so cannot be confused with anything."""
+    svc = get_service(service_key)
+    key = name_key(name)
+    try:
+        member_int = int(member_id)
+    except (TypeError, ValueError):
+        member_int = None
+    for p in svc.roster.profiles():
+        if p.telegram_id == member_int or p.telegram_id not in svc.roster:
+            continue
+        other = listed_name(p)
+        if other and name_key(other) == key:
+            return True
+    return False
+
+
+def picker_entries(service_key: str, requester_id=None,
+                   declined: Iterable = ()) -> List[Tuple[MemberProfile, str, bool]]:
+    """(profile, label, free) for every listable supporter, in listable order.
+
+    Busy people are LISTED with free=False rather than hidden. `free` folds every
+    reason into one bit -- not started, /unavailable, in a conversation, holding a
+    directed request, waiting themselves, or already asked for this request -- so
+    nothing downstream CAN render which reason it was. The requester never sees
+    themselves.
+    """
+    svc = get_service(service_key)
+    declined_ids = set()
+    for d in declined or ():
+        try:
+            declined_ids.add(int(d))
+        except (TypeError, ValueError):
+            continue
+    out = []
+    for p, label in listable_supporters(svc.key):
+        if requester_id is not None and p.telegram_id == requester_id:
+            continue
+        free = (p.telegram_id not in declined_ids
+                and is_supporter_available(svc.key, p.telegram_id))
+        out.append((p, label, free))
+    return out
+
+
+def directed_fork_offered(service_key: str, requester_id) -> bool:
+    """Whether "a specific peer supporter / anyone" is offered at all: directed mode
+    is on for the track AND somebody other than the requester is listable. Busy
+    people count -- the list still shows them, with send-to-anyone prominent."""
+    svc = get_service(service_key)
+    if not svc.directed_enabled:
+        return False
+    return any(p.telegram_id != requester_id
+               for p, _label in listable_supporters(svc.key))
 
 
 def help_request_text(service_key: Optional[str]) -> str:

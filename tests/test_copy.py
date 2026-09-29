@@ -202,6 +202,36 @@ def test_member_addendum_names_the_member_only_commands():
         assert command in addendum, (command, addendum)
 
 
+def test_name_copy_is_complete_and_plain():
+    """Every /name reply exists, is plain text, and renders.
+
+    Each rejection key src/supporter_names.name_problem can return MUST have copy,
+    or a supporter typing a bad name gets a KeyError instead of a reason."""
+    from src.supporter_names import REJECTION_KEYS
+    plain = list(REJECTION_KEYS) + [
+        "name_taken", "name_suffix_note", "name_list_off_note",
+        "name_reset_done_no_name", "name_reset_nothing", "name_unchanged",
+        "name_current_none", "availability_needs_name", "now_available_named",
+        "now_unavailable_named",
+    ]
+    for key in plain:
+        value = MESSAGES.get(key)
+        assert isinstance(value, str) and value.strip(), key
+        assert "{" not in value and "}" not in value, (key, value)
+
+    for key in ("name_current_chosen", "name_current_telegram", "name_saved",
+                "name_reset_done"):
+        text = MESSAGES[key].format(name="Sam")
+        assert "{" not in text and "}" not in text, (key, text)
+        assert "Sam" in text, (key, text)
+
+    addendum = MESSAGES["member_addendum_named"]
+    for command in ("/available", "/unavailable", "/name", "/release"):
+        assert command in addendum, (command, addendum)
+    assert "/name" in MESSAGES["availability_needs_name"]
+    assert "/name" in MESSAGES["name_current_none"]
+
+
 def test_registration_copy_never_names_a_decider():
     """Nothing a /register applicant reads may name, number or hint at WHO decided.
 
@@ -296,8 +326,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 15, (
-        "expected at least 15 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 16, (
+        "expected at least 16 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

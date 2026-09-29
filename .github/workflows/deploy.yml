@@ -126,6 +126,9 @@ jobs:
       - name: tests/test_member_profiles.py
         run: python tests/test_member_profiles.py
 
+      - name: tests/test_supporter_names.py
+        run: python tests/test_supporter_names.py
+
       - name: tests/test_directed_requests.py
         run: python tests/test_directed_requests.py
 

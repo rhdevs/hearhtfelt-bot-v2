@@ -115,6 +115,11 @@ def test_b_unknown_keys_land_in_fields_verbatim():
         'created_at': 'x',
         'updated_at': 'y',
         'started_bot_at': 'z',
+        # Name bookkeeping: typed (telegram_first_name) or timestamps nobody
+        # renders. Present here to prove none of them leaks into `fields`.
+        'telegram_first_name': 'Robin',
+        'telegram_first_name_at': 'w',
+        'display_name_set_at': 'v',
         # The two keys nobody has heard of yet.
         'pronouns': 'they/them',
         'year': 2,
@@ -161,6 +166,7 @@ def test_d_legacy_doc_defaults_absent_means_available_not_started():
         "forbids the bot from messaging first")
     assert profile.display_name == ""
     assert profile.blurb == ""
+    assert profile.telegram_first_name == "", "ABSENT first name means no known name"
 
 
 # --------------------------------------------------------------------------- (e)

@@ -331,6 +331,9 @@ def setup(supporters=1, service="pss", db_available=True, **profile_overrides):
 
     hf.channel_id, hf.enabled = HF_CHANNEL, (service == "hf")
     pss.channel_id, pss.enabled = PSS_CHANNEL, (service == "pss")
+    # Directed mode is now OFF by default (rollout safety, PSS_DIRECTED_ENABLED_DEFAULT);
+    # this suite exists to drive it, so it opts in explicitly.
+    pss.directed_enabled = True
 
     docs = [supporter_doc(n, **profile_overrides) for n in range(supporters)]
     target = config.SERVICES[service]
@@ -1403,14 +1406,16 @@ if __name__ == "__main__":
             restore_mod.db_mgr, expiry_mod.db_mgr)
     hf = config.SERVICES[ServiceType.HF.value]
     pss = config.SERVICES[ServiceType.PSS.value]
-    saved = (hf.channel_id, hf.enabled, pss.channel_id, pss.enabled)
+    saved = (hf.channel_id, hf.enabled, pss.channel_id, pss.enabled,
+             pss.directed_enabled)
     try:
         asyncio.run(run())
         print("\nAll %d directed-request assertions passed!" % len(CASES))
     finally:
         (handlers_mod.db_mgr, queue_mod.db_mgr, session_mod.db_mgr,
          restore_mod.db_mgr, expiry_mod.db_mgr) = real
-        hf.channel_id, hf.enabled, pss.channel_id, pss.enabled = saved
+        (hf.channel_id, hf.enabled, pss.channel_id, pss.enabled,
+         pss.directed_enabled) = saved
         # replace_records([]) FIRST: replace() with the same id set is a no-op that
         # keeps existing profiles, so without this the scratch profiles would leak
         # into any suite sharing this process.

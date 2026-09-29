@@ -85,7 +85,9 @@ def test_directed_support_is_a_pss_feature_only():
     assert hf.directed_enabled is False, (
         "HF must never offer the picker: its supporters are not curated with display "
         "names and its channel is the only routing it has")
-    assert pss.directed_enabled is True
+    # Env-driven, and OFF unless deliberately opted in: see the next test.
+    assert pss.directed_enabled == config._env_bool(
+        'PSS_DIRECTED_ENABLED', config.PSS_DIRECTED_ENABLED_DEFAULT)
     assert pss.directed_response_minutes == 1440
     assert pss.picker_page_size == 8
     for svc in SERVICES.values():
@@ -95,6 +97,23 @@ def test_directed_support_is_a_pss_feature_only():
         assert svc.directed_response_minutes > 0, svc.key
         assert isinstance(svc.closing_extra, str), svc.key
         assert isinstance(svc.closing_extra_member, str), svc.key
+
+
+def test_pss_directed_is_off_by_default():
+    """ROLLOUT SAFETY. Production's PSS roster holds a test account and names now
+    default to Telegram first names, so the old "no display_name => invisible" lever
+    is gone. Merging must not put a list of supporters in front of real students:
+    only an explicit PSS_DIRECTED_ENABLED turns it on."""
+    assert config.PSS_DIRECTED_ENABLED_DEFAULT is False
+    if os.getenv('PSS_DIRECTED_ENABLED') is None:
+        # Live in CI, where nothing sets it.
+        assert SERVICES["pss"].directed_enabled is False
+
+
+def test_supporter_names_is_a_pss_feature_only():
+    # HF must stay byte-identical: no name capture, no /name, no *_named copy.
+    assert SERVICES["hf"].supporter_names is False
+    assert SERVICES["pss"].supporter_names is True
 
 
 def test_back_compat_aliases_mirror_hf():
@@ -128,8 +147,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 12, (
-        "expected at least 12 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 14, (
+        "expected at least 14 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )
