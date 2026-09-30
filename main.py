@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import time
-from telegram import BotCommand
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from telegram import BotCommand, Update
+from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+                          TypeHandler, filters)
 import config
 from config import (
     BOT_TOKEN,
@@ -140,6 +141,11 @@ async def main():
     handlers = BotHandlers(session_manager, queue_manager)
     
     # Register handlers
+    # FIRST, and in group -1: that group runs before every other handler for every
+    # update, whichever handler (if any) then takes it. It is the capture point for
+    # PSS supporters' has_started_bot and Telegram first name (the name students see
+    # unless they choose one with /name). It never replies, sends or raises.
+    application.add_handler(TypeHandler(Update, handlers.note_private_contact), group=-1)
     application.add_handler(CommandHandler("start", handlers.start_command))
     # One handler, two names: /help stays alive for posters and existing users.
     application.add_handler(CommandHandler(["chat", "help"], handlers.chat_command))
@@ -159,6 +165,10 @@ async def main():
     # boot gate. Deliberately absent from BOT_COMMANDS: that menu is the
     # requester's surface. See D41/D42.
     application.add_handler(CommandHandler("register", handlers.register_command))
+    # A PSS supporter's own listed name. Deliberately absent from BOT_COMMANDS, and
+    # SILENT to anyone who is not an active PSS supporter in a private chat -- which
+    # is exactly what an unrecognised command gets, since nothing handles those.
+    application.add_handler(CommandHandler("name", handlers.name_command))
     
     # Message handler for regular messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))

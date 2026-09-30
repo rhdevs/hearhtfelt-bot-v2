@@ -1075,6 +1075,77 @@ async def case_ag_a_truly_stale_directed_request_still_closes_silently():
     print("OK  ag. a directed request past its own horizon is still closed silently")
 
 
+async def case_ah_the_list_after_a_restart_marks_the_busy_without_saying_why():
+    """After a restart the list must still know who is busy -- in a conversation
+    (restored active session), holding a request (restored directed index) or
+    /unavailable -- and must mark all three the SAME way. A restore that forgot
+    either index would offer a button that DMs somebody already occupied."""
+    reset_state()
+    pss = config.SERVICES[ServiceType.PSS.value]
+    saved_directed = pss.directed_enabled
+    pss.directed_enabled = True
+    try:
+        pss.roster.replace_records([
+            {'telegram_id': 2101, 'display_name': 'Ann', 'has_started_bot': True,
+             'available': True, 'active': True},
+            {'telegram_id': 2102, 'display_name': 'Ben', 'has_started_bot': True,
+             'available': True, 'active': True},
+            {'telegram_id': 2103, 'display_name': 'Cat', 'has_started_bot': True,
+             'available': True, 'active': True},
+            {'telegram_id': 2104, 'display_name': 'Dee', 'has_started_bot': True,
+             'available': False, 'active': True},
+        ])
+        stub = StubDB([
+            active_doc('a-ah', 7701, 2101, 5, service='pss'),
+            pending_doc('p-ah1', 7702, 5, service='pss', routing='directed',
+                        target_member_id=2102,
+                        directed_at=utcnow() - datetime.timedelta(minutes=5)),
+            pending_doc('p-ah2', 7703, 5, service='pss', routing='choosing'),
+        ])
+        bot, sm, qm, em, _ = build(stub)
+        restore_state(qm, sm)
+        assert bot.sent == [], ("rehydration sends nothing", bot.sent)
+
+        shown = []
+
+        async def answer(t=None, show_alert=False):
+            return None
+
+        async def edit_message_text(t, reply_markup=None, **kw):
+            shown.append((t, reply_markup))
+
+        fu = SimpleNamespace(id=7703, username=None, first_name="Req", last_name=None)
+        q = SimpleNamespace(from_user=fu, data="pk_l:0", answer=answer,
+                            edit_message_text=edit_message_text)
+        update = SimpleNamespace(effective_user=fu, message=None, callback_query=q,
+                                 effective_chat=SimpleNamespace(id=7703, type="private"))
+        await BotHandlers(sm, qm).handle_callback_query(update, SimpleNamespace(bot=bot))
+
+        assert shown, "the list was not rendered"
+        text, markup = shown[-1]
+        for name in ("Ann", "Ben", "Dee"):
+            assert "%s (busy)" % name in text, (name, text)
+        assert "Cat" in text and "Cat (busy)" not in text, text
+        # Pick buttons are opaque (pk_s:<nonce>:<n>); the id lives only in the view.
+        view = config.picker_views[fu.id]
+        selects = [view['ids'][int(b.callback_data.rsplit(":", 1)[1]) - 1]
+                   for row in markup.inline_keyboard for b in row
+                   if b.callback_data.startswith("pk_s:%s:" % view['nonce'])]
+        assert selects == [2103], selects
+        lines = [l for l in text.split("\n") if l[:1].isdigit()]
+        assert len(lines) == 4, lines
+        for line in lines:
+            for word in ("conversation", "unavailable", "started", "declin",
+                         "waiting", "reach"):
+                assert word not in line.lower(), (word, line)
+        assert bot.sent == [], ("rendering in place sends nothing new", bot.sent)
+    finally:
+        pss.directed_enabled = saved_directed
+        pss.roster.replace_records([])
+        pss.roster.replace([PSS_MEMBER])
+    print("OK  ah. the list after a restart marks the busy, all alike, and offers only the free")
+
+
 # --------------------------------------------------------------------------- runner
 CASES = [
     case_a_happy_pending,
@@ -1110,6 +1181,7 @@ CASES = [
     case_ae_an_old_request_repicked_recently_survives_boot,
     case_af_a_directed_request_is_judged_on_its_own_clock,
     case_ag_a_truly_stale_directed_request_still_closes_silently,
+    case_ah_the_list_after_a_restart_marks_the_busy_without_saying_why,
 ]
 
 
@@ -1130,8 +1202,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 33, (
-        "expected at least 31 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 34, (
+        "expected at least 34 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

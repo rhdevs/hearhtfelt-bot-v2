@@ -2,6 +2,7 @@ import datetime
 import html
 import logging
 import re
+import secrets
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CallbackContext
@@ -18,7 +19,6 @@ from config import (
     CB_PICK_SELECT,
     SERVICES,
     UserState,
-    available_supporters,
     picker_views,
     user_states,
     user_to_queue_map,
@@ -40,10 +40,23 @@ from config import (
     default_service_key,
     get_service,
     help_request_text,
+    directed_fork_offered,
+    listed_name,
+    name_taken_by_other,
+    omitted_supporters,
+    picker_entries,
+    supporter_label,
+    supporter_name_problem,
 )
 from src.bot.managers.session import SessionManager
 from src.bot.managers.queue import QueueManager, SelfClaimError
 from src.database.manager import db_mgr
+from src.supporter_names import (
+    CAPTURED_NAME_MAX_LENGTH,
+    NAME_MAX_LENGTH,
+    RESET_KEYWORD,
+    clean_name,
+)
 from src.timeutil import ensure_aware_utc, format_hhmm, utcnow
 
 logger = logging.getLogger(__name__)
@@ -78,16 +91,266 @@ class BotHandlers:
         for svc in SERVICES.values():
             if user_id not in svc.roster:
                 continue
-            profile = svc.roster.profile(user_id)
-            if profile is not None and profile.has_started_bot:
-                continue
+            self._record_started_on(svc, user_id)
+
+    def _record_started_on(self, svc, user_id) -> None:
+        """_record_bot_started for ONE track. Plain, not async, on purpose: nothing
+        may await between the Mongo write and the memory write (see
+        _record_first_name_on for why that matters)."""
+        profile = svc.roster.profile(user_id)
+        if profile is not None and profile.has_started_bot:
+            return
+        try:
+            db_mgr.mark_member_started(user_id, True,
+                                       collection=svc.members_collection)
+        except Exception as exc:
+            logger.warning("Could not record bot-started for member %s (%s): %s",
+                           user_id, svc.key, exc)
+        svc.roster.mark_started(user_id, True)
+
+    def _record_first_name_on(self, svc, user_id, first_name) -> None:
+        """Capture the Telegram first name this member's own private update carried.
+
+        It is the automatic listed name (a /name override always wins), so it is
+        refreshed on every contact and a rename on Telegram follows through.
+
+        Why the 5-minute roster refresh cannot clobber this: main.refresh_all_rosters
+        reads Mongo and replaces memory with no await in between, and this writes
+        Mongo FIRST and memory SECOND, also with no await in between. On one event
+        loop the two therefore run strictly one after the other, and either order
+        ends with the new name in both places. A failed Mongo write still updates
+        memory: the next refresh reverts it, and the next contact re-captures it, so
+        it self-heals rather than sticking.
+        """
+        captured = clean_name(first_name)[:CAPTURED_NAME_MAX_LENGTH].strip()
+        if not captured:
+            # Telegram always sends a first name. An empty one here is a malformed
+            # update, and it must never erase a good name we already have.
+            return
+        profile = svc.roster.profile(user_id)
+        if profile is not None and profile.telegram_first_name == captured:
+            # The hot path, taken on nearly every message: a dict lookup, no Mongo.
+            return
+
+        old_first = profile.telegram_first_name if profile else None
+        old_listed = listed_name(profile)
+        try:
+            db_mgr.set_member_first_name(user_id, captured,
+                                         collection=svc.members_collection)
+        except Exception as exc:
+            logger.warning("Could not record the Telegram first name of member %s "
+                           "(%s): %s", user_id, svc.key, exc)
+        base_doc = None
+        if profile is None:
+            # No profile in memory, only a bare roster id (e.g. an approval whose doc
+            # read failed). Build it from Mongo, never from nothing: a blank profile
+            # would list somebody under the real first name they chose /name to
+            # hide, and as free when they said /unavailable.
+            # Read AFTER the write above, so the doc already carries this first name.
+            # Synchronous, like everything here -- see the refresh argument in the
+            # docstring.
             try:
-                db_mgr.mark_member_started(user_id, True,
-                                           collection=svc.members_collection)
+                base_doc = db_mgr.get_member_profile_doc(
+                    user_id, collection=svc.members_collection)
             except Exception as exc:
-                logger.warning("Could not record bot-started for member %s (%s): %s",
+                logger.warning("Could not read the '%s' record of member %s: %s",
+                               svc.key, user_id, exc)
+        # create_if_missing: a roster id with no profile would otherwise stay
+        # unlisted until the next refresh. The profile is built from base_doc, so it
+        # keeps the override and availability; blank only when Mongo is unreadable,
+        # and never created at all for a doc that says active: False.
+        svc.roster.set_first_name(user_id, captured, create_if_missing=True,
+                                  base_doc=base_doc)
+        new_listed = listed_name(svc.roster.profile(user_id))
+        logger.info("%s supporter %s: Telegram first name %r -> %r (listed as %r -> %r)",
+                    svc.key, user_id, old_first, captured, old_listed, new_listed)
+        if new_listed == "" and clean_name(profile.display_name if profile else "") == "":
+            # The id only: the name itself is already on the line above.
+            logger.info("%s supporter %s cannot be listed under their Telegram first "
+                        "name; /name sets one", svc.key, user_id)
+
+    def _note_supporter_contact(self, user) -> None:
+        """THE capture point for tracks that list supporters by name: records
+        has_started_bot and the Telegram first name on every supporter_names track
+        this user is a member of.
+
+        HF (supporter_names False) is never touched here, which keeps HF
+        byte-identical: its has_started_bot backfill stays in handle_message and
+        start_command exactly as before.
+        """
+        for svc in SERVICES.values():
+            if not svc.supporter_names or user.id not in svc.roster:
+                continue
+            self._record_started_on(svc, user.id)
+            self._record_first_name_on(svc, user.id, getattr(user, "first_name", None))
+
+    async def note_private_contact(self, update, context) -> None:
+        """The group -1 TypeHandler callback. Group -1 runs before every other
+        handler for every update, so every private message, command or button tap
+        from a supporter refreshes what the bot knows about them -- whichever
+        handler then takes the update, and even when none does.
+
+        It replies to nobody, sends nothing and NEVER raises: an exception here
+        would reach handle_error on an update that is otherwise fine.
+        """
+        try:
+            if not self._is_private_chat(update):
+                return
+            user = getattr(update, "effective_user", None)
+            if user is None:
+                return
+            self._note_supporter_contact(user)
+        except Exception:
+            logger.warning("Supporter contact capture failed; continuing", exc_info=True)
+
+    # ------------------------------------------------------------------ /name
+    async def name_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/name: a PSS supporter sees, sets or resets the name students see.
+
+        Deliberately absent from set_my_commands, and SILENT to everybody else.
+        """
+        user = getattr(update, "effective_user", None)
+        message = getattr(update, "message", None)
+        if user is None or message is None:
+            return
+
+        svc = next((s for s in SERVICES.values()
+                    if s.supporter_names and user.id in s.roster), None)
+        if svc is None or not self._is_private_chat(update):
+            # No reply, no send, no DB call. This is EXACTLY what an unrecognised
+            # command gets: main.py registers no handler for those, and
+            # handle_message is filtered on ~filters.COMMAND, so '/foo' is answered
+            # with silence. Replying MESSAGES['unknown_command'] here would make
+            # /name distinguishable from a command that does not exist, and so tell
+            # a stranger that a supporter roster exists. Students, HF-only members,
+            # deactivated members and every group/channel land here. test_boot's
+            # unknown-command guard pins the premise: if a catch-all is ever
+            # added, /name must be routed through it.
+            logger.debug("/name ignored for user %s (not an active named-track "
+                         "supporter in a private chat)", user.id)
+            return
+
+        # So the answer reflects their CURRENT Telegram first name, even though the
+        # group -1 hook normally got there first.
+        self._note_supporter_contact(user)
+
+        # message.text, NOT context.args: args are whitespace-split, which would
+        # silently turn "Sam\nLee" into "Sam Lee" and hide the newline the rules
+        # reject. "/name@botname Sam" splits the same way.
+        raw = message.text or ""
+        parts = raw.split(None, 1)
+        arg = parts[1] if len(parts) > 1 else ""
+
+        # Every reply in this flow is PLAIN TEXT, no parse_mode: a name is
+        # supporter-typed text and must never be interpreted as markup.
+        if not arg.strip():
+            await message.reply_text(self._name_status_text(svc, user.id))
+            return
+        if arg.strip().casefold() == RESET_KEYWORD:
+            await self._reset_name(message, svc, user.id)
+            return
+        await self._set_name(message, svc, user.id, arg)
+
+    def _name_status_text(self, svc, user_id) -> str:
+        profile = svc.roster.profile(user_id)
+        name = listed_name(profile)
+        label = supporter_label(svc.key, user_id) or name
+        if not name:
+            text = MESSAGES["name_current_none"]
+        elif clean_name(profile.display_name):
+            text = MESSAGES["name_current_chosen"].format(name=label)
+        else:
+            text = MESSAGES["name_current_telegram"].format(name=label)
+        if name and label != name:
+            text += "\n\n" + MESSAGES["name_suffix_note"]
+        if not (svc.runnable and svc.directed_enabled):
+            text += "\n\n" + MESSAGES["name_list_off_note"]
+        return text
+
+    def _write_display_name(self, svc, user_id, new):
+        """Mongo FIRST, memory SECOND, no await anywhere in here.
+
+        Returns (reply_key_or_None, suffix, old_chosen_from_mongo_or_None).
+        reply_key 'missing' means: answer with SILENCE (not an active member in
+        Mongo, the same path as the unknown-command refusal). Memory is changed only
+        when the write landed, so a refresh can never silently undo a name the
+        supporter was told was saved.
+        """
+        if db_mgr.db_available:
+            try:
+                outcome, before = db_mgr.set_member_display_name(
+                    user_id, new, collection=svc.members_collection)
+            except Exception as exc:
+                logger.warning("Could not save the chosen name of member %s (%s): %s",
                                user_id, svc.key, exc)
-            svc.roster.mark_started(user_id, True)
+                outcome, before = "error", None
+            if outcome == "missing":
+                logger.info("%s /name from %s refused: not an active member in the "
+                            "database", svc.key, user_id)
+                return "missing", "", None
+            if outcome != "ok":
+                return "availability_failed", "", None
+            svc.roster.set_display_name(user_id, new)
+            return None, "", (before or {}).get("display_name")
+        if not svc.roster.set_display_name(user_id, new):
+            return "availability_failed", "", None
+        return None, "\n\n" + MESSAGES["availability_memory_only"], None
+
+    async def _set_name(self, message, svc, user_id, arg) -> None:
+        problem = supporter_name_problem(arg)
+        if problem:
+            await message.reply_text(MESSAGES[problem])
+            return
+        new = clean_name(arg)
+        profile = svc.roster.profile(user_id)
+        if profile is not None and clean_name(profile.display_name) == new:
+            await message.reply_text(MESSAGES["name_unchanged"])
+            return
+        if name_taken_by_other(svc.key, user_id, new):
+            await message.reply_text(MESSAGES["name_taken"])
+            return
+
+        old_listed = listed_name(profile)
+        old_chosen = clean_name(profile.display_name) if profile else ""
+        failure, suffix, stored_before = self._write_display_name(svc, user_id, new)
+        if failure == "missing":
+            return
+        if failure:
+            await message.reply_text(MESSAGES[failure])
+            return
+        old_chosen = stored_before or old_chosen
+        new_listed = listed_name(svc.roster.profile(user_id)) or new
+        logger.info("%s supporter %s changed their listed name: %r -> %r "
+                    "(chosen name %r -> %r)",
+                    svc.key, user_id, old_listed, new_listed, old_chosen, new)
+        await message.reply_text(
+            MESSAGES["name_saved"].format(name=supporter_label(svc.key, user_id) or new)
+            + suffix)
+
+    async def _reset_name(self, message, svc, user_id) -> None:
+        profile = svc.roster.profile(user_id)
+        if profile is None or clean_name(profile.display_name) == "":
+            await message.reply_text(MESSAGES["name_reset_nothing"])
+            return
+
+        old_listed = listed_name(profile)
+        old_chosen = clean_name(profile.display_name)
+        failure, suffix, stored_before = self._write_display_name(svc, user_id, "")
+        if failure == "missing":
+            return
+        if failure:
+            await message.reply_text(MESSAGES[failure])
+            return
+        old_chosen = stored_before or old_chosen
+        new_listed = listed_name(svc.roster.profile(user_id))
+        logger.info("%s supporter %s changed their listed name: %r -> %r "
+                    "(chosen name %r -> %r)",
+                    svc.key, user_id, old_listed, new_listed, old_chosen, "")
+        if new_listed:
+            label = supporter_label(svc.key, user_id) or new_listed
+            await message.reply_text(MESSAGES["name_reset_done"].format(name=label) + suffix)
+        else:
+            await message.reply_text(MESSAGES["name_reset_done_no_name"] + suffix)
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -119,7 +382,14 @@ class BotHandlers:
         # surface. This addendum is how a supporter discovers them instead.
         if self._is_private_chat(update) and is_any_member(user_id):
             self._record_bot_started(user_id)
-            text = text + "\n\n" + MESSAGES["member_addendum"]
+            # A member of a track that lists supporters by name also has /name.
+            # An HF-only member's text is byte-identical to before. `enabled`, the
+            # same gate is_any_member applies, so a switched-off PSS track does not
+            # change what an HF member who is also on its roster is told.
+            named = any(s.enabled and s.supporter_names and user_id in s.roster
+                        for s in SERVICES.values())
+            text = text + "\n\n" + MESSAGES[
+                "member_addendum_named" if named else "member_addendum"]
 
         await update.message.reply_text(text)
 
@@ -163,6 +433,18 @@ class BotHandlers:
             suffix = "\n\n" + MESSAGES["availability_memory_only"]
 
         profile = svc.roster.profile(user_id)
+        if svc.supporter_names:
+            # A named track lists everyone with a name and marks the busy ones, and
+            # the name defaults to the Telegram first name -- so "no name" means
+            # "nothing usable", which the supporter fixes themselves with /name.
+            if profile is None or not listed_name(profile):
+                await update.message.reply_text(MESSAGES["availability_needs_name"] + suffix)
+                return
+            text = (MESSAGES["now_available_named"] if available
+                    else MESSAGES["now_unavailable_named"])
+            await update.message.reply_text(text + suffix)
+            return
+
         if profile is None or not profile.display_name:
             # The toggle was honoured; they just have nothing to render yet.
             await update.message.reply_text(MESSAGES["availability_needs_profile"] + suffix)
@@ -871,22 +1153,46 @@ class BotHandlers:
                              "%s on '%s'", registration_id, applicant, svc.key)
 
             # In memory too, so they can claim immediately instead of waiting out
-            # the 300s roster refresh. NOTE: .add() creates NO profile, so they are
-            # claim-authorized and PICKER-INVISIBLE until somebody sets a display
-            # name. That is the intended behaviour, not an oversight -- it is the
-            # staged-rollout lever for the whole picker feature. D38/R15.
-            # mark_started is a no-op while there is no profile; it matters on the
-            # re-activation path, where one already exists and would otherwise
-            # disagree with Mongo until the next refresh.
-            svc.roster.add(applicant)
-            svc.roster.mark_started(applicant, True)
+            # the 300s roster refresh. The in-memory profile is LOADED FROM THE
+            # JUST-WRITTEN MONGO DOCUMENT, not built from nothing: a RE-activated
+            # supporter therefore keeps the /name override and /unavailable they
+            # had before deactivation, rather than being listed under the Telegram
+            # first name they chose to hide, as free (R15). A first-time applicant's
+            # doc has no name yet, so they become LISTABLE (once the fork is on for
+            # this track) from their next private message -- captured by
+            # note_private_contact, the same capture point that records
+            # has_started_bot -- or under a name they choose with /name. An admin
+            # override via `set-profile --display-name` still works too. The
+            # staged-rollout lever is PSS_DIRECTED_ENABLED (R11), not the absence
+            # of a name.
+            # Fallback when the write or the read-back failed: the bare id, as
+            # before. mark_started is then a no-op unless a profile already exists,
+            # where it keeps memory agreeing with Mongo until the next refresh; the
+            # next private message builds the profile from Mongo instead.
+            # Synchronous and before the first await: winner-only, pre-await.
+            installed = False
+            if not write_failed:
+                try:
+                    doc_after = db_mgr.get_member_profile_doc(
+                        applicant, collection=svc.members_collection)
+                except Exception as exc:
+                    doc_after = None
+                    logger.warning("Could not read back the '%s' record for %s: %s",
+                                   svc.key, applicant, exc)
+                installed = svc.roster.upsert_record(doc_after)
+            if not installed:
+                svc.roster.add(applicant)
+                svc.roster.mark_started(applicant, True)
 
         # The first await of the winning path: a plain ack.
         await query.answer()
 
         notified = True
         if approving:
-            text = MESSAGES["registration_approved"].format(member=svc.member_label)
+            # HF's copy is byte-identical: HF never sets supporter_names, so this
+            # always picks registration_approved for that track.
+            key = 'registration_approved_named' if svc.supporter_names else 'registration_approved'
+            text = MESSAGES[key].format(member=svc.member_label)
         else:
             # VERBATIM from MESSAGES. No .format(), no concatenation, no
             # interpolation of any kind: nothing the applicant reads may name or
@@ -976,8 +1282,8 @@ class BotHandlers:
             return MESSAGES["choosing_status"]
         if routing == 'directed':
             # Discloses only the supporter this requester chose themselves.
-            profile = svc.roster.profile(entry.get('target_member_id'))
-            name = profile.display_name if profile is not None else svc.member_label
+            name = (supporter_label(svc.key, entry.get('target_member_id'))
+                    or svc.member_label)
             return MESSAGES["directed_status"].format(name=name)
         return MESSAGES["queue_status"].format(member=svc.member_label)
 
@@ -1121,13 +1427,16 @@ class BotHandlers:
 
         user_telehandle = f"@{update.effective_user.username}" if update.effective_user.username else None
 
-        # THE FORK. `if options:` is load-bearing in three separate ways: no pickable
-        # supporters means no dead-end UI, means HF (directed_enabled False) never
-        # reaches it, and means the pre-Phase-5 suites -- whose rosters are bare ints
-        # with no display names -- keep driving the original path below untouched.
+        # THE FORK: "a specific peer supporter" or "any available peer supporter".
+        # Shown iff directed mode is on for the track AND at least one listable
+        # supporter (active, with a known name) exists other than the requester.
+        # It is shown EVEN WHEN ALL OF THEM ARE BUSY: the list then marks every one
+        # busy and puts send-to-anyone first, which is honest and still one tap from
+        # the channel. HF (directed_enabled False) never reaches it, and neither do
+        # the pre-Phase-5 suites, whose rosters are bare ints with no names -- they
+        # keep driving the original path below untouched.
         svc = get_service(service_key)
-        options = available_supporters(svc.key) if svc.directed_enabled else []
-        if options:
+        if directed_fork_offered(svc.key, user_id):
             # The Mongo row is created BEFORE the question, so a restart mid-question
             # is recoverable rather than a request that quietly never existed.
             queue_id = self.queue_manager.add_to_queue(
@@ -1350,58 +1659,99 @@ class BotHandlers:
 
     async def _render_picker(self, query, context, user_id: int, queue_id: str,
                              page: int, note: str = "") -> bool:
-        """Render one page of choosable supporters. False when there is nobody to show.
+        """Render one page of the supporter list. False when nobody can be shown.
 
-        Numbers are 1-based and PAGE-LOCAL, and the view is recorded BEFORE the
-        message is sent so a very fast reply cannot race the record and be read
-        against the previous page.
+        EVERY listable supporter is shown, numbered; anyone who cannot be asked
+        right now carries the one busy marker and no button, whatever the reason.
+        Numbers are 1-based and PAGE-LOCAL and cover busy entries too, so a typed
+        number means what is on screen; send_directed_request's live re-check is
+        what refuses a busy one. The view is recorded BEFORE the message is sent so
+        a very fast reply cannot race the record and be read against the previous
+        page.
+
+        `note` is already HTML-safe (its {name} was escaped by the caller) and is
+        deliberately NOT escaped again here.
         """
         entry = self.queue_manager.get_queue_entry(queue_id)
         if entry is None:
             return False
 
         svc = get_service(entry.get('service'))
-        declined = set(entry.get('declined_by') or [])
-        options = [p for p in available_supporters(svc.key)
-                   if p.telegram_id not in declined]
+        # KILL SWITCH: with directed mode off, a picker button rendered before the
+        # switch was flipped must not show a single name.
+        entries = (picker_entries(svc.key, requester_id=user_id,
+                                  declined=entry.get('declined_by') or [])
+                   if svc.directed_enabled else [])
 
-        if not options:
+        if svc.directed_enabled:
+            omitted = omitted_supporters(svc.key)
+            if omitted:
+                # Ids only -- these are exactly the people with no usable name. A
+                # supporter who expected to be listed must be findable in the logs.
+                logger.info("%d %s roster member(s) left off the list for want of a "
+                            "usable name: %s", len(omitted), svc.key, omitted)
+
+        prefix = (note + "\n\n") if note else ""
+
+        if not entries:
             # NEVER render an empty list: a picker with no names is a dead end with no
             # way out but /cancel.
             picker_views.pop(user_id, None)
             await self._send_or_edit(
-                query, context, user_id, MESSAGES["picker_nobody_free"],
+                query, context, user_id, prefix + MESSAGES["picker_nobody_free"],
                 InlineKeyboardMarkup([
                     [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
                                           callback_data=CB_PICK_OPEN)],
                     [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
                                           callback_data=CB_PICK_CANCEL)],
-                ]))
+                ]), parse_mode='HTML')
             return False
 
+        anyone_free = any(free for _profile, _label, free in entries)
+
         page_size = max(1, svc.picker_page_size)
-        pages = max(1, (len(options) + page_size - 1) // page_size)
+        pages = max(1, (len(entries) + page_size - 1) // page_size)
         try:
             page = int(page)
         except (TypeError, ValueError):
             page = 0
         page = max(0, min(page, pages - 1))
-        chunk = options[page * page_size:(page + 1) * page_size]
+        chunk = entries[page * page_size:(page + 1) * page_size]
 
+        # Name only. The blurb stays in the data and the CLI but is never shown.
         lines = []
-        for number, profile in enumerate(chunk, start=1):
-            lines.append(f"{number}. {html.escape(profile.display_name)}")
-            if profile.blurb:
-                lines.append(f"   {html.escape(profile.blurb)}")
+        for number, (_profile, label, free) in enumerate(chunk, start=1):
+            line = f"{number}. {html.escape(label)}"
+            if not free:
+                line += " " + html.escape(MESSAGES["picker_busy_marker"])
+            lines.append(line)
 
-        text = ((note + "\n\n") if note else "") + MESSAGES["picker_header"] + "\n\n"
-        text += "\n".join(lines) + "\n\n" + MESSAGES["picker_hint"]
+        text = prefix
+        if not anyone_free:
+            text += MESSAGES["picker_nobody_free"] + "\n\n"
+        text += MESSAGES["picker_header"] + "\n\n" + "\n".join(lines)
+        if anyone_free:
+            text += "\n\n" + MESSAGES["picker_hint"]
         if pages > 1:
             text += "\n" + MESSAGES["picker_page"].format(page=page + 1, pages=pages)
 
-        rows = [[InlineKeyboardButton(f"{number}. {profile.display_name}"[:60],
-                                      callback_data=f"{CB_PICK_SELECT}:{profile.telegram_id}")]
-                for number, profile in enumerate(chunk, start=1)]
+        anyone_row = [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
+                                           callback_data=CB_PICK_OPEN)]
+        rows = []
+        if not anyone_free:
+            # Nobody can be picked, so the way forward goes first, where it is seen.
+            rows.append(anyone_row)
+        # Buttons for the FREE only. Button text is plain -- no parse mode applies.
+        # callback_data is OPAQUE: a per-render nonce plus the on-screen number, never
+        # a Telegram id. callback_data is readable by any modified client, and an id
+        # there would tie every /name pseudonym to a real account. The nonce also
+        # makes a button from an earlier render (or an earlier request) dead: it can
+        # only ever resolve against the list the requester is looking at now.
+        nonce = secrets.token_hex(4)
+        rows.extend(
+            [InlineKeyboardButton(f"{number}. {label}"[:60],
+                                  callback_data=f"{CB_PICK_SELECT}:{nonce}:{number}")]
+            for number, (_profile, label, free) in enumerate(chunk, start=1) if free)
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton(MESSAGES["picker_back_button"],
@@ -1411,16 +1761,18 @@ class BotHandlers:
                                             callback_data=f"{CB_PICK_LIST}:{page + 1}"))
         if nav:
             rows.append(nav)
-        rows.append([InlineKeyboardButton(MESSAGES["picker_anyone_button"],
-                                          callback_data=CB_PICK_OPEN)])
+        if anyone_free:
+            rows.append(anyone_row)
         rows.append([InlineKeyboardButton(MESSAGES["picker_cancel_button"],
                                           callback_data=CB_PICK_CANCEL)])
 
-        # RECORD BEFORE SENDING.
+        # RECORD BEFORE SENDING. Busy ids included, so a typed number lines up with
+        # the numbered list on screen.
         picker_views[user_id] = {
             'queue_id': queue_id,
             'page': page,
-            'ids': [p.telegram_id for p in chunk],
+            'ids': [profile.telegram_id for profile, _label, _free in chunk],
+            'nonce': nonce,
             'rendered_at': utcnow(),
         }
 
@@ -1465,7 +1817,7 @@ class BotHandlers:
         await self._choose_supporter(None, context, user_id, queue_id, ids[number - 1])
 
     async def _handle_picker_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """pk_o / pk_l:<page> / pk_s:<member_id> / pk_x, all from the requester."""
+        """pk_o / pk_l:<page> / pk_s:<nonce>:<number> / pk_x, all from the requester."""
         query = update.callback_query
         user_id = query.from_user.id
         data = query.data or ""
@@ -1493,17 +1845,44 @@ class BotHandlers:
 
         if data == CB_PICK_OPEN:
             await query.answer()
-            if not await self.queue_manager.route_to_open_queue(queue_id):
+            outcome = await self.queue_manager.route_to_open_queue(queue_id)
+            if outcome == 'ok':
+                # Every choice on this message is now spent. route_to_open_queue
+                # already sent queue_added, so only the keyboard needs to go.
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                return
+            if outcome == 'post_failed':
+                # The one real fault. The buttons are deliberately LEFT live: routing
+                # reverted to 'choosing', so the same tap is a valid retry.
                 try:
                     await context.bot.send_message(chat_id=user_id,
                                                    text=MESSAGES["channel_error"])
                 except Exception as exc:
                     logger.warning("Could not report the channel error to %s: %s",
                                    user_id, exc)
+                return
+            # 'already_open' / 'gone': a repeat or stale tap. Tell them where their
+            # request actually stands -- "the system is down" would send somebody
+            # whose request is live in the channel off to retype it or give up.
+            text = (self._open_request_status_text(user_id)
+                    if self.queue_manager.get_queue_entry(queue_id) is not None
+                    else MESSAGES["directed_gone"])
+            await self._send_or_edit(query, context, user_id, text)
             return
 
         if data.startswith(CB_PICK_LIST + ":"):
             await query.answer()
+            if (entry.get('routing') or 'open') == 'open':
+                # A stale 'A specific peer supporter' / 'Choose someone else' button on
+                # a request that is already in the channel. Rendering a list here would
+                # invite a choice that can no longer happen.
+                picker_views.pop(user_id, None)
+                await self._send_or_edit(query, context, user_id,
+                                         self._open_request_status_text(user_id))
+                return
             try:
                 page = int(data.split(":", 1)[1])
             except (IndexError, TypeError, ValueError):
@@ -1511,13 +1890,29 @@ class BotHandlers:
             await self._render_picker(query, context, user_id, queue_id, page)
             return
 
-        # CB_PICK_SELECT
+        # CB_PICK_SELECT: pk_s:<nonce>:<number>. Resolved ONLY against the view this
+        # requester was last shown for THIS request -- the same rule a typed number
+        # follows. Anything else (a button from an older render, an older request,
+        # a restart, or hand-crafted data) re-renders the current list: it never
+        # selects anybody, and it never names anybody the requester cannot see.
         await query.answer()
+        view = picker_views.get(user_id)
+        member_id = None
         try:
-            member_id = int(data.split(":", 1)[1])
-        except (IndexError, TypeError, ValueError):
-            await self._render_picker(query, context, user_id, queue_id, 0,
-                                      MESSAGES["picker_not_a_number"])
+            _prefix, nonce, number = data.split(":", 2)
+            number = int(number)
+        except (TypeError, ValueError):
+            nonce, number = None, 0
+        if (view is not None and view.get('queue_id') == queue_id
+                and nonce and view.get('nonce') == nonce):
+            ids = view.get('ids') or []
+            if 1 <= number <= len(ids):
+                member_id = ids[number - 1]
+        if member_id is None:
+            page = (view.get('page', 0)
+                    if view is not None and view.get('queue_id') == queue_id else 0)
+            await self._render_picker(query, context, user_id, queue_id, page,
+                                      MESSAGES["picker_lost_view"])
             return
         await self._choose_supporter(query, context, user_id, queue_id, member_id)
 
@@ -1528,9 +1923,7 @@ class BotHandlers:
 
         if outcome == 'ok':
             entry = self.queue_manager.get_queue_entry(queue_id)
-            svc = get_service(entry.get('service')) if entry else None
-            profile = svc.roster.profile(member_id) if svc is not None else None
-            name = profile.display_name if profile is not None else ""
+            name = supporter_label(entry.get('service'), member_id) if entry else ""
             picker_views.pop(user_id, None)
             await self._send_or_edit(
                 query, context, user_id,
@@ -1543,21 +1936,40 @@ class BotHandlers:
                 ]), parse_mode='HTML')
             return
 
-        if outcome == 'busy':
-            await self._render_picker(query, context, user_id, queue_id, 0,
-                                      MESSAGES["picker_busy"])
-            return
-
-        if outcome == 'unreachable':
-            await self._render_picker(query, context, user_id, queue_id, 0,
-                                      MESSAGES["picker_unreachable"])
+        if outcome in ('busy', 'unreachable'):
+            # ONE wording for every reason, so a decline, a /unavailable, a
+            # conversation and an unreachable chat are indistinguishable. Re-render
+            # the page they were looking at, not page one.
+            # With directed mode switched off (the kill switch) not even the note
+            # may carry a name: the render below shows none either.
+            entry = self.queue_manager.get_queue_entry(queue_id)
+            svc = get_service(entry.get('service')) if entry is not None else None
+            name = (supporter_label(svc.key, member_id)
+                    if svc is not None and svc.directed_enabled else "") or "That person"
+            view = picker_views.get(user_id)
+            page = (view.get('page', 0)
+                    if view is not None and view.get('queue_id') == queue_id else 0)
+            await self._render_picker(
+                query, context, user_id, queue_id, page,
+                MESSAGES["picker_busy"].format(name=html.escape(name)))
             return
 
         # 'gone'. Two very different situations reach here, and directed_gone --
         # "This request is no longer waiting." -- is a LIE in the second one: a stale
         # picker button tapped while the request is already sitting with somebody.
         # Say which it is, and never name a supporter the requester did not choose.
+        # A THIRD situation reaches here too: a pick whose send was overtaken by the
+        # requester's own later tap ('Send to anyone instead', Cancel) or by the
+        # supporter's Accept. Whatever overtook it already told the requester where
+        # they stand; this must not contradict it.
         picker_views.pop(user_id, None)
+        if self.session_manager.get_session_by_user(user_id):
+            # The supporter they picked accepted while the pick was still being sent;
+            # conversation_started has already reached them. Retire the list with
+            # where they actually are -- never "This request is no longer waiting."
+            await self._send_or_edit(query, context, user_id,
+                                     MESSAGES["conversation_status"])
+            return
         if self.queue_manager.get_queue_entry(queue_id) is not None:
             await self._send_or_edit(query, context, user_id,
                                      self._open_request_status_text(user_id))
@@ -1614,10 +2026,8 @@ class BotHandlers:
 
         # --- declining -------------------------------------------------------
         entry = self.queue_manager.get_queue_entry(queue_id)
-        name = ""
-        if entry is not None:
-            profile = get_service(entry.get('service')).roster.profile(user_id)
-            name = profile.display_name if profile is not None else ""
+        # Unescaped on purpose: _offer_next_step sends plain text.
+        name = supporter_label(entry.get('service'), user_id) if entry is not None else ""
 
         if not await self.queue_manager.undirect(queue_id, user_id, reason='declined',
                                                  notify_member=False):

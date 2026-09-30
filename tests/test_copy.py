@@ -39,7 +39,7 @@ BLAME_WORDS = ("declin", "rejected", "dropped", "abandoned", "gave up",
 NO_BLAME_KEYS = (
     "comfort_question", "comfort_specific_button", "comfort_anyone_button",
     "picker_nobody_free", "picker_lost_view", "picker_not_a_number",
-    "picker_busy", "picker_unreachable", "picker_header", "picker_hint",
+    "picker_busy", "picker_busy_marker", "picker_header", "picker_hint",
     "directed_sent", "directed_unavailable", "next_step_question",
     "directed_status", "choosing_status", "choosing_expired", "directed_gone",
 )
@@ -51,7 +51,7 @@ REGISTRATION_APPLICANT_KEYS = (
     "registration_private_only", "registration_submitted",
     "registration_already_pending", "registration_already_member",
     "registration_cooldown", "registration_approved", "registration_rejected",
-    "registration_unavailable",
+    "registration_unavailable", "registration_approved_named",
 )
 
 # Substrings that would tell an applicant a PERSON judged them, and invite the
@@ -159,13 +159,11 @@ def test_requester_facing_copy_never_blames_a_supporter():
     keys = [k for k in NO_BLAME_KEYS if k in MESSAGES]
     keys += [k for k in MESSAGES if k.startswith("released_")]
     keys += [k for k in REGISTRATION_APPLICANT_KEYS if k in MESSAGES]
-    # Raised from 15 in step with the pool this scan walks. The three sources
-    # above currently supply 17 + 3 + 8 = 28 keys; at 15 the floor had drifted
-    # to thirteen keys of slack, so more than half the requester-facing copy
-    # could have vanished from MESSAGES without this guard noticing. Zero
-    # headroom is the convention in this file: raise it when the pool grows,
-    # never lower it.
-    assert len(keys) >= 28, (
+    # Raised from 28 in step with the pool this scan walks: registration_approved_named
+    # joined REGISTRATION_APPLICANT_KEYS (P4), so the three sources above now
+    # supply 17 + 3 + 9 = 29 keys. Zero headroom is the convention in this file:
+    # raise it when the pool grows, never lower it.
+    assert len(keys) >= 29, (
         "far fewer requester-facing keys than expected (%d); this scan would be "
         "nearly vacuous: %s" % (len(keys), sorted(keys)))
     for key in keys:
@@ -184,6 +182,7 @@ def test_phase_five_and_six_templates_render():
         "directed_status": MESSAGES["directed_status"].format(name="Alex"),
         "directed_sent": MESSAGES["directed_sent"].format(name="Alex"),
         "picker_page": MESSAGES["picker_page"].format(page=2, pages=3),
+        "picker_busy": MESSAGES["picker_busy"].format(name="Alex"),
         "directed_request": MESSAGES["directed_request"].format(
             description="a thing", window="24 hours"),
     }
@@ -192,6 +191,39 @@ def test_phase_five_and_six_templates_render():
         assert text.strip(), key
     assert "Alex" in rendered["directed_unavailable"]
     assert "Page 2 of 3" == rendered["picker_page"]
+    assert "Alex" in rendered["picker_busy"]
+
+
+def test_picker_labels_are_the_approved_wording():
+    """The user approved these exact words. A casual rewording is a product change."""
+    assert MESSAGES["comfort_specific_button"] == "A specific peer supporter"
+    assert MESSAGES["comfort_anyone_button"] == "Any available peer supporter"
+    assert MESSAGES["picker_anyone_button"] == "Send to anyone instead"
+    assert MESSAGES["picker_cancel_button"] == "Cancel"
+    assert MESSAGES["picker_busy_marker"] == "(busy)"
+
+
+def test_html_picker_copy_is_parse_safe():
+    """These go out with parse_mode HTML. A literal <, > or & in the copy itself
+    would be read as markup and the whole message rejected by Telegram."""
+    for key in ("picker_header", "picker_hint", "picker_page", "picker_nobody_free",
+                "picker_lost_view", "picker_not_a_number", "picker_busy",
+                "picker_busy_marker", "directed_sent"):
+        for ch in "<>&":
+            assert ch not in MESSAGES[key], (key, ch, MESSAGES[key])
+
+
+def test_every_button_label_is_a_reserved_name():
+    """A supporter named "Cancel" or "(busy)" would be indistinguishable from the
+    bot's own buttons and markers on the list."""
+    import config
+    from src.supporter_names import name_key
+    labels = {k: v for k, v in MESSAGES.items()
+              if k.endswith("_button") and isinstance(v, str)}
+    labels["picker_busy_marker"] = MESSAGES["picker_busy_marker"]
+    assert len(labels) >= 10, labels
+    for key, value in labels.items():
+        assert name_key(value) in config.RESERVED_NAME_KEYS, (key, value)
 
 
 def test_member_addendum_names_the_member_only_commands():
@@ -200,6 +232,36 @@ def test_member_addendum_names_the_member_only_commands():
     addendum = MESSAGES["member_addendum"]
     for command in ("/available", "/unavailable", "/release"):
         assert command in addendum, (command, addendum)
+
+
+def test_name_copy_is_complete_and_plain():
+    """Every /name reply exists, is plain text, and renders.
+
+    Each rejection key src/supporter_names.name_problem can return MUST have copy,
+    or a supporter typing a bad name gets a KeyError instead of a reason."""
+    from src.supporter_names import REJECTION_KEYS
+    plain = list(REJECTION_KEYS) + [
+        "name_taken", "name_suffix_note", "name_list_off_note",
+        "name_reset_done_no_name", "name_reset_nothing", "name_unchanged",
+        "name_current_none", "availability_needs_name", "now_available_named",
+        "now_unavailable_named",
+    ]
+    for key in plain:
+        value = MESSAGES.get(key)
+        assert isinstance(value, str) and value.strip(), key
+        assert "{" not in value and "}" not in value, (key, value)
+
+    for key in ("name_current_chosen", "name_current_telegram", "name_saved",
+                "name_reset_done"):
+        text = MESSAGES[key].format(name="Sam")
+        assert "{" not in text and "}" not in text, (key, text)
+        assert "Sam" in text, (key, text)
+
+    addendum = MESSAGES["member_addendum_named"]
+    for command in ("/available", "/unavailable", "/name", "/release"):
+        assert command in addendum, (command, addendum)
+    assert "/name" in MESSAGES["availability_needs_name"]
+    assert "/name" in MESSAGES["name_current_none"]
 
 
 def test_registration_copy_never_names_a_decider():
@@ -246,6 +308,8 @@ def test_registration_templates_render():
     rendered = {
         "registration_approved": MESSAGES["registration_approved"].format(
             member="Support Volunteer"),
+        "registration_approved_named": MESSAGES["registration_approved_named"].format(
+            member="Support Volunteer"),
         "registration_approve_button": MESSAGES["registration_approve_button"].format(
             member="Support Volunteer"),
         "registration_cross_roster": MESSAGES["registration_cross_roster"].format(
@@ -259,12 +323,14 @@ def test_registration_templates_render():
         assert "{" not in text and "}" not in text, (key, text)
         assert text.strip(), key
     assert "Support Volunteer" in rendered["registration_approved"]
+    assert "Support Volunteer" in rendered["registration_approved_named"]
     assert "Alex" in rendered["registration_settled_rejected"]
 
     # And every registration value is a plain, non-empty str -- the admin-facing
     # ones included, since they are sent with parse_mode='HTML'.
     registration_keys = [k for k in MESSAGES if k.startswith("registration_")]
-    assert len(registration_keys) >= 20, (
+    # Raised 20 -> 23 in P4: registration_approved_named joined the existing 22.
+    assert len(registration_keys) >= 23, (
         "far fewer registration keys than expected (%d); this scan would be "
         "nearly vacuous: %s" % (len(registration_keys), sorted(registration_keys)))
     for key in registration_keys:
@@ -280,6 +346,10 @@ def test_bot_command_menu():
     # recruitment command to somebody who opened this bot in distress is the
     # wrong thing to put in front of them. Discovery is out-of-band. D42/R13.
     assert "register" not in [c.command for c in main.BOT_COMMANDS]
+    # /name is absent for a stronger reason: it is SILENT to everyone who is not an
+    # active PSS supporter, exactly like a command that does not exist. Listing it
+    # would announce to every student that a supporter roster is behind the bot.
+    assert "name" not in [c.command for c in main.BOT_COMMANDS]
     for c in main.BOT_COMMANDS:
         # Telegram's constraints: names [a-z0-9_]{1,32}, descriptions 1-256 chars.
         assert 1 <= len(c.command) <= 32
@@ -296,8 +366,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 15, (
-        "expected at least 15 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 19, (
+        "expected at least 19 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

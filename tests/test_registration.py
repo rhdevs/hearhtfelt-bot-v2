@@ -279,6 +279,21 @@ class StubDB:
                            bool(available), collection))
         return True
 
+    def set_member_first_name(self, member_id, first_name, collection=None):
+        """No upsert, same as the real writer: with no document there is nothing
+        to set, and it never creates one. Returns whether the doc exists, so
+        case (z) can drive note_private_contact straight through it."""
+        self.calls.append(('set_member_first_name', int(member_id), first_name,
+                           collection))
+        if not self.db_available:
+            return False
+        bucket = self.members.setdefault(collection, {})
+        doc = bucket.get(int(member_id))
+        if doc is None:
+            return False
+        doc['telegram_first_name'] = str(first_name)
+        return True
+
     # --- assertion helpers -------------------------------------------------
     def called(self, method):
         return [c for c in self.calls if c[0] == method]
@@ -696,7 +711,7 @@ async def case_g_approving_into_pss_writes_pss_and_settles_every_card():
     assert APPLICANT in pss.roster and APPLICANT not in hf.roster
 
     assert bot.texts_to(APPLICANT) == [
-        MESSAGES["registration_approved"].format(member=pss.member_label)], \
+        MESSAGES["registration_approved_named"].format(member=pss.member_label)], \
         bot.texts_to(APPLICANT)
 
     settled = [(c, m) for c, _mid, _t, m in bot.edited]
@@ -727,6 +742,11 @@ async def case_h_approving_into_hf_never_touches_the_pss_collection():
     assert PSS_COLL not in stub.members, stub.members
     assert APPLICANT in hf.roster and APPLICANT not in pss.roster
     assert doc['decision_service'] == 'hf', doc
+    # HF's copy is byte-identical: it never picks the *_named variant, because
+    # hf.supporter_names is False.
+    assert bot.texts_to(APPLICANT) == [
+        MESSAGES["registration_approved"].format(member=hf.member_label)], \
+        bot.texts_to(APPLICANT)
     assert_no_decider_leak(bot)
     print("OK  h. approving into HF lands in heartfelt_members and never touches "
           "peer_supporters")
@@ -769,7 +789,7 @@ async def case_i_two_simultaneous_approvals_produce_exactly_one_of_everything():
         "exactly ONE roster write: %r" % (stub.called('add_authorized_member'),))
     assert len(bot.texts_to(APPLICANT)) == 1, (
         "the applicant must be told exactly once: %r" % (bot.texts_to(APPLICANT),))
-    assert bot.texts_to(APPLICANT)[0] == MESSAGES["registration_approved"].format(
+    assert bot.texts_to(APPLICANT)[0] == MESSAGES["registration_approved_named"].format(
         member=pss.member_label)
 
     answers = rec1.answer_texts() + rec2.answer_texts()
@@ -808,7 +828,7 @@ async def case_j_a_reject_after_an_approve_changes_nothing():
         rec.answers
 
     assert bot.texts_to(APPLICANT) == [
-        MESSAGES["registration_approved"].format(member=pss.member_label)], (
+        MESSAGES["registration_approved_named"].format(member=pss.member_label)], (
         "the applicant must have received exactly one message, and it must be "
         "the approval -- never a rejection after being approved: %r"
         % (bot.texts_to(APPLICANT),))
@@ -1105,7 +1125,7 @@ async def case_w_a_restart_leaves_the_live_buttons_fully_functional():
     assert doc['status'] == 'approved' and doc['decided_by'] == A2, doc
     assert APPLICANT in pss.roster
     assert fresh_bot.texts_to(APPLICANT) == [
-        MESSAGES["registration_approved"].format(member=pss.member_label)], \
+        MESSAGES["registration_approved_named"].format(member=pss.member_label)], \
         fresh_bot.texts_to(APPLICANT)
     assert sorted(c for c, _mid, _t, _m in fresh_bot.edited) == [str(A1), str(A2)], (
         "both cards are still addressable after a restart, from the persisted "
@@ -1175,9 +1195,12 @@ async def case_y_cross_roster_membership_blocks_approval_from_memory_and_mongo()
           "from Mongo alone")
 
 
-async def case_z_an_approved_supporter_becomes_pickable_once_named():
-    """The end-to-end proof of D38/R15: approval makes somebody claim-authorized
-    immediately, and picker-visible only after a display name is set."""
+async def case_z_an_approved_supporter_is_listed_once_the_bot_knows_their_name():
+    """The end-to-end proof that D38/R15's old lever ("no display_name => invisible")
+    is gone: names now default automatically to the Telegram first name, captured
+    from the supporter's own next private message, so PSS_DIRECTED_ENABLED is the
+    only rollout switch left. Also proves the admin override still works on top of
+    the captured name."""
     bot, handlers, stub = setup()
     await do_register(handlers, bot)
     doc = sole_registration(stub)
@@ -1189,27 +1212,42 @@ async def case_z_an_approved_supporter_becomes_pickable_once_named():
         stub.members[PSS_COLL][APPLICANT]
     assert APPLICANT in pss.roster, "claim-authorized immediately"
     assert config.available_supporters("pss") == [], (
-        "and PICKER-INVISIBLE until somebody sets a display name -- that is the "
-        "staged-rollout lever, not an oversight: %r"
+        "no name has been captured yet, so there is nothing to list: %r"
         % (config.available_supporters("pss"),))
 
-    # An admin sets the name out-of-band; the next roster refresh picks it up.
-    stub.members[PSS_COLL][APPLICANT].update(display_name="Robin", available=True)
-    await main.refresh_all_rosters()
+    # The applicant's own next private message is the capture point -- no admin,
+    # no refresh.
+    rec = Rec()
+    await handlers.note_private_contact(
+        text_update(APPLICANT, 'hi', rec, first_name='Robin'), ctx_for(bot))
+
+    assert stub.members[PSS_COLL][APPLICANT]['telegram_first_name'] == 'Robin', \
+        stub.members[PSS_COLL][APPLICANT]
 
     pickable = [p.telegram_id for p in config.available_supporters("pss")]
     assert pickable == [APPLICANT], (
-        "once named, the approved supporter is offered in the picker: %r"
-        % (pickable,))
+        "listed IMMEDIATELY, before any refresh: %r" % (pickable,))
+    assert config.supporter_label("pss", APPLICANT) == 'Robin'
+
+    # The 5-minute roster refresh must not clobber a just-captured name.
+    await main.refresh_all_rosters()
+    assert config.supporter_label("pss", APPLICANT) == 'Robin'
+
+    # The admin override still works, on top of the captured name.
+    stub.members[PSS_COLL][APPLICANT]['display_name'] = 'Robin T'
+    await main.refresh_all_rosters()
+    assert config.supporter_label("pss", APPLICANT) == 'Robin T'
+
     assert_no_decider_leak(bot)
-    print("OK  z. an approved supporter is claim-authorized at once and pickable "
-          "once named")
+    print("OK  z. an approved supporter is listed once the bot knows their name, "
+          "and an admin override still works")
 
 
 async def case_aa_every_registration_string_passes_the_copy_guards():
     keys = [k for k in MESSAGES if k.startswith("registration_")]
-    # 21 registration_* keys exist; zero headroom, house convention.
-    assert len(keys) >= 21, (
+    # 23 registration_* keys exist (22 + registration_approved_named, added in
+    # P4); zero headroom, house convention.
+    assert len(keys) >= 23, (
         "far fewer registration keys than expected (%d); this scan would be "
         "nearly vacuous: %s" % (len(keys), sorted(keys)))
     for key in keys:
@@ -1445,7 +1483,7 @@ async def case_af_a_switched_off_track_says_so_on_its_button():
     await tap(handlers, bot, A1, approve_data(doc['registration_id'], pss.key))
     sent = bot.texts_to(APPLICANT)[before:]
     assert len(sent) == 1, f"exactly one message to the applicant, got {sent}"
-    assert sent[0] == MESSAGES["registration_approved"].format(member=pss.member_label), (
+    assert sent[0] == MESSAGES["registration_approved_named"].format(member=pss.member_label), (
         "the applicant's copy must be untouched by the admin-facing marker")
 
 
@@ -1499,6 +1537,43 @@ async def case_ag_the_deep_link_starts_registration_only_when_it_is_on():
     assert not stub_n.called('create_registration')
     assert "Care Network" in noargs
 
+async def case_ah_reapproval_keeps_the_chosen_name_and_availability():
+    """A supporter deactivated while hiding their Telegram first name behind /name,
+    and while /unavailable, is re-approved. Memory must be loaded from the Mongo
+    document -- a bare roster.add() would let their next private message build a
+    BLANK profile, listing them as 'Roberta' and as free. R15."""
+    bot, handlers, stub = setup()
+    stub.members[PSS_COLL] = {APPLICANT: {
+        'telegram_id': APPLICANT, 'active': False, 'display_name': 'Sam',
+        'telegram_first_name': 'Roberta', 'available': False,
+        'has_started_bot': True}}
+    _hf, pss = services()
+    prior_directed = pss.directed_enabled
+    pss.directed_enabled = True
+    try:
+        await do_register(handlers, bot)
+        doc = sole_registration(stub)
+        await tap(handlers, bot, A1, approve_data(doc['registration_id'], "pss"))
+
+        p = pss.roster.profile(APPLICANT)
+        assert p is not None and p.display_name == 'Sam' and p.available is False, p
+        assert config.supporter_label("pss", APPLICANT) == 'Sam'
+        assert config.available_supporters("pss") == [],             config.available_supporters("pss")
+
+        # Their first private message after re-approval changes neither.
+        await handlers.note_private_contact(
+            text_update(APPLICANT, 'hi', Rec(), first_name='Roberta'), ctx_for(bot))
+        assert config.supporter_label("pss", APPLICANT) == 'Sam'
+        assert pss.roster.profile(APPLICANT).available is False
+        assert config.available_supporters("pss") == []
+        for label in config.supporter_labels("pss").values():
+            assert 'Roberta' not in label, label
+    finally:
+        pss.directed_enabled = prior_directed
+    print("OK  ah. re-approving a deactivated supporter keeps their chosen name "
+          "and /unavailable")
+
+
 CASES = [
     case_a_an_empty_allowlist_makes_register_indistinguishable_from_nothing,
     case_b_an_inert_bot_refuses_every_registration_tap,
@@ -1525,7 +1600,7 @@ CASES = [
     case_w_a_restart_leaves_the_live_buttons_fully_functional,
     case_x_approving_someone_deactivated_re_activates_them_once,
     case_y_cross_roster_membership_blocks_approval_from_memory_and_mongo,
-    case_z_an_approved_supporter_becomes_pickable_once_named,
+    case_z_an_approved_supporter_is_listed_once_the_bot_knows_their_name,
     case_aa_every_registration_string_passes_the_copy_guards,
     case_ab_the_cli_renders_a_malformed_row_without_raising,
     case_ac_an_admin_can_never_decide_their_own_request,
@@ -1533,6 +1608,7 @@ CASES = [
     case_ae_the_real_mongo_filter_names_the_state_it_leaves,
     case_af_a_switched_off_track_says_so_on_its_button,
     case_ag_the_deep_link_starts_registration_only_when_it_is_on,
+    case_ah_reapproval_keeps_the_chosen_name_and_availability,
 ]
 
 
@@ -1550,8 +1626,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 33, (
-        "expected at least 31 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 34, (
+        "expected at least 34 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

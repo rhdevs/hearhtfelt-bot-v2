@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import re
 import config
 from config import ServiceType, UserState, closing_text
 from src.timeutil import utcnow
@@ -224,6 +225,37 @@ def text_update(user_id, text, rec):
                            effective_chat=SimpleNamespace(id=user_id, type="private"))
 
 
+def pick_data(user_id, member_id):
+    """The callback_data of `member_id`'s button on the list `user_id` was last shown.
+
+    Picker buttons carry an opaque per-render token, never an id, so a test cannot
+    hand-write one: it is read back from the view the bot recorded, exactly as the
+    bot will resolve it. With no view, or a member not on it, this returns a token
+    that cannot resolve -- which is what a stale or hand-crafted tap looks like.
+    """
+    view = config.picker_views.get(user_id)
+    if view is None or member_id not in (view.get('ids') or []):
+        return "pk_s:stale:0"
+    return "pk_s:%s:%d" % (view['nonce'], view['ids'].index(member_id) + 1)
+
+
+def button_members(user_id, markup):
+    """Member ids behind the pick buttons on `markup`, resolved through the view the
+    bot recorded for `user_id` -- the only place the id lives. Also asserts every
+    pick button is opaque: pk_s:<8 hex nonce>:<number>, with the view's nonce."""
+    view = config.picker_views.get(user_id) or {}
+    out = []
+    for row in markup.inline_keyboard:
+        for b in row:
+            if not b.callback_data.startswith("pk_s:"):
+                continue
+            m = re.fullmatch(r"pk_s:([0-9a-f]{8}):(\d+)", b.callback_data)
+            assert m, ("pick buttons must be opaque", b.callback_data)
+            assert m.group(1) == view.get('nonce'), (b.callback_data, view)
+            out.append(view['ids'][int(m.group(2)) - 1])
+    return out
+
+
 def cb_update(user_id, data, rec):
     async def answer(t=None, show_alert=False):
         rec.answers.append((t, show_alert))
@@ -277,6 +309,9 @@ def build(pickable, db_available=True, extra_members=()):
     pss = config.SERVICES[ServiceType.PSS.value]
     hf.channel_id, hf.enabled = HF_CHANNEL, False
     pss.channel_id, pss.enabled = PSS_CHANNEL, True
+    # Directed mode is OFF by default now (PSS_DIRECTED_ENABLED_DEFAULT); the
+    # directed-provenance cases need it, so opt in explicitly.
+    pss.directed_enabled = True
     hf.roster.replace_records([])
 
     ids = [MEMBER] + list(extra_members)
@@ -318,7 +353,7 @@ async def directed_conversation(handlers, bot, rec, ctx):
     assert config.queue_entries[queue_id]['routing'] == 'choosing'
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % MEMBER, rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, MEMBER), rec), ctx)
     await handlers.handle_callback_query(
         cb_update(MEMBER, "dr_a:%s" % queue_id, rec), ctx)
     assert config.user_to_session_map.get(REQUESTER) == queue_id, "accept failed"
@@ -474,11 +509,16 @@ async def case_e_release_on_directed_provenance_never_touches_the_channel():
     assert datas == ["pk_l:0", "pk_o", "pk_x"], datas
     assert_no_blame(to_requester, "the requester")
 
-    # And the picker really does exclude the person who just released.
+    # And the picker really does refuse the person who just released: listed, but
+    # marked busy with no button -- the reason is never shown.
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
-    text = [t for t, _m in rec.replies][-1]
-    assert "Sup %d" % MEMBER not in text, text
+    text, markup = rec.replies[-1]
+    assert "Sup %d (busy)" % MEMBER in text, text
     assert "Sup %d" % SECOND_MEMBER in text, text
+    assert "Sup %d (busy)" % SECOND_MEMBER not in text, text
+    members = button_members(REQUESTER, markup)
+    assert MEMBER not in members, members
+    assert SECOND_MEMBER in members, members
     print("OK  e. /release on a directed request stays off the channel and re-offers the choice")
 
 
@@ -686,7 +726,7 @@ if __name__ == "__main__":
     hf = config.SERVICES[ServiceType.HF.value]
     pss = config.SERVICES[ServiceType.PSS.value]
     saved = (hf.channel_id, hf.enabled, pss.channel_id, pss.enabled,
-             pss.closing_extra, pss.closing_extra_member)
+             pss.closing_extra, pss.closing_extra_member, pss.directed_enabled)
     try:
         asyncio.run(run())
         print("\nAll %d release/end assertions passed!" % len(CASES))
@@ -694,7 +734,7 @@ if __name__ == "__main__":
         (handlers_mod.db_mgr, queue_mod.db_mgr, session_mod.db_mgr,
          restore_mod.db_mgr, expiry_mod.db_mgr) = real
         (hf.channel_id, hf.enabled, pss.channel_id, pss.enabled,
-         pss.closing_extra, pss.closing_extra_member) = saved
+         pss.closing_extra, pss.closing_extra_member, pss.directed_enabled) = saved
         # replace_records([]) FIRST: replace() with the same id set is a no-op that
         # keeps existing profiles.
         hf.roster.replace_records([])
