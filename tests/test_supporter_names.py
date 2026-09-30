@@ -155,6 +155,8 @@ class NamesStubDB:
 
     def get_member_profile_doc(self, member_id, collection=None):
         self.calls.append(('get_member_profile_doc', member_id, collection))
+        if not self.db_available:
+            return None        # what the real one returns with Mongo down
         doc = self._doc(collection, member_id)
         return dict(doc) if doc is not None else None
 
@@ -1193,6 +1195,79 @@ async def case_ad_name_refuses_a_look_alike_and_auto_names_get_suffixes():
           "look-alikes are numbered")
 
 
+async def case_ae_capture_with_no_profile_rebuilds_it_from_mongo():
+    # A bare roster id (an approval whose read-back failed) whose Mongo doc says
+    # they hid 'Roberta' behind /name and said /unavailable. The capture must build
+    # the profile from that doc, never a blank one listing 'Roberta' as free.
+    reset_state()
+    stub = install(NamesStubDB())
+    pss = pss_roster([])
+    stub.put(PSS_COLL, member_doc(2101, display_name='Sam', first_name='Roberta',
+                                  available=False))
+    pss.roster.add(2101)
+    assert pss.roster.profile(2101) is None
+    h, _bot, ctx = make_handlers()
+    set_track(runnable=True, directed=True)
+
+    await h.note_private_contact(text_update(2101, 'hi', Rec(), first_name='Roberta'), ctx)
+    p = pss.roster.profile(2101)
+    assert (p.display_name, p.available, p.has_started_bot, p.telegram_first_name) ==         ('Sam', False, True, 'Roberta'), p
+    assert config.supporter_label('pss', 2101) == 'Sam'
+    assert not config.is_supporter_available('pss', 2101)
+    for label in config.supporter_labels('pss').values():
+        assert 'Roberta' not in label, label
+
+    rec = Rec()
+    await h.name_command(text_update(2101, '/name', rec, first_name='Roberta'), ctx)
+    assert rec.replies[-1][0] == MESSAGES['name_current_chosen'].format(name='Sam'),         rec.replies
+
+    # Deactivated in Mongo but still a bare id in memory until the next refresh:
+    # no profile is created, so they never become listable in that window.
+    stub.put(PSS_COLL, member_doc(2102, first_name='Gone', active=False))
+    pss.roster.add(2102)
+    await h.note_private_contact(text_update(2102, 'hi', Rec(), first_name='Gone'), ctx)
+    assert pss.roster.profile(2102) is None
+    assert config.supporter_label('pss', 2102) == ''
+
+    # Mongo down: the old blank profile still gets the first name, as before.
+    reset_state()
+    stub = install(NamesStubDB(db_available=False))
+    pss = pss_roster([])
+    pss.roster.add(2103)
+    await h.note_private_contact(text_update(2103, 'hi', Rec(), first_name='Robin'), ctx)
+    assert pss.roster.profile(2103).telegram_first_name == 'Robin'
+    print("OK  ae. a capture with no profile rebuilds it from Mongo: override and "
+          "/unavailable kept, deactivated never created")
+
+
+def case_af_store_upsert_record_and_base_doc():
+    store = config.AuthorizedMembersStore()
+    assert store.upsert_record(member_doc(7, display_name='Sam', available=False)) is True
+    assert 7 in store
+    assert store.profile(7).display_name == 'Sam' and store.profile(7).available is False
+    assert store.upsert_record(member_doc(8, active=False)) is False and 8 not in store
+    assert store.upsert_record({'telegram_id': 'x'}) is False
+    assert store.upsert_record(None) is False
+
+    # replace() drops profiles for ids outside the new set, hence fresh stores.
+    store2 = config.AuthorizedMembersStore()
+    store2.replace([9])
+    assert store2.set_first_name(
+        9, 'Rob', create_if_missing=True,
+        base_doc=member_doc(9, display_name='Sam', available=False,
+                            has_started_bot=False)) is True
+    p = store2.profile(9)
+    assert (p.display_name, p.available, p.has_started_bot, p.telegram_first_name) ==         ('Sam', False, True, 'Rob'), p
+
+    store3 = config.AuthorizedMembersStore()
+    store3.replace([10])
+    assert store3.set_first_name(10, 'X', create_if_missing=True,
+                                 base_doc=member_doc(10, active=False)) is False
+    assert store3.profile(10) is None
+    print("OK  af. upsert_record and set_first_name(base_doc) build profiles from "
+          "Mongo, never for the deactivated")
+
+
 CASES = [
     case_a_accepted_names,
     case_b_rejected_names_give_their_exact_key,
@@ -1224,6 +1299,8 @@ CASES = [
     case_ab_the_cli_set_profile_validates_and_cleans,
     case_ac_capital_i_and_other_look_alikes_collide,
     case_ad_name_refuses_a_look_alike_and_auto_names_get_suffixes,
+    case_ae_capture_with_no_profile_rebuilds_it_from_mongo,
+    case_af_store_upsert_record_and_base_doc,
 ]
 
 
@@ -1238,8 +1315,8 @@ if __name__ == "__main__":
     # A driver that discovers its own tests reports success when it discovers
     # NOTHING. A refactor, a rename, an import shadow or a bad merge all reach that
     # state. Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 30, (
-        "expected at least 30 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 32, (
+        "expected at least 32 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

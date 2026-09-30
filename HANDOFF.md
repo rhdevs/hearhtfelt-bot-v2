@@ -458,6 +458,14 @@ Telegram first name from their **next private message** — there is nothing an
 admin needs to do for the ordinary case; the capture point is the same
 `note_private_contact` hook described in R10/R16.
 
+**Re-activation keeps what the supporter chose.** Approving somebody previously
+deactivated loads their profile from the Mongo document straight into memory, so
+a `/name` override and an `/unavailable` they set before deactivation still apply
+immediately. They are never listed under the Telegram first name they had chosen
+to hide, and never shown as free. If the read-back fails, the capture on their
+next private message builds the profile from Mongo instead; only with Mongo
+unreachable does it fall back to a blank profile, which the next refresh corrects.
+
 An admin override still works and is validated with the same rules `/name`
 itself enforces (R16's rule list — length, character set, no lookalike
 collision, and so on):

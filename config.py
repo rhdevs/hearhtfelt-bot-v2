@@ -168,6 +168,27 @@ class AuthorizedMembersStore:
             self._profiles = new_profiles
             return True
 
+    def upsert_record(self, doc) -> bool:
+        """Authorize ONE member and install its profile from a raw Mongo document,
+        leaving everyone else untouched.
+
+        For registration approval: add() alone creates no profile, and the next
+        private message would then build a BLANK one -- listing a re-activated
+        supporter under the real first name they had hidden behind /name, and as
+        free when they had said /unavailable.
+
+        False, and nothing changes, for an unusable doc or one that says active: False.
+        """
+        if not isinstance(doc, dict) or doc.get('active') is False:
+            return False
+        profile = self._profile_from_doc(doc)
+        if profile is None:
+            return False
+        with self._lock:
+            self._members.add(profile.telegram_id)
+            self._profiles[profile.telegram_id] = profile
+        return True
+
     def profile(self, member_id) -> Optional["MemberProfile"]:
         """A COPY of the stored profile, never the stored object."""
         try:
@@ -220,16 +241,22 @@ class AuthorizedMembersStore:
             stored.display_name = str(display_name)
             return True
 
-    def set_first_name(self, member_id, first_name, create_if_missing: bool = False) -> bool:
+    def set_first_name(self, member_id, first_name, create_if_missing: bool = False,
+                       base_doc=None) -> bool:
         """In-memory only. The captured Telegram first name.
 
         False when this member has no profile -- unless `create_if_missing` and the
-        id IS a member, in which case a minimal profile is created. ONLY the
-        private-contact capture passes the flag: a member who just messaged the bot
-        privately HAS started it, and that caller wrote Mongo first. It closes the
-        window after a registration approval, whose roster.add() creates no profile,
-        so the new supporter would otherwise stay unlisted until the next refresh.
-        A non-member returns False even with the flag.
+        id IS a member, in which case a profile is created. ONLY the private-contact
+        capture passes the flag: a member who just messaged the bot privately HAS
+        started it, and that caller wrote Mongo first. It closes the window where a
+        roster id has no profile (e.g. an approval whose read-back failed), so the
+        supporter would otherwise stay unlisted until the next refresh.
+
+        The caller passes the member's Mongo document as `base_doc`, so a created
+        profile carries their /name override and /unavailable rather than listing
+        them under the first name they chose to hide, as free. The profile is blank
+        (bar the first name) only when Mongo could not be read. A base_doc that says
+        active: False creates nothing. A non-member returns False even with the flag.
         """
         try:
             member_int = int(member_id)
@@ -242,6 +269,18 @@ class AuthorizedMembersStore:
                 return True
             if not create_if_missing or member_int not in self._members:
                 return False
+            if isinstance(base_doc, dict):
+                if base_doc.get('active') is False:
+                    # Deactivated in Mongo, still in this process's memory until the
+                    # next refresh; they must not become listable in that window.
+                    return False
+                built = self._profile_from_doc(base_doc)
+                if built is not None and built.telegram_id == member_int:
+                    self._profiles[member_int] = dataclasses.replace(
+                        built, has_started_bot=True, telegram_first_name=str(first_name))
+                    return True
+            # Mongo unreadable (or an unusable/mismatched doc): the old blank profile.
+            # The next refresh corrects it from Mongo.
             self._profiles[member_int] = MemberProfile(
                 telegram_id=member_int,
                 has_started_bot=True,

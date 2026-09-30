@@ -1537,6 +1537,43 @@ async def case_ag_the_deep_link_starts_registration_only_when_it_is_on():
     assert not stub_n.called('create_registration')
     assert "Care Network" in noargs
 
+async def case_ah_reapproval_keeps_the_chosen_name_and_availability():
+    """A supporter deactivated while hiding their Telegram first name behind /name,
+    and while /unavailable, is re-approved. Memory must be loaded from the Mongo
+    document -- a bare roster.add() would let their next private message build a
+    BLANK profile, listing them as 'Roberta' and as free. R15."""
+    bot, handlers, stub = setup()
+    stub.members[PSS_COLL] = {APPLICANT: {
+        'telegram_id': APPLICANT, 'active': False, 'display_name': 'Sam',
+        'telegram_first_name': 'Roberta', 'available': False,
+        'has_started_bot': True}}
+    _hf, pss = services()
+    prior_directed = pss.directed_enabled
+    pss.directed_enabled = True
+    try:
+        await do_register(handlers, bot)
+        doc = sole_registration(stub)
+        await tap(handlers, bot, A1, approve_data(doc['registration_id'], "pss"))
+
+        p = pss.roster.profile(APPLICANT)
+        assert p is not None and p.display_name == 'Sam' and p.available is False, p
+        assert config.supporter_label("pss", APPLICANT) == 'Sam'
+        assert config.available_supporters("pss") == [],             config.available_supporters("pss")
+
+        # Their first private message after re-approval changes neither.
+        await handlers.note_private_contact(
+            text_update(APPLICANT, 'hi', Rec(), first_name='Roberta'), ctx_for(bot))
+        assert config.supporter_label("pss", APPLICANT) == 'Sam'
+        assert pss.roster.profile(APPLICANT).available is False
+        assert config.available_supporters("pss") == []
+        for label in config.supporter_labels("pss").values():
+            assert 'Roberta' not in label, label
+    finally:
+        pss.directed_enabled = prior_directed
+    print("OK  ah. re-approving a deactivated supporter keeps their chosen name "
+          "and /unavailable")
+
+
 CASES = [
     case_a_an_empty_allowlist_makes_register_indistinguishable_from_nothing,
     case_b_an_inert_bot_refuses_every_registration_tap,
@@ -1571,6 +1608,7 @@ CASES = [
     case_ae_the_real_mongo_filter_names_the_state_it_leaves,
     case_af_a_switched_off_track_says_so_on_its_button,
     case_ag_the_deep_link_starts_registration_only_when_it_is_on,
+    case_ah_reapproval_keeps_the_chosen_name_and_availability,
 ]
 
 
@@ -1588,8 +1626,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 33, (
-        "expected at least 31 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 34, (
+        "expected at least 34 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

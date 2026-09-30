@@ -139,9 +139,27 @@ class BotHandlers:
         except Exception as exc:
             logger.warning("Could not record the Telegram first name of member %s "
                            "(%s): %s", user_id, svc.key, exc)
-        # create_if_missing: a member approved by /register is roster.add()ed with
-        # no profile, and would otherwise stay unlisted until the next refresh.
-        svc.roster.set_first_name(user_id, captured, create_if_missing=True)
+        base_doc = None
+        if profile is None:
+            # No profile in memory, only a bare roster id (e.g. an approval whose doc
+            # read failed). Build it from Mongo, never from nothing: a blank profile
+            # would list somebody under the real first name they chose /name to
+            # hide, and as free when they said /unavailable.
+            # Read AFTER the write above, so the doc already carries this first name.
+            # Synchronous, like everything here -- see the refresh argument in the
+            # docstring.
+            try:
+                base_doc = db_mgr.get_member_profile_doc(
+                    user_id, collection=svc.members_collection)
+            except Exception as exc:
+                logger.warning("Could not read the '%s' record of member %s: %s",
+                               svc.key, user_id, exc)
+        # create_if_missing: a roster id with no profile would otherwise stay
+        # unlisted until the next refresh. The profile is built from base_doc, so it
+        # keeps the override and availability; blank only when Mongo is unreadable,
+        # and never created at all for a doc that says active: False.
+        svc.roster.set_first_name(user_id, captured, create_if_missing=True,
+                                  base_doc=base_doc)
         new_listed = listed_name(svc.roster.profile(user_id))
         logger.info("%s supporter %s: Telegram first name %r -> %r (listed as %r -> %r)",
                     svc.key, user_id, old_first, captured, old_listed, new_listed)
@@ -1134,19 +1152,36 @@ class BotHandlers:
                              "%s on '%s'", registration_id, applicant, svc.key)
 
             # In memory too, so they can claim immediately instead of waiting out
-            # the 300s roster refresh. NOTE: .add() creates NO profile, so they
-            # become LISTABLE (once the fork is on for this track) under their
-            # Telegram first name from their next private message -- captured by
+            # the 300s roster refresh. The in-memory profile is LOADED FROM THE
+            # JUST-WRITTEN MONGO DOCUMENT, not built from nothing: a RE-activated
+            # supporter therefore keeps the /name override and /unavailable they
+            # had before deactivation, rather than being listed under the Telegram
+            # first name they chose to hide, as free (R15). A first-time applicant's
+            # doc has no name yet, so they become LISTABLE (once the fork is on for
+            # this track) from their next private message -- captured by
             # note_private_contact, the same capture point that records
             # has_started_bot -- or under a name they choose with /name. An admin
             # override via `set-profile --display-name` still works too. The
-            # staged-rollout lever is now PSS_DIRECTED_ENABLED (R11), not the
-            # absence of a name.
-            # mark_started is a no-op while there is no profile; it matters on the
-            # re-activation path, where one already exists and would otherwise
-            # disagree with Mongo until the next refresh.
-            svc.roster.add(applicant)
-            svc.roster.mark_started(applicant, True)
+            # staged-rollout lever is PSS_DIRECTED_ENABLED (R11), not the absence
+            # of a name.
+            # Fallback when the write or the read-back failed: the bare id, as
+            # before. mark_started is then a no-op unless a profile already exists,
+            # where it keeps memory agreeing with Mongo until the next refresh; the
+            # next private message builds the profile from Mongo instead.
+            # Synchronous and before the first await: winner-only, pre-await.
+            installed = False
+            if not write_failed:
+                try:
+                    doc_after = db_mgr.get_member_profile_doc(
+                        applicant, collection=svc.members_collection)
+                except Exception as exc:
+                    doc_after = None
+                    logger.warning("Could not read back the '%s' record for %s: %s",
+                                   svc.key, applicant, exc)
+                installed = svc.roster.upsert_record(doc_after)
+            if not installed:
+                svc.roster.add(applicant)
+                svc.roster.mark_started(applicant, True)
 
         # The first await of the winning path: a plain ack.
         await query.answer()
