@@ -221,9 +221,17 @@ class FakeBot:
         self.edited = []        # (chat_id, message_id, text)
         self.markup_edits = []  # (chat_id, message_id)
         self.fail_for = {}      # chat_id (str) -> exception message
+        self.gate = None  # one-shot: park the next matching send (hold_next_send)
         self._mid = 0
 
     async def send_message(self, chat_id, text, reply_markup=None, **kw):
+        # BEFORE the fail_for check, so a gated failing DM fails only after release.
+        gate = self.gate
+        if (gate is not None and str(chat_id) == gate['chat']
+                and gate['match'](text, reply_markup)):
+            self.gate = None
+            gate['reached'].set()
+            await gate['release'].wait()
         if str(chat_id) in self.fail_for:
             raise RuntimeError(self.fail_for[str(chat_id)])
         self._mid += 1
@@ -243,6 +251,16 @@ class FakeBot:
 
     def texts_to(self, user_id):
         return [t for c, t, _m in self.sent if c == str(user_id)]
+
+
+def hold_next_send(bot, chat_id, match=None):
+    """Park the NEXT send_message to chat_id (that `match(text, markup)` accepts)
+    until `release` is set, so a test can land a second update INSIDE the await the
+    production code yields on. One-shot. Returns (reached, release)."""
+    reached, release = asyncio.Event(), asyncio.Event()
+    bot.gate = {'chat': str(chat_id), 'match': match or (lambda _t, _m: True),
+                'reached': reached, 'release': release}
+    return reached, release
 
 
 class Rec:
@@ -1797,6 +1815,182 @@ async def case_am_a_stale_specific_tap_after_anyone_shows_status_not_the_list():
     print("OK  am. a stale 'specific' tap after 'anyone' shows where the request is, not a list")
 
 
+# ---- races INSIDE send_directed_request's awaits ---------------------------------
+# Each case parks one send_message with hold_next_send, lands a second update while
+# the pick is suspended on it, then lets the pick finish. Whatever landed in the
+# window won; the pick's tail must not write over it.
+async def _start_pick_in_a_window(gate_chat, match=None, fail_dm=False):
+    bot, sm, qm, handlers, stub = setup(supporters=2)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    if fail_dm:
+        bot.fail_for[str(supporter_id(0))] = "Forbidden: bot was blocked by the user"
+    reached, release = hold_next_send(bot, gate_chat, match)
+    pick = asyncio.create_task(handlers.handle_callback_query(
+        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx))
+    await asyncio.wait_for(reached.wait(), 5)
+    assert config.queue_entries[queue_id]['routing'] == 'directed', \
+        "the interleaved update must land INSIDE the directed window"
+    return SimpleNamespace(bot=bot, sm=sm, qm=qm, handlers=handlers, stub=stub,
+                           rec=rec, ctx=ctx, queue_id=queue_id, pick=pick,
+                           release=release)
+
+
+async def _finish_pick(w):
+    w.release.set()
+    await asyncio.wait_for(w.pick, 5)
+
+
+def _busy_sup0():
+    return config.MESSAGES["picker_busy"].format(name="Sup 00")
+
+
+def _sent_to_sup0():
+    return config.MESSAGES["directed_sent"].format(name="Sup 00")
+
+
+async def case_an_anyone_during_a_failing_dm_keeps_the_request_claimable():
+    w = await _start_pick_in_a_window(supporter_id(0), fail_dm=True)
+    bot, stub, rec, ctx, queue_id = w.bot, w.stub, w.rec, w.ctx, w.queue_id
+
+    await w.handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
+    await _finish_pick(w)
+
+    entry = config.queue_entries[queue_id]
+    assert entry['routing'] == 'open', entry['routing']
+    assert stub.docs[queue_id]['routing'] == 'open', stub.docs[queue_id]
+    assert config.user_states[REQUESTER] == UserState.IN_QUEUE, \
+        config.user_states.get(REQUESTER)
+    assert queue_id in config.queue_order, config.queue_order
+    # A fact about the member, not the request: still recorded.
+    assert ('mark_member_started', supporter_id(0), False) in stub.calls, stub.calls
+    assert config.SERVICES['pss'].roster.profile(supporter_id(0)).has_started_bot is False
+    posts = [s for s in bot.sent if s[0] == PSS_CHANNEL and s[2] is not None]
+    assert len(posts) == 1, posts
+    texts = requester_texts(bot, rec)
+    assert texts.count(config.MESSAGES["queue_added"]) == 1, texts
+    assert not [t for t in texts if _busy_sup0() in t], texts
+
+    # The live channel post really is claimable.
+    before = stub.count('claim_session')
+    n_ans = len(rec.answers)
+    await w.handlers.handle_callback_query(
+        cb_update(supporter_id(1), "claim_%s" % queue_id, rec), ctx)
+    # The claim went through the atomic gate (SessionManager then records the same
+    # claim a second time, which is why this is not simply `before + 1`).
+    claims = stub.called('claim_session')
+    assert len(claims) > before, stub.calls
+    assert claims[before] == ('claim_session', queue_id, supporter_id(1)), claims
+    assert not [a for a, _s in rec.answers[n_ans:] if a and 'specific supporter' in a], \
+        rec.answers[n_ans:]
+    assert queue_id not in config.queue_entries
+    assert w.sm.get_session_by_user(REQUESTER) == queue_id
+    print("OK  an. 'anyone' during a failing DM leaves the request open and claimable")
+
+
+async def case_ao_cancel_during_a_failing_dm_stays_cancelled():
+    w = await _start_pick_in_a_window(supporter_id(0), fail_dm=True)
+    bot, stub, rec, ctx, queue_id = w.bot, w.stub, w.rec, w.ctx, w.queue_id
+
+    await w.handlers.cancel_command(text_update(REQUESTER, "/cancel", rec), ctx)
+    await _finish_pick(w)
+
+    assert queue_id not in config.queue_entries
+    assert config.user_states.get(REQUESTER) == UserState.IDLE, \
+        config.user_states.get(REQUESTER)
+    assert REQUESTER not in config.picker_views, config.picker_views
+    assert stub.ended.get(queue_id) == 'user_cancelled', stub.ended
+    assert supporter_id(0) not in config.directed_by_member, config.directed_by_member
+    assert ('mark_member_started', supporter_id(0), False) in stub.calls, stub.calls
+    assert not [s for s in bot.sent if s[0] == PSS_CHANNEL], bot.sent
+    texts = requester_texts(bot, rec)
+    assert config.MESSAGES["queue_cancelled"] in texts, texts
+    assert not [t for t in texts if _busy_sup0() in t], texts
+
+    # Not back on a picker: a typed number selects nobody.
+    n = stub.count('direct_session')
+    await w.handlers.handle_message(text_update(REQUESTER, "2", rec), ctx)
+    assert stub.count('direct_session') == n, stub.calls
+    print("OK  ao. Cancel during a failing DM stays cancelled, never back on the list")
+
+
+async def case_ap_anyone_during_a_landed_dm_retires_it_and_posts_no_note():
+    w = await _start_pick_in_a_window(supporter_id(0))
+    bot, stub, rec, ctx, queue_id = w.bot, w.stub, w.rec, w.ctx, w.queue_id
+
+    await w.handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
+    await _finish_pick(w)
+
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    assert stub.docs[queue_id]['routing'] == 'open', stub.docs[queue_id]
+    assert config.user_states[REQUESTER] == UserState.IN_QUEUE
+    assert len(bot.texts_to(supporter_id(0))) == 1, "the DM did land"
+    assert any(c == str(supporter_id(0)) for c, _mid in bot.markup_edits), \
+        ("its Accept / Not right now buttons must be retired", bot.markup_edits)
+    assert not [s for s in bot.sent if s[0] == PSS_CHANNEL and s[2] is None], \
+        "no directed note for a request already in the channel"
+    posts = [s for s in bot.sent if s[0] == PSS_CHANNEL and s[2] is not None]
+    assert len(posts) == 1, posts
+    assert stub.count('set_directed_message') == 0, stub.calls
+    assert _sent_to_sup0() not in requester_texts(bot, rec), requester_texts(bot, rec)
+
+    # A stale Accept on that DM takes nothing.
+    n_claim = stub.count('claim_session')
+    await w.handlers.handle_callback_query(
+        cb_update(supporter_id(0), "dr_a:%s" % queue_id, rec), ctx)
+    assert stub.count('claim_session') == n_claim, stub.calls
+    assert 'different supporter' in rec.answers[-1][0], rec.answers[-1]
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    joined = " ".join(requester_texts(bot, rec)).lower()
+    for word in FORBIDDEN_TO_REQUESTER:
+        assert word not in joined, (word, joined)
+    print("OK  ap. 'anyone' during a landed DM retires its buttons and posts no note")
+
+
+async def case_aq_a_note_posted_during_an_accept_or_anyone_is_closed_with_the_right_words():
+    def note_only(_t, m):
+        return m is None   # the directed note is the only markup-less channel send
+
+    # Block 1: the target Accepts while the note is being posted.
+    w = await _start_pick_in_a_window(PSS_CHANNEL, match=note_only)
+    bot, rec, ctx, queue_id = w.bot, w.rec, w.ctx, w.queue_id
+    await w.handlers.handle_callback_query(
+        cb_update(supporter_id(0), "dr_a:%s" % queue_id, rec), ctx)
+    await _finish_pick(w)
+
+    notes = [s for s in bot.sent if s[0] == PSS_CHANNEL and s[2] is None]
+    assert len(notes) == 1, notes
+    edits = [t for c, _m, t in bot.edited if c == PSS_CHANNEL]
+    assert edits and 'accepted' in edits[-1], edits
+    assert w.sm.get_session_by_user(REQUESTER) == queue_id
+    texts = requester_texts(bot, rec)
+    assert config.MESSAGES["conversation_status"] in texts, texts
+    assert _sent_to_sup0() not in texts, texts
+
+    # Block 2: the requester taps 'Send to anyone instead' while the note is posted.
+    w = await _start_pick_in_a_window(PSS_CHANNEL, match=note_only)
+    bot, stub, rec, ctx, queue_id = w.bot, w.stub, w.rec, w.ctx, w.queue_id
+    await w.handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
+    await _finish_pick(w)
+
+    edits = [t for c, _m, t in bot.edited if c == PSS_CHANNEL]
+    assert edits and 'no longer waiting' in edits[-1], edits
+    assert 'accepted' not in edits[-1], edits
+    posts = [s for s in bot.sent if s[0] == PSS_CHANNEL and s[2] is not None]
+    assert len(posts) == 1, posts
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    assert stub.docs[queue_id]['routing'] == 'open', stub.docs[queue_id]
+    assert config.user_states[REQUESTER] == UserState.IN_QUEUE
+    texts = requester_texts(bot, rec)
+    assert _sent_to_sup0() not in texts, texts
+    assert config.MESSAGES["queue_status"].format(
+        member=config.SERVICES['pss'].member_label) in texts, texts
+    print("OK  aq. a note posted during an Accept or a reroute closes with the right words")
+
+
 # --------------------------------------------------------------------------- runner
 CASES = [
     case_a_fork_appears_and_nothing_reaches_the_channel,
@@ -1837,6 +2031,10 @@ CASES = [
     case_ak_a_restart_at_the_list_never_guesses_and_keeps_busy_honest,
     case_al_a_second_anyone_tap_reports_the_queue_not_an_outage,
     case_am_a_stale_specific_tap_after_anyone_shows_status_not_the_list,
+    case_an_anyone_during_a_failing_dm_keeps_the_request_claimable,
+    case_ao_cancel_during_a_failing_dm_stays_cancelled,
+    case_ap_anyone_during_a_landed_dm_retires_it_and_posts_no_note,
+    case_aq_a_note_posted_during_an_accept_or_anyone_is_closed_with_the_right_words,
 ]
 
 
@@ -1854,8 +2052,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 38, (
-        "expected at least 38 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 42, (
+        "expected at least 42 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

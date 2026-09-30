@@ -544,6 +544,27 @@ class QueueManager:
         except Exception as exc:
             logger.warning("Could not strip the directed request buttons: %s", exc)
 
+    @staticmethod
+    def _still_directed_at(queue_id: str, entry: dict, member_int: int) -> bool:
+        """True iff `entry` is still THE live entry for queue_id AND still waits on
+        member_int.
+
+        send_directed_request asks this after every await. Each await is a window in
+        which the requester's own buttons keep working -- the list message still
+        carries 'Send to anyone instead' and 'Cancel' -- and, once the DM has landed,
+        in which the target can Accept or decline. Whatever won that window already
+        moved the request on and owns it; code after the await must not write over it.
+
+        MEMORY is the witness, not a Mongo return value. Every transition out of
+        'directed' (undirect, accept_directed, remove_from_queue, the sweep) changes
+        memory with no await between its Mongo write and its memory write, so between
+        awaits memory cannot disagree with Mongo. undirect_session's None cannot serve:
+        it also means "Mongo raised", and then rolling memory back is still right.
+        """
+        return (queue_entries.get(queue_id) is entry
+                and entry.get('routing') == 'directed'
+                and entry.get('target_member_id') == member_int)
+
     async def send_directed_request(self, queue_id: str, member_id: int) -> str:
         """Route ONE request to ONE supporter. Returns 'ok' | 'gone' | 'busy' | 'unreachable'.
 
@@ -551,6 +572,9 @@ class QueueManager:
         first, then the atomic Mongo transition, then the in-memory transition, and
         only THEN the first await. Two taps on the same name both reach
         direct_session; exactly one gets a document back; exactly one DM is sent.
+
+        After EVERY await it re-checks _still_directed_at; losing that check returns
+        'gone' and writes nothing over the winner.
         """
         entry = queue_entries.get(queue_id)
         if entry is None:
@@ -619,34 +643,50 @@ class QueueManager:
             # messaged burns 24 hours of silence on a person in distress.
             logger.warning("Could not DM directed request %s to member %s: %s",
                            queue_id, member_int, exc)
-            if db_mgr.db_available:
-                try:
-                    db_mgr.undirect_session(queue_id, member_int, reason='unreachable')
-                except Exception as inner:
-                    logger.warning("Rollback of directed request %s also failed: %s",
-                                   queue_id, inner)
-            entry['routing'] = 'choosing'
-            entry['target_member_id'] = None
-            entry['directed_at'] = None
-            entry['directed_message_id'] = None
-            # undirect_session also reset waiting_since; mirror it or memory expires
-            # this request on a clock Mongo no longer agrees with.
-            entry['waiting_since'] = utcnow()
-            directed_by_member.pop(member_int, None)
-            # Keep memory in step with what undirect_session just wrote, so the
-            # re-rendered picker does not offer the same unreachable person again.
-            if member_int not in declined:
-                entry['declined_by'] = list(entry.get('declined_by') or []) + [member_int]
-            # AND PUT THE REQUESTER BACK. The state was moved to IN_QUEUE before the
-            # await; rolling the row back to 'choosing' without rolling this back
-            # leaves them staring at a re-rendered picker that says "reply with its
-            # number" while handle_message answers every number they type with the
-            # generic unknown-command string. The buttons keep working, so nothing
-            # looks broken -- it just silently stops listening. Every other
-            # directed -> choosing path (undirect) restores this; so must the rollback.
-            if requester_id:
-                user_states[requester_id] = UserState.CHOOSING_SUPPORTER
+            if self._still_directed_at(queue_id, entry, member_int):
+                if db_mgr.db_available:
+                    try:
+                        db_mgr.undirect_session(queue_id, member_int, reason='unreachable')
+                    except Exception as inner:
+                        logger.warning("Rollback of directed request %s also failed: %s",
+                                       queue_id, inner)
+                entry['routing'] = 'choosing'
+                entry['target_member_id'] = None
+                entry['directed_at'] = None
+                entry['directed_message_id'] = None
+                # undirect_session also reset waiting_since; mirror it or memory expires
+                # this request on a clock Mongo no longer agrees with.
+                entry['waiting_since'] = utcnow()
+                directed_by_member.pop(member_int, None)
+                # Keep memory in step with what undirect_session just wrote, so the
+                # re-rendered picker does not offer the same unreachable person again.
+                if member_int not in declined:
+                    entry['declined_by'] = list(entry.get('declined_by') or []) + [member_int]
+                # AND PUT THE REQUESTER BACK. The state was moved to IN_QUEUE before the
+                # await; rolling the row back to 'choosing' without rolling this back
+                # leaves them staring at a re-rendered picker that says "reply with its
+                # number" while handle_message answers every number they type with the
+                # generic unknown-command string. The buttons keep working, so nothing
+                # looks broken -- it just silently stops listening. Every other
+                # directed -> choosing path (undirect) restores this; so must the rollback.
+                if requester_id:
+                    user_states[requester_id] = UserState.CHOOSING_SUPPORTER
+                outcome = 'unreachable'
+            else:
+                # Something the requester did while this DM was in flight -- 'Send to
+                # anyone instead' or Cancel -- already moved the request on, and it owns
+                # the row and the requester's state now. Rolling back to 'choosing' over
+                # it strands a live channel post that every Claim refuses ("sent to a
+                # specific supporter") while Mongo says 'open', or puts somebody who
+                # just cancelled back on a picker for a request that no longer exists.
+                # Touch nothing but our own index entry.
+                logger.info("Directed request %s moved on while its DM to member %s "
+                            "was in flight; leaving it where it is", queue_id, member_int)
+                if directed_by_member.get(member_int) == queue_id:
+                    directed_by_member.pop(member_int, None)
+                outcome = 'gone'
 
+            # Unconditional: this is a fact about the member, not about the request.
             lowered = str(exc).lower()
             if ("bot can't initiate" in lowered
                     or "can't initiate conversation" in lowered
@@ -664,9 +704,23 @@ class QueueManager:
                         logger.warning("Could not clear has_started_bot for %s: %s",
                                        member_int, inner)
                 svc.roster.mark_started(member_int, False)
-            return 'unreachable'
+            return outcome
 
-        entry['directed_message_id'] = getattr(message, 'message_id', None)
+        message_id = getattr(message, 'message_id', None)
+        if not self._still_directed_at(queue_id, entry, member_int):
+            # The DM landed, but the requester moved the request on while it was in
+            # flight. undirect / remove_from_queue ran while directed_message_id was
+            # still None, so they had no buttons to strip: retire THIS DM's buttons
+            # here -- the same tidy-up a cancelled request gives its supporter -- and
+            # post NO channel note. The request is already in the channel or gone;
+            # a note would tell the channel it was sent to this person.
+            logger.info("Directed request %s moved on while its DM to member %s was "
+                        "in flight; retiring that DM's buttons", queue_id, member_int)
+            await self._strip_directed_buttons({'directed_message_id': message_id},
+                                               member_int)
+            return 'gone'
+
+        entry['directed_message_id'] = message_id
         if db_mgr.db_available and entry['directed_message_id'] is not None:
             try:
                 db_mgr.set_directed_message(queue_id, entry['directed_message_id'])
@@ -676,6 +730,15 @@ class QueueManager:
 
         # Best-effort, never fatal, and always AFTER the DM.
         await self._post_directed_notice(queue_id, entry, svc, member_name)
+        if not self._still_directed_at(queue_id, entry, member_int):
+            # An Accept, a 'Not right now', a 'Send to anyone' or a Cancel ran while the
+            # note was being posted. Each of them edits the note -- but found none to
+            # edit yet. Close it now with the wording that outcome would have used
+            # (never "declined"), and do not tell the requester 'directed_sent': the
+            # winner has already told them where they stand.
+            await self._update_directed_notice(
+                entry, 'accepted' if entry.get('accepted') else 'closed')
+            return 'gone'
         return 'ok'
 
     async def accept_directed(self, queue_id: str, member_id: int, member_name: str = None,
@@ -713,6 +776,9 @@ class QueueManager:
 
         # Synchronously, before the first await -- the same reason claim_queue does it.
         queue_entries.pop(queue_id, None)
+        # Marks the now-orphaned entry, so a channel note that send_directed_request
+        # is still posting closes as 'accepted' rather than 'no longer waiting'.
+        entry['accepted'] = True
         if user_id in user_to_queue_map:
             del user_to_queue_map[user_id]
         directed_by_member.pop(member_int, None)

@@ -1934,7 +1934,18 @@ class BotHandlers:
         # "This request is no longer waiting." -- is a LIE in the second one: a stale
         # picker button tapped while the request is already sitting with somebody.
         # Say which it is, and never name a supporter the requester did not choose.
+        # A THIRD situation reaches here too: a pick whose send was overtaken by the
+        # requester's own later tap ('Send to anyone instead', Cancel) or by the
+        # supporter's Accept. Whatever overtook it already told the requester where
+        # they stand; this must not contradict it.
         picker_views.pop(user_id, None)
+        if self.session_manager.get_session_by_user(user_id):
+            # The supporter they picked accepted while the pick was still being sent;
+            # conversation_started has already reached them. Retire the list with
+            # where they actually are -- never "This request is no longer waiting."
+            await self._send_or_edit(query, context, user_id,
+                                     MESSAGES["conversation_status"])
+            return
         if self.queue_manager.get_queue_entry(queue_id) is not None:
             await self._send_or_edit(query, context, user_id,
                                      self._open_request_status_text(user_id))

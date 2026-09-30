@@ -606,6 +606,28 @@ stripped. A stale "A specific peer supporter" / "Choose someone else" button
 on a request that's already in the channel shows the same status instead of
 a list, so it can never invite a choice that can no longer happen.
 
+**A tap that lands while a pick is still being sent wins.** Between tapping a
+name and that supporter's DM arriving, the list's "Send to anyone instead"
+and "Cancel" still work; and once the DM has landed, the supporter can
+Accept or tap "Not right now" while the channel note is still being posted.
+So `send_directed_request` re-checks after EVERY await that it still owns
+the request (`QueueManager._still_directed_at`: is the in-memory entry still
+the live one, still `directed`, still at this supporter?). Memory is the
+witness because every transition out of `directed` writes Mongo and memory
+with no await between them. If the check fails, whatever overtook the pick
+owns the request and the pick writes nothing over it:
+- A DM that fails no longer rolls an already-open or cancelled request back
+  to `choosing` (which used to strand a channel post every Claim refused, or
+  put somebody who had just cancelled back on a list). `has_started_bot` is
+  still cleared, since that is a fact about the supporter, not the request.
+- A DM that landed after the request moved on has its Accept / Not right now
+  buttons stripped straight away, and no channel note is posted.
+- A channel note that was mid-post during an Accept or a reroute is closed
+  immediately, as "accepted" or "no longer waiting" (never "declined").
+- The requester is never shown `directed_sent` in any of these races; they
+  see what the winner told them (`queue_status`, `queue_cancelled`, or
+  `conversation_status` if the supporter accepted).
+
 ---
 
 ## 6. Tests
