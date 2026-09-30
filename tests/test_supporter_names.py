@@ -41,6 +41,7 @@ from src.supporter_names import (
     REJECTION_KEYS,
     clean_name,
     disambiguate,
+    is_invisible_char,
     name_key,
     name_problem,
     name_skeleton,
@@ -302,7 +303,7 @@ def pss_roster(docs):
 # --------------------------------------------------------------------------- cases
 ACCEPTED = ('Sam', 'Mary-Ann', "O'Brien", 'J. Tan', 'A.J.', 'José', '李明', 'Nguyễn',
             'Sunny 🌻', 'Sup 00', 'Sup 3000', 'Member9000', 'Anne-Marie O’Neil',
-            '❤️ Mei', 'x' * 32)
+            '❤️ Mei', 'Mei ☺︎', 'x' * 32)
 
 REJECTED = (
     ('Sam\nLee', 'name_multiline'),
@@ -310,6 +311,21 @@ REJECTED = (
     ('Sam‮', 'name_invisible_chars'),
     ('Sam\t', 'name_invisible_chars'),
     ('\U0001F469‍⚕️ Ann', 'name_invisible_chars'),
+    # Blank-rendering, not merely invisible: Hangul fillers (Lo, so they look like
+    # LETTERS to Unicode), the Braille blank (So), and Default_Ignorable marks --
+    # the combining grapheme joiner, a Khmer inherent vowel, a Mongolian free
+    # variation selector and a non-emoji variation selector.
+    ('Samㅤ', 'name_invisible_chars'),
+    ('ㅤ', 'name_invisible_chars'),
+    ('Samᅟ', 'name_invisible_chars'),
+    ('Sᅠam', 'name_invisible_chars'),
+    ('Samﾠ', 'name_invisible_chars'),
+    ('Sam⠀', 'name_invisible_chars'),
+    ('Sa͏m', 'name_invisible_chars'),
+    ('Sam឴', 'name_invisible_chars'),
+    ('Sam᠋', 'name_invisible_chars'),
+    ('Sam︀', 'name_invisible_chars'),
+    ('Sam\U000E0100', 'name_invisible_chars'),
     ('', 'name_empty'),
     ('   ', 'name_empty'),
     ('x' * 33, 'name_too_long'),
@@ -960,6 +976,8 @@ NAME_REJECTIONS = (
     ('/name Sam\nLee', 'name_multiline'),
     ('/name ​Sam', 'name_invisible_chars'),
     ('/name Sam‮', 'name_invisible_chars'),
+    ('/name Samㅤ', 'name_invisible_chars'),
+    ('/name ㅤ', 'name_invisible_chars'),
     ('/name ' + 'x' * 33, 'name_too_long'),
     ('/name sam@x', 'name_has_at'),
     ('/name t.me/sam', 'name_looks_like_link'),
@@ -1145,12 +1163,15 @@ def case_ac_capital_i_and_other_look_alikes_collide():
     let it stand next to 'Bill'. The case-preserving skeleton closes that, without
     making 'Ali' collide with 'All' or with the reserved word 'all'."""
     for a, b in (('Bill', 'BiII'), ('Bill', 'Biǀǀ'), ('Ian', 'lan'), ('Bob', 'Bօb'),
-                 ('alex', 'ɑlex'), ('Ivy', 'ivy'), ('IVY', 'ivy'), ('Bill', 'B1ll')):
+                 ('alex', 'ɑlex'), ('Ivy', 'ivy'), ('IVY', 'ivy'), ('Bill', 'B1ll'),
+                 ('Sam', 'Samㅤ'), ('Sam', 'Samﾠ'), ('Sam', 'Sᅠam'),
+                 ('Sam', 'Sam⠀'), ('Sam', 'Sa͏m')):
         assert names_look_alike(a, b), (a, b)
     for a, b in (('Ali', 'All'), ('Ian', 'Lan'), ('Alex', 'Alexa'), ('Kai', 'Kal')):
         assert not names_look_alike(a, b), (a, b)
 
     assert disambiguate([(1402, 'Bill'), (1401, 'BiII')]) ==         {1401: 'BiII (1)', 1402: 'Bill (2)'}
+    assert disambiguate([(2001, 'Sam'), (2002, 'Samㅤ')]) ==         {2001: 'Sam (1)', 2002: 'Samㅤ (2)'}
     # Transitive, and a bystander stays unsuffixed.
     assert disambiguate([(3, 'ivy'), (1, 'Ivy'), (2, 'IvY'), (9, 'Bo')]) ==         {1: 'Ivy (1)', 2: 'IvY (2)', 3: 'ivy (3)', 9: 'Bo'}
 
@@ -1268,6 +1289,35 @@ def case_af_store_upsert_record_and_base_doc():
           "Mongo, never for the deactivated")
 
 
+async def case_ag_blank_looking_names_are_never_listed_or_set():
+    P = config.MemberProfile
+    assert config.listed_name(P(1, telegram_first_name='Samㅤ')) == 'Sam'
+    assert config.listed_name(P(1, telegram_first_name='ㅤ')) == ''
+    assert config.listed_name(P(1, telegram_first_name='ﾠᅠ')) == ''
+    assert config.listed_name(
+        P(1, display_name='Samㅤ', telegram_first_name='Robin')) == '', \
+        'a bad override hides them and never falls back'
+
+    reset_state(); stub = install(NamesStubDB())
+    seed_pss(stub, member_doc(2101, first_name='Sam'), member_doc(2102, first_name='Robin'))
+    h, _bot, ctx = make_handlers()
+    for text in ('/name Samㅤ', '/name ㅤ', '/name Robinﾠ'):
+        rec = Rec(); await h.name_command(text_update(2102, text, rec), ctx)
+        assert rec.replies == [(MESSAGES['name_invisible_chars'], None)], (text, rec.replies)
+        assert write_calls(stub) == [], text
+
+    reset_state(); stub = install(NamesStubDB())
+    seed_pss(stub, member_doc(2103, first_name='ㅤ'), member_doc(2104, first_name='Sam'),
+             member_doc(2105, first_name='Samㅤ'), member_doc(2106, first_name='Annﾠ'))
+    labels = config.supporter_labels('pss')
+    assert labels == {2104: 'Sam (1)', 2105: 'Sam (2)', 2106: 'Ann'}, labels
+    assert config.omitted_supporters('pss') == [2103]
+    for label in labels.values():
+        assert not any(is_invisible_char(ch) for ch in label), repr(label)
+    print("OK  ag. Hangul fillers and other blank characters: refused by /name, "
+          "stripped from Telegram names, never a blank or twin row")
+
+
 CASES = [
     case_a_accepted_names,
     case_b_rejected_names_give_their_exact_key,
@@ -1301,6 +1351,7 @@ CASES = [
     case_ad_name_refuses_a_look_alike_and_auto_names_get_suffixes,
     case_ae_capture_with_no_profile_rebuilds_it_from_mongo,
     case_af_store_upsert_record_and_base_doc,
+    case_ag_blank_looking_names_are_never_listed_or_set,
 ]
 
 
@@ -1315,8 +1366,8 @@ if __name__ == "__main__":
     # A driver that discovers its own tests reports success when it discovers
     # NOTHING. A refactor, a rename, an import shadow or a bad merge all reach that
     # state. Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 32, (
-        "expected at least 32 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 33, (
+        "expected at least 33 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

@@ -9,8 +9,9 @@ config.name_taken_by_other, which calls names_look_alike from here.
 
 Why so strict: a listed name is shown to a student who may be in distress, next to
 a number they type to choose. It must not be able to smuggle a link, a phone number,
-a username, markup, an invisible character, or something that looks like the bot's
-own buttons into that list, and two supporters must never look identical in it.
+a username, markup, an invisible or blank-rendering character (a Hangul filler looks
+like a letter to Unicode), or something that looks like the bot's own buttons into
+that list, and two supporters must never look identical in it.
 "Identical" is judged with two keys, because one cannot do both jobs: name_key is
 case-insensitive (so "IVY" is "ivy") and name_skeleton is case-preserving (so the
 capital I in "BiII" is the lowercase l in "Bill"). names_look_alike is either.
@@ -49,6 +50,24 @@ _LINE_BREAKS = frozenset("\n\r\x0b\x0c\x85  ")
 # Control, format (zero-width, bidi overrides, ZWJ), surrogate, private-use and
 # unassigned. Any of these can make two names look identical or reorder the line.
 _INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+
+# Characters that render as NOTHING but are not in an invisible category, so the
+# category check above misses them. The Hangul fillers (U+115F, U+1160, U+3164,
+# U+FFA0) are category Lo -- LETTERS -- and Telegram users set their first name to
+# U+3164 precisely because it looks blank; U+3164 and U+FFA0 even NFKC to U+1160,
+# which isalnum(), so the look-alike keys kept them and "Sam" + filler stood next
+# to "Sam" unnumbered. U+2800 (Braille blank) is a symbol. The rest are
+# Default_Ignorable marks: the combining grapheme joiner, the Khmer inherent vowels,
+# the Mongolian free variation selectors and every variation selector EXCEPT
+# FE0E/FE0F, which choose text-vs-emoji presentation and are how an ordinary "❤️"
+# is typed. unicodedata does not expose Default_Ignorable, so the non-C members are
+# listed by hand; the C-category ones are already covered above.
+_BLANK_CODEPOINTS = frozenset(
+    [chr(c) for c in (0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C,
+                      0x180D, 0x180F, 0x2800, 0x3164, 0xFFA0)]
+    + [chr(c) for c in range(0xFE00, 0xFE0E)]
+    + [chr(c) for c in range(0xE0100, 0xE01F0)]
+)
 # Hyphen, straight and curly apostrophe, full stop. Nothing that can form markup,
 # a link, a mention or our own "(2)" collision suffix.
 _ALLOWED_PUNCTUATION = frozenset("-'’.")
@@ -119,15 +138,29 @@ def clean_name(raw) -> str:
     return " ".join(text.split())
 
 
+def is_invisible_char(ch) -> bool:
+    """True for any character a student could not see: an invisible category
+    (control, format, surrogate, private-use, unassigned) or a blank-rendering
+    letter, symbol or mark from _BLANK_CODEPOINTS."""
+    return ch in _BLANK_CODEPOINTS or unicodedata.category(ch) in _INVISIBLE_CATEGORIES
+
+
+def strip_invisible(text) -> str:
+    """`text` with every is_invisible_char removed. Validates nothing."""
+    return "".join(ch for ch in ("" if text is None else str(text))
+                   if not is_invisible_char(ch))
+
+
 def name_key(name) -> str:
     """The comparison key for "is this the same name?". NEVER displayed.
 
     Deliberately lossy: case, accents, spacing, punctuation, fullwidth and
-    mathematical letter forms, common Cyrillic/Greek look-alikes, 0/o, 1/l, rn/m and
-    vv/w all collapse, so two supporters cannot be told apart only by something a
-    student cannot see.
+    mathematical letter forms, common Cyrillic/Greek look-alikes, 0/o, 1/l, rn/m,
+    vv/w, and invisible and blank-rendering characters all collapse, so two
+    supporters cannot be told apart only by something a student cannot see.
     """
     text = unicodedata.normalize("NFKC", "" if name is None else str(name))
+    text = strip_invisible(text)  # AFTER NFKC: U+3164 and U+FFA0 only become U+1160 there.
     text = text.translate(_UPPER_CONFUSABLES)
     text = text.casefold()
     text = unicodedata.normalize("NFD", text)
@@ -145,8 +178,10 @@ def name_skeleton(name) -> str:
     are the same glyph. Marks are stripped BEFORE the map, so an accented capital
     ("Ì") becomes I and then l. There is deliberately no casefold: folding case is
     name_key's job, and doing both in one key would make "Ali" read as "all".
+    Invisible and blank-rendering characters collapse away here too.
     """
     text = unicodedata.normalize("NFKC", "" if name is None else str(name))
+    text = strip_invisible(text)  # AFTER NFKC: U+3164 and U+FFA0 only become U+1160 there.
     text = unicodedata.normalize("NFD", text)
     text = "".join(ch for ch in text if not unicodedata.category(ch).startswith("M"))
     text = text.translate(_SKELETON_UPPER).translate(_LOWER_CONFUSABLES)
@@ -187,7 +222,7 @@ def name_problem(raw, reserved_keys=frozenset()) -> Optional[str]:
     # 1-2 run on the RAW text: clean_name would hide a newline or a tab as a space.
     if any(ch in _LINE_BREAKS for ch in text):
         return "name_multiline"
-    if any(unicodedata.category(ch) in _INVISIBLE_CATEGORIES for ch in text):
+    if any(is_invisible_char(ch) for ch in text):
         return "name_invisible_chars"
 
     name = clean_name(text)

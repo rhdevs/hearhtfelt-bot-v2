@@ -12,6 +12,7 @@ load_dotenv()
 # no cycle: the name rules stay testable without the bot's state.
 from src.supporter_names import (
     NAME_MAX_LENGTH, clean_name, disambiguate, name_problem, names_look_alike, reserved_forms,
+    strip_invisible,
 )
 
 class UserState(Enum):
@@ -1278,7 +1279,13 @@ def listed_name(profile: Optional[MemberProfile]) -> str:
     override = clean_name(profile.display_name)
     if override:
         return override if supporter_name_problem(override) is None else ""
-    auto = clean_name(profile.telegram_first_name)
+    # STRIPPED, not rejected: the supporter never typed this name for us. A first
+    # name that is only a Hangul filler (a common way to look nameless on Telegram)
+    # comes out empty and is omitted -- and logged -- never listed as a blank row;
+    # "Sam" + filler is listed as "Sam" and numbered against any other Sam. The
+    # OVERRIDE above is never stripped: /name refused it, so a stored one that fails
+    # hides the supporter like any other bad override.
+    auto = clean_name(strip_invisible(profile.telegram_first_name))
     # A Telegram first name can run to 64 chars. Shorten rather than drop: the
     # supporter never typed it for us and would not know why they had vanished.
     if len(auto) > NAME_MAX_LENGTH:

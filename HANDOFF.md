@@ -511,7 +511,11 @@ in this order — the first violation wins, so the reply is always the most
 specific, most actionable one):
 1. One line — no newline, carriage return or other line-break character.
 2. No invisible, zero-width, bidi-override or other formatting/control/
-   surrogate/private-use/unassigned characters.
+   surrogate/private-use/unassigned characters, and no blank-rendering
+   characters Unicode files as letters, symbols or marks: the Hangul fillers
+   (U+115F, U+1160, U+3164, U+FFA0), the Braille blank U+2800, the combining
+   grapheme joiner, and every variation selector except the emoji ones
+   FE0E/FE0F (`supporter_names.is_invisible_char`).
 3. 1–32 characters after collapsing whitespace (leading/trailing trimmed,
    internal runs collapsed to one space).
 4. No `@` (can't imitate a username or email).
@@ -539,6 +543,8 @@ specific, most actionable one):
     This check is roster-aware and lives in `config.name_taken_by_other`, not
     in `name_problem` itself (`src/supporter_names.py` is deliberately pure —
     no `config` import — so its rules stay independently testable).
+    Invisible and blank-rendering characters are ignored when comparing, so
+    "Sam" plus a Hangul filler is "Sam".
 
 Each rejection gets a specific, friendly message (the `name_*` keys in
 `MESSAGES`) — never a generic "invalid name".
@@ -555,7 +561,10 @@ three are numbered together.
 nor a `/name` override is left off the picker list entirely (not shown as
 "(busy)" — this is the one case that omits rather than marks). Their id is
 logged at INFO on every render that would otherwise have included them
-(`omitted_supporters`).
+(`omitted_supporters`). Blank-rendering characters are stripped from a
+captured Telegram first name before it is checked, so a supporter whose first
+name is only a Hangul filler is omitted (and logged), never listed as an empty
+row. A `/name` override containing one is refused outright.
 
 **Logging:** every name change — automatic capture or `/name` — is logged at
 INFO with the supporter's Telegram id and the old and new name (`old first ->
