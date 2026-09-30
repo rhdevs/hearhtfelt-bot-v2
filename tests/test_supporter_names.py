@@ -345,6 +345,10 @@ REJECTED = (
     ('Sam#1', 'name_bad_chars'),
     ('<b>Sam</b>', 'name_bad_chars'),
     ('Sam (2)', 'name_bad_chars'),
+    # Compatibility forms that RENDER as the collision suffix: category So, so the
+    # whitelist alone admitted them, and "Alex ⑵" stood next to the bot's "Alex (2)".
+    ('Alex ⑵', 'name_bad_chars'),
+    ('Alex ⦇2⦈', 'name_bad_chars'),
     ('Alex (he/him)', 'name_bad_chars'),
     ('Ś̂̃am', 'name_bad_chars'),
     ('1234', 'name_numeric'),

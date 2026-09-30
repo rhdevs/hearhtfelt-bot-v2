@@ -239,6 +239,12 @@ def name_problem(raw, reserved_keys=frozenset()) -> Optional[str]:
         return "name_looks_like_link"
     if _PHONE_RE.search(folded):
         return "name_has_phone"
+    # Checked on the NFKC form, not just by the whitelist below: "⑵" (U+2475) and
+    # its kin are category So, which the whitelist admits as an emoji-ish symbol,
+    # yet they RENDER as "(2)" -- a forged copy of the collision suffix disambiguate
+    # appends. Brackets of any kind are never part of a name.
+    if any(ch in "()[]{}" for ch in folded):
+        return "name_bad_chars"
 
     # Whitelist, not blacklist: letters, numbers, spaces, emoji-ish symbols and four
     # punctuation marks. Parentheses are out, which is what makes the collision
@@ -283,7 +289,8 @@ def disambiguate(entries: Iterable[Tuple[int, str]]) -> Dict[int, str]:
     stable across renders and nobody is "the real Alex". Grouping is transitive: if
     A looks like B and B like C, all three are numbered together, even when A and C
     alone would not collide -- otherwise two of the three would still look the same.
-    The suffix cannot be forged, because parentheses fail name_problem. No id or
+    The suffix cannot be forged, because parentheses -- including compatibility
+    forms such as "⑵", which NFKC to "(2)" -- fail name_problem. No id or
     username is ever shown -- the number is a position in the group, nothing more.
     """
     items = [(int(member_id), name) for member_id, name in entries]
