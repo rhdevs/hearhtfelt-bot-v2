@@ -43,6 +43,9 @@ from src.supporter_names import (
     disambiguate,
     name_key,
     name_problem,
+    name_skeleton,
+    names_look_alike,
+    reserved_forms,
 )
 from src.timeutil import utcnow
 
@@ -1135,6 +1138,61 @@ async def case_ab_the_cli_set_profile_validates_and_cleans():
           "whitespace, and '' resets")
 
 
+def case_ac_capital_i_and_other_look_alikes_collide():
+    """name_key folds case, so on its own it saw 'BiII' (capital I) as 'biii' and
+    let it stand next to 'Bill'. The case-preserving skeleton closes that, without
+    making 'Ali' collide with 'All' or with the reserved word 'all'."""
+    for a, b in (('Bill', 'BiII'), ('Bill', 'Biǀǀ'), ('Ian', 'lan'), ('Bob', 'Bօb'),
+                 ('alex', 'ɑlex'), ('Ivy', 'ivy'), ('IVY', 'ivy'), ('Bill', 'B1ll')):
+        assert names_look_alike(a, b), (a, b)
+    for a, b in (('Ali', 'All'), ('Ian', 'Lan'), ('Alex', 'Alexa'), ('Kai', 'Kal')):
+        assert not names_look_alike(a, b), (a, b)
+
+    assert disambiguate([(1402, 'Bill'), (1401, 'BiII')]) ==         {1401: 'BiII (1)', 1402: 'Bill (2)'}
+    # Transitive, and a bystander stays unsuffixed.
+    assert disambiguate([(3, 'ivy'), (1, 'Ivy'), (2, 'IvY'), (9, 'Bo')]) ==         {1: 'Ivy (1)', 2: 'IvY (2)', 3: 'ivy (3)', 9: 'Bo'}
+
+    assert config.supporter_name_problem('CanceI') == 'name_reserved'
+    assert config.supporter_name_problem('AII') == 'name_reserved'
+    for n in ('Ali', 'Ian', 'Isla', 'Lily', 'Eli', 'Kai', 'Liam', 'Iris', 'Ivy'):
+        assert config.supporter_name_problem(n) is None, n
+    assert len({name_skeleton('Sup %02d' % n) for n in range(20)}) == 20,         "the skeleton must not merge distinct auto-style names"
+    for w in ('cancel', 'busy', 'anyone'):
+        assert reserved_forms(w) <= config.RESERVED_NAME_KEYS, w
+    print("OK  ac. capital I vs l and Armenian/Latin look-alikes collide; "
+          "Ali, Ian and Ivy stay legal")
+
+
+async def case_ad_name_refuses_a_look_alike_and_auto_names_get_suffixes():
+    reset_state()
+    stub = install(NamesStubDB())
+    seed_pss(stub, member_doc(2001, first_name='Bill'),
+             member_doc(2002, first_name='Robin'))
+    h, _bot, ctx = make_handlers()
+    for text in ('/name BiII', '/name Biǀǀ', '/name B1ll'):
+        rec = Rec()
+        await h.name_command(text_update(2002, text, rec), ctx)
+        assert rec.replies == [(MESSAGES['name_taken'], None)], (text, rec.replies)
+        assert write_calls(stub) == [], text
+
+    # Names nobody chose -- captured Telegram first names -- still get numbered.
+    # A fresh stub AND seed_pss (which REPLACES the in-memory roster) so this block
+    # sees exactly these four people.
+    stub = install(NamesStubDB())
+    seed_pss(stub, member_doc(2003, first_name='Bill'),
+             member_doc(2004, first_name='BiII'),
+             member_doc(2005, first_name='Bob'),
+             member_doc(2006, first_name='Bօb'))
+    labels = config.supporter_labels('pss')
+    assert labels == {2003: 'Bill (1)', 2004: 'BiII (2)',
+                      2005: 'Bob (1)', 2006: 'Bօb (2)'}, labels
+    for label in labels.values():
+        for member_id in ('2003', '2004', '2005', '2006'):
+            assert member_id not in label, (member_id, label)
+    print("OK  ad. /name refuses a capital-I look-alike, and auto-captured "
+          "look-alikes are numbered")
+
+
 CASES = [
     case_a_accepted_names,
     case_b_rejected_names_give_their_exact_key,
@@ -1164,6 +1222,8 @@ CASES = [
     case_z_write_failures,
     case_aa_the_cli_lists_labelled_names_with_collision_suffixes,
     case_ab_the_cli_set_profile_validates_and_cleans,
+    case_ac_capital_i_and_other_look_alikes_collide,
+    case_ad_name_refuses_a_look_alike_and_auto_names_get_suffixes,
 ]
 
 
@@ -1178,8 +1238,8 @@ if __name__ == "__main__":
     # A driver that discovers its own tests reports success when it discovers
     # NOTHING. A refactor, a rename, an import shadow or a bad merge all reach that
     # state. Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 28, (
-        "expected at least 28 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 30, (
+        "expected at least 30 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

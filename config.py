@@ -10,7 +10,9 @@ load_dotenv()
 
 # A PURE module (re/unicodedata/typing only) that never imports config, so there is
 # no cycle: the name rules stay testable without the bot's state.
-from src.supporter_names import NAME_MAX_LENGTH, clean_name, disambiguate, name_key, name_problem
+from src.supporter_names import (
+    NAME_MAX_LENGTH, clean_name, disambiguate, name_problem, names_look_alike, reserved_forms,
+)
 
 class UserState(Enum):
     IDLE = "idle"
@@ -1119,15 +1121,17 @@ _RESERVED_NAME_WORDS = (
 
 # Derived from MESSAGES and SERVICES, so a new or renamed *_button, member label or
 # track name is covered automatically -- there is no second list to forget.
-RESERVED_NAME_KEYS: FrozenSet[str] = frozenset(
-    k for k in (
-        [name_key(w) for w in _RESERVED_NAME_WORDS]
-        + [name_key(v) for key, v in MESSAGES.items()
+# Holds BOTH reserved_forms of every word, the name_key and the casefolded visual
+# skeleton, so "CanceI" (capital I) is refused exactly like "Cancel".
+RESERVED_NAME_KEYS: FrozenSet[str] = frozenset().union(*(
+    reserved_forms(w) for w in (
+        list(_RESERVED_NAME_WORDS)
+        + [v for key, v in MESSAGES.items()
            if key.endswith('_button') and isinstance(v, str)]
-        + [name_key(s.member_label) for s in SERVICES.values()]
-        + [name_key(s.display_name) for s in SERVICES.values()]
-    ) if k
-)
+        + [s.member_label for s in SERVICES.values()]
+        + [s.display_name for s in SERVICES.values()]
+    )
+))
 
 
 def closing_text(service_key: Optional[str], for_member: bool) -> str:
@@ -1290,12 +1294,12 @@ def omitted_supporters(service_key: str) -> List[int]:
 
 
 def name_taken_by_other(service_key: str, member_id, name) -> bool:
-    """True iff some OTHER roster member is currently LISTED under a name that
-    name_key-matches `name`. Only listed names count: another member's invalid raw
+    """True iff some OTHER roster member is currently LISTED under a name that is a
+    look-alike of `name` under names_look_alike (same name_key OR same visual
+    skeleton, so "BiII" is taken by "Bill"). Only listed names count: another member's invalid raw
     text, or a Telegram name hidden behind their own override, is shown to nobody
     and so cannot be confused with anything."""
     svc = get_service(service_key)
-    key = name_key(name)
     try:
         member_int = int(member_id)
     except (TypeError, ValueError):
@@ -1304,7 +1308,7 @@ def name_taken_by_other(service_key: str, member_id, name) -> bool:
         if p.telegram_id == member_int or p.telegram_id not in svc.roster:
             continue
         other = listed_name(p)
-        if other and name_key(other) == key:
+        if other and names_look_alike(other, name):
             return True
     return False
 

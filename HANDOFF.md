@@ -519,10 +519,15 @@ specific, most actionable one):
 8. Not purely numeric (people pick from the list by typing a number).
 9. At least one letter.
 10. Not a word or button label the bot itself uses (`RESERVED_NAME_KEYS` —
-    e.g. "busy", "cancel", "anyone").
+    e.g. "busy", "cancel", "anyone"). Reserved words are also matched by
+    their visual skeleton, so "CanceI" (capital I) is refused like "Cancel".
 11. Not the same as, or a lookalike of (case/whitespace/accent-insensitive,
-    with common homoglyph folding — Cyrillic/Greek look-alikes, 0/o, 1/l,
-    "rn"/"m", "vv"/"w"), another active PSS supporter's current listed name.
+    with homoglyph folding — Cyrillic/Greek/Armenian and Latin look-alikes,
+    0/o, 1/l (and 1/i), capital I vs lowercase l, "rn"/"m", "vv"/"w" —
+    checked with two keys, a case-insensitive `name_key` and a case-preserving
+    visual `name_skeleton`, so that "BiII" collides with "Bill" while "Ali"
+    and "All" stay distinct), another active PSS supporter's current listed
+    name.
     This check is roster-aware and lives in `config.name_taken_by_other`, not
     in `name_problem` itself (`src/supporter_names.py` is deliberately pure —
     no `config` import — so its rules stay independently testable).
@@ -534,7 +539,9 @@ Each rejection gets a specific, friendly message (the `name_*` keys in
 (automatic-vs-automatic, automatic-vs-chosen, or chosen-vs-chosen) are shown
 as "Alex (1)", "Alex (2)", ... in ascending Telegram-id order
 (`src.supporter_names.disambiguate`), computed fresh over active members every
-time a list is rendered — never stored.
+time a list is rendered — never stored. Grouping is by look-alike (either
+key, `names_look_alike`), transitively: if A looks like B and B like C, all
+three are numbered together.
 
 **No usable name:** a supporter with neither a captured Telegram first name
 nor a `/name` override is left off the picker list entirely (not shown as

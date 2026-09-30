@@ -5,12 +5,15 @@ PURE ON PURPOSE: this module imports only re, unicodedata and typing. config.py
 imports it, so importing config from here would be a cycle -- and a rule set that
 needs the bot's state to decide whether "Sam" is a name is a rule set nobody can
 test. The one roster-aware rule ("somebody else already goes by that") lives in
-config.name_taken_by_other, which calls name_key from here.
+config.name_taken_by_other, which calls names_look_alike from here.
 
 Why so strict: a listed name is shown to a student who may be in distress, next to
 a number they type to choose. It must not be able to smuggle a link, a phone number,
 a username, markup, an invisible character, or something that looks like the bot's
 own buttons into that list, and two supporters must never look identical in it.
+"Identical" is judged with two keys, because one cannot do both jobs: name_key is
+case-insensitive (so "IVY" is "ivy") and name_skeleton is case-preserving (so the
+capital I in "BiII" is the lowercase l in "Bill"). names_look_alike is either.
 """
 
 import re
@@ -56,16 +59,34 @@ _DOMAIN_RE = re.compile(r"[^\W_]\.[^\W\d_]{2,}")
 # "Sup 3000" (four) is a name; "9123 4567" is a phone number.
 _PHONE_RE = re.compile(r"\d(?:[\s.\-'’]*\d){4,}")
 
-# Applied BEFORE casefold: uppercase Cyrillic/Greek letters that render like Latin.
-_UPPER_CONFUSABLES = str.maketrans({
+# Applied BEFORE casefold: uppercase Cyrillic/Greek/Armenian letters that render
+# like Latin. Kept as a plain dict too, because _SKELETON_UPPER is built from it.
+_UPPER_CONFUSABLE_MAP = {
     # Cyrillic
     "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M",
     "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T",
     "У": "Y", "Х": "X", "І": "I", "Ј": "J", "Ѕ": "S",
+    "Ӏ": "I",
+    # Armenian
+    "Օ": "O", "Ս": "U",
     # Greek
     "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H",
     "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O",
     "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+}
+_UPPER_CONFUSABLES = str.maketrans(_UPPER_CONFUSABLE_MAP)
+
+# In a sans-serif UI font capital I IS lowercase l. casefold() hides that by turning
+# I into i, which is why name_key alone let 'BiII' pass for 'Bill'. So the skeleton
+# uses the same uppercase map, except that every capital-I look-alike (Latin, Greek,
+# Cyrillic and the Cyrillic palochka) becomes 'l' instead of 'I'.
+# The digit 1 passes for BOTH i and l. name_key already reads it as l ("A11" is
+# "All"); the skeleton reads it as i, so "B1ll" is caught as "Bill" too. It must be
+# mapped here, before _LOWER_CONFUSABLES would turn it into l.
+_SKELETON_UPPER = str.maketrans({
+    **_UPPER_CONFUSABLE_MAP,
+    "I": "l", "Ι": "l", "І": "l", "Ӏ": "l",
+    "1": "i",
 })
 
 # Applied AFTER casefold and mark stripping: lowercase look-alikes, plus the two
@@ -75,8 +96,10 @@ _LOWER_CONFUSABLES = str.maketrans({
     "а": "a", "е": "e", "о": "o", "р": "p", "с": "c",
     "у": "y", "х": "x", "і": "i", "ј": "j", "ѕ": "s",
     "ԁ": "d", "ӏ": "l", "һ": "h", "ԛ": "q", "ԝ": "w",
+    # Armenian
+    "օ": "o", "ո": "n", "ս": "u", "հ": "h", "զ": "q",
     # Latin
-    "ɡ": "g", "ı": "i",
+    "ɡ": "g", "ı": "i", "ɑ": "a", "ɩ": "i", "ǀ": "l",
     # Greek
     "α": "a", "ε": "e", "ι": "i", "κ": "k", "ν": "v",
     "ο": "o", "ρ": "p", "τ": "t", "υ": "u", "χ": "x",
@@ -114,13 +137,50 @@ def name_key(name) -> str:
     return text.replace("rn", "m").replace("vv", "w")
 
 
+def name_skeleton(name) -> str:
+    """The CASE-PRESERVING visual key: what the name looks like on screen. NEVER
+    displayed.
+
+    Complements name_key, which is case-insensitive and so cannot see that I and l
+    are the same glyph. Marks are stripped BEFORE the map, so an accented capital
+    ("Ì") becomes I and then l. There is deliberately no casefold: folding case is
+    name_key's job, and doing both in one key would make "Ali" read as "all".
+    """
+    text = unicodedata.normalize("NFKC", "" if name is None else str(name))
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if not unicodedata.category(ch).startswith("M"))
+    text = text.translate(_SKELETON_UPPER).translate(_LOWER_CONFUSABLES)
+    text = "".join(ch for ch in text if ch.isalnum())
+    return text.replace("rn", "m").replace("vv", "w")
+
+
+def names_look_alike(a, b) -> bool:
+    """True iff a student could not reliably tell a from b: same name_key (case,
+    accents, spacing, common homoglyphs) OR same name_skeleton (I/l/1 and other
+    case-sensitive look-alikes).
+
+    Two keys, because one cannot do both: folding case makes I == i, and a visual
+    map makes I == l; merging both into one key would make "Ali" read as the
+    reserved word "all", and "Ian" as "Lan".
+    """
+    return name_key(a) == name_key(b) or name_skeleton(a) == name_skeleton(b)
+
+
+def reserved_forms(name) -> frozenset:
+    """The forms of `name` compared against the bot's reserved words: its name_key
+    and its casefolded skeleton. The skeleton form is what catches "CanceI" (capital
+    I) for "Cancel"; config builds RESERVED_NAME_KEYS from these same forms."""
+    return frozenset(k for k in (name_key(name), name_skeleton(name).casefold()) if k)
+
+
 def name_problem(raw, reserved_keys=frozenset()) -> Optional[str]:
     """None when `raw` is acceptable as a listed name, else the FIRST problem key.
 
     The order is part of the contract (tests pin it): the most specific, most
     actionable reason wins, so "Call 91234567" is told about the phone number rather
-    than something vaguer. `reserved_keys` are name_key()s of words the bot itself
-    uses; config passes RESERVED_NAME_KEYS. Roster collisions are NOT checked here.
+    than something vaguer. `reserved_keys` are the reserved_forms() of words the bot
+    itself uses; config passes RESERVED_NAME_KEYS, built from reserved_forms. Roster
+    collisions are NOT checked here.
     """
     text = "" if raw is None else str(raw)
 
@@ -174,7 +234,7 @@ def name_problem(raw, reserved_keys=frozenset()) -> Optional[str]:
         return "name_numeric"
     if not any(unicodedata.category(c).startswith("L") for c in name):
         return "name_needs_letter"
-    if name_key(name) in reserved_keys:
+    if reserved_forms(name) & reserved_keys:
         return "name_reserved"
     return None
 
@@ -182,15 +242,34 @@ def name_problem(raw, reserved_keys=frozenset()) -> Optional[str]:
 def disambiguate(entries: Iterable[Tuple[int, str]]) -> Dict[int, str]:
     """member_id -> the label shown to requesters.
 
-    Names are grouped by name_key. A name nobody else shares is shown as-is. EVERY
-    member of a collision group is numbered, " (1)", " (2)", ... in ascending
-    member_id order, so the order is stable across renders and nobody is "the real
-    Alex". The suffix cannot be forged, because parentheses fail name_problem. No id
-    or username is ever shown -- the number is a position in the group, nothing more.
+    Names are grouped into connected components of names_look_alike. A name that
+    looks like nobody else's is shown as-is. EVERY member of a look-alike group is
+    numbered, " (1)", " (2)", ... in ascending member_id order, so the order is
+    stable across renders and nobody is "the real Alex". Grouping is transitive: if
+    A looks like B and B like C, all three are numbered together, even when A and C
+    alone would not collide -- otherwise two of the three would still look the same.
+    The suffix cannot be forged, because parentheses fail name_problem. No id or
+    username is ever shown -- the number is a position in the group, nothing more.
     """
-    groups: Dict[str, list] = {}
-    for member_id, name in entries:
-        groups.setdefault(name_key(name), []).append((int(member_id), name))
+    items = [(int(member_id), name) for member_id, name in entries]
+    # Union-find over every pair. O(n^2) name comparisons is fine: a roster is tens
+    # of people, and a pairwise check is the only way to honour "either key".
+    parent = list(range(len(items)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            if names_look_alike(items[i][1], items[j][1]):
+                parent[find(i)] = find(j)
+
+    groups: Dict[int, list] = {}
+    for index, item in enumerate(items):
+        groups.setdefault(find(index), []).append(item)
     labels: Dict[int, str] = {}
     for members in groups.values():
         if len(members) == 1:
