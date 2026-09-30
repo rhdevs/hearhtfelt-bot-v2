@@ -945,29 +945,40 @@ class QueueManager:
             queue_order.append(session_id)
         return session_id
 
-    async def route_to_open_queue(self, queue_id: str) -> bool:
+    async def route_to_open_queue(self, queue_id: str) -> str:
         """The requester chose to ask anyone who's free.
 
         Allowed from 'directed' as well as 'choosing', and deliberately so: the
         alternative locks somebody in distress behind one person's 24-hour silence
         with no exit but /cancel and retyping everything. It is their own choice, so
         it is not the automatic reroute that must never happen.
+
+        Returns 'ok' | 'already_open' | 'gone' | 'post_failed'. ONLY 'post_failed'
+        is a fault. 'already_open' is a double tap, or a tap on an older
+        fork/list/next-step message whose request is already in the channel, and
+        must never be reported to a student as an outage. NOT a bool: every result
+        is a non-empty string, so never test it for truthiness.
         """
         entry = queue_entries.get(queue_id)
         if entry is None:
-            return False
+            return 'gone'
 
         routing = entry.get('routing') or 'open'
+        if routing == 'open':
+            # A repeat tap: the request is already posted and working.
+            return 'already_open'
         if routing not in ('choosing', 'directed'):
-            return False
+            return 'gone'
 
         if routing == 'directed':
             target = entry.get('target_member_id')
             if target is None:
-                return False
+                return 'gone'
             if not await self.undirect(queue_id, target, reason='rerouted',
                                        notify_member=False):
-                return False
+                # We lost the race to an accept or a lapse. Its winner has already
+                # messaged the requester, so do not post; the caller shows status.
+                return 'gone'
 
         # Before the first await: a double tap finds routing already 'open' and bails.
         entry['routing'] = 'open'
@@ -978,7 +989,7 @@ class QueueManager:
         posted, _error_type = await self.post_queue_to_channel(queue_id)
         if not posted:
             entry['routing'] = 'choosing'
-            return False
+            return 'post_failed'
 
         if db_mgr.db_available:
             try:
@@ -1004,7 +1015,7 @@ class QueueManager:
             except Exception as exc:
                 logger.warning("Could not confirm the open queue to %s: %s",
                                requester, exc)
-        return True
+        return 'ok'
 
     def is_user_in_queue(self, user_id: int) -> bool:
         """Check if user is already in queue - O(1) lookup"""

@@ -579,6 +579,18 @@ already-in-progress conversation, an already-held directed request, a pending
 ask that hasn't resolved yet, or simply an unreachable chat (`has_started_bot`
 unset/stale). The requester is never told which.
 
+**"Send to anyone" is safe to tap twice.** A repeat or stale tap on
+"Any available peer supporter" / "Send to anyone instead" (a double tap, or
+an older fork/list/next-step message) tells the student where their request
+stands (`queue_status`) and never posts to the channel twice.
+`route_to_open_queue` returns a string outcome, not a bool, precisely so
+that "already open" can't be mistaken for a fault: `channel_error` is
+reserved for a real channel-post failure, and in that case the buttons are
+left live so the same tap retries. On success the fork's keyboard is
+stripped. A stale "A specific peer supporter" / "Choose someone else" button
+on a request that's already in the channel shows the same status instead of
+a list, so it can never invite a choice that can no longer happen.
+
 ---
 
 ## 6. Tests

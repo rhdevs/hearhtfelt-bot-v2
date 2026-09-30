@@ -249,6 +249,7 @@ class Rec:
     def __init__(self):
         self.replies = []   # (text, reply_markup) sent back to the acting user
         self.answers = []   # (text, show_alert)
+        self.markup_strips = []   # reply_markup values passed to query.edit_message_reply_markup
 
 
 def text_update(user_id, text, rec, username=None, chat_type="private"):
@@ -269,6 +270,7 @@ def cb_update(user_id, data, rec, username="mem", first="Mem"):
         rec.replies.append((t, reply_markup))
 
     async def edit_message_reply_markup(reply_markup=None, **kw):
+        rec.markup_strips.append(reply_markup)
         return None
 
     fu = SimpleNamespace(id=user_id, username=username, first_name=first, last_name=None)
@@ -1016,6 +1018,8 @@ async def case_u_a_failed_channel_post_leaves_the_request_choosable():
     assert not stub.called('open_session'), stub.calls
     assert queue_id not in config.queue_order
     assert config.MESSAGES["channel_error"] in bot.texts_to(REQUESTER)
+    assert rec.markup_strips == [], (
+        "a failed post keeps the buttons so the same tap retries", rec.markup_strips)
     print("OK  u. a failed channel post reverts to 'choosing' and never flips Mongo")
 
 
@@ -1732,6 +1736,67 @@ async def case_ak_a_restart_at_the_list_never_guesses_and_keeps_busy_honest():
     print("OK  ak. a restart at the list never guesses, and the restored busy stay busy")
 
 
+async def case_al_a_second_anyone_tap_reports_the_queue_not_an_outage():
+    """The old bool return made 'already open' and 'channel down' the same False, so
+    a double tap on 'Any available peer supporter' told somebody whose request was
+    live in the channel that the system was broken."""
+    bot, sm, qm, handlers, stub = setup(supporters=2)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
+    assert rec.markup_strips == [None], (
+        "the fork keyboard is spent once the request is in the channel", rec.markup_strips)
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
+
+    posts = [s for s in bot.sent if s[0] == PSS_CHANNEL and s[2] is not None]
+    assert len(posts) == 1, posts
+    assert stub.count('open_session') == 1, stub.calls
+    texts = requester_texts(bot, rec)
+    assert config.MESSAGES["channel_error"] not in texts, texts
+    assert texts.count(config.MESSAGES["queue_added"]) == 1, texts
+    status = config.MESSAGES["queue_status"].format(
+        member=config.SERVICES['pss'].member_label)
+    assert status in texts, texts
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    assert stub.docs[queue_id]['routing'] == 'open', stub.docs[queue_id]
+    assert config.user_states[REQUESTER] == UserState.IN_QUEUE
+    joined = " ".join(texts).lower()
+    for word in FORBIDDEN_TO_REQUESTER:
+        assert word not in joined, (word, texts)
+    print("OK  al. a second 'anyone' tap reports the queue, never an outage, and posts once")
+
+
+async def case_am_a_stale_specific_tap_after_anyone_shows_status_not_the_list():
+    bot, sm, qm, handlers, stub = setup(supporters=2)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
+
+    rec.replies.clear()
+    n = stub.count('direct_session')
+    dm_before = len(bot.texts_to(supporter_id(0)))
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    assert not [t for t, _m in rec.replies if config.MESSAGES["picker_header"] in t],         rec.replies
+    assert REQUESTER not in config.picker_views, config.picker_views
+    status = config.MESSAGES["queue_status"].format(
+        member=config.SERVICES['pss'].member_label)
+    assert status in requester_texts(bot, rec), requester_texts(bot, rec)
+
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+    assert stub.count('direct_session') == n, stub.calls
+    assert len(bot.texts_to(supporter_id(0))) == dm_before, bot.texts_to(supporter_id(0))
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    print("OK  am. a stale 'specific' tap after 'anyone' shows where the request is, not a list")
+
+
 # --------------------------------------------------------------------------- runner
 CASES = [
     case_a_fork_appears_and_nothing_reaches_the_channel,
@@ -1770,6 +1835,8 @@ CASES = [
     case_ai_hf_is_untouched_when_pss_forks,
     case_aj_a_restart_at_the_fork_keeps_both_buttons_working,
     case_ak_a_restart_at_the_list_never_guesses_and_keeps_busy_honest,
+    case_al_a_second_anyone_tap_reports_the_queue_not_an_outage,
+    case_am_a_stale_specific_tap_after_anyone_shows_status_not_the_list,
 ]
 
 
@@ -1787,8 +1854,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 36, (
-        "expected at least 36 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 38, (
+        "expected at least 38 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

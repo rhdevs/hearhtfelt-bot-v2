@@ -1802,17 +1802,44 @@ class BotHandlers:
 
         if data == CB_PICK_OPEN:
             await query.answer()
-            if not await self.queue_manager.route_to_open_queue(queue_id):
+            outcome = await self.queue_manager.route_to_open_queue(queue_id)
+            if outcome == 'ok':
+                # Every choice on this message is now spent. route_to_open_queue
+                # already sent queue_added, so only the keyboard needs to go.
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                return
+            if outcome == 'post_failed':
+                # The one real fault. The buttons are deliberately LEFT live: routing
+                # reverted to 'choosing', so the same tap is a valid retry.
                 try:
                     await context.bot.send_message(chat_id=user_id,
                                                    text=MESSAGES["channel_error"])
                 except Exception as exc:
                     logger.warning("Could not report the channel error to %s: %s",
                                    user_id, exc)
+                return
+            # 'already_open' / 'gone': a repeat or stale tap. Tell them where their
+            # request actually stands -- "the system is down" would send somebody
+            # whose request is live in the channel off to retype it or give up.
+            text = (self._open_request_status_text(user_id)
+                    if self.queue_manager.get_queue_entry(queue_id) is not None
+                    else MESSAGES["directed_gone"])
+            await self._send_or_edit(query, context, user_id, text)
             return
 
         if data.startswith(CB_PICK_LIST + ":"):
             await query.answer()
+            if (entry.get('routing') or 'open') == 'open':
+                # A stale 'A specific peer supporter' / 'Choose someone else' button on
+                # a request that is already in the channel. Rendering a list here would
+                # invite a choice that can no longer happen.
+                picker_views.pop(user_id, None)
+                await self._send_or_edit(query, context, user_id,
+                                         self._open_request_status_text(user_id))
+                return
             try:
                 page = int(data.split(":", 1)[1])
             except (IndexError, TypeError, ValueError):
