@@ -144,7 +144,7 @@ Replace `heartfelt-bot` with your container name if it differs. Changes propagat
 Share this link with prospective supporters:
 
 ```
-https://t.me/hearhtfelt_companion_bot?start=register
+https://t.me/carenetwork_bot?start=register
 ```
 
 Tapping it opens the bot and starts registration directly. `/register` is

@@ -86,8 +86,20 @@ Both tracks are enabled on the **production** bot:
 
 | Track | Channel | Members |
 |-------|---------|---------|
-| HF | `-1002825528485` ("HeaRHtfelt Companion Queue") | 14 (real) |
-| PSS | `-1004439634374` ("HeartfeltPeer Test") | 1 — **test only** |
+| HF | `-1004353592462` ("HeaRHtfelt Queue") | 14 (real) |
+| PSS | `-1004439634374` ("PSS Queue") | 2 — one is a **test** account |
+
+- **The bot is `@carenetwork_bot`** ("Care Network Bot", id `8838885991`) since
+  2026-09-30. Telegram does not let a bot's @username change, so the rename to
+  Care Network was done by creating a new bot and swapping `BOT_TOKEN` in the
+  droplet `.env`; the old `@hearhtfelt_companion_bot` token is kept there
+  commented out as `#OLD_BOT_TOKEN(...)`, and the old HF channel
+  (`-1002825528485`) likewise as `#OLD_ADMIN_CHANNEL_ID`. Every
+  `has_started_bot` flag was reset at the swap, because "has pressed Start"
+  was true of the OLD bot only: every supporter must press Start on
+  `@carenetwork_bot` before the bot can DM them (R10). Nothing polls the old
+  token any more, so a message to the old handle gets no reply -- point
+  people at the new one (BotFather description on the old bot).
 
 - **PSS is in TEST mode.** `.env` on the droplet has
   `PSS_CHANNEL_ID=-1004439634374` and `PSS_ENABLED=true`. The `peer_supporters`
@@ -414,7 +426,7 @@ session document; `active_sessions` has never carried one. With Mongo down,
 could be shown. If Mongo is down and a supporter genuinely cannot continue, the
 conversation will idle-expire on its own timer.
 
-**R13 (link: `https://t.me/hearhtfelt_companion_bot?start=register` -- the only discovery route; `/register` is not in the command menu by design) — `/register` is inert until `REGISTRATION_ADMIN_IDS` is set, and every id on
+**R13 (link: `https://t.me/carenetwork_bot?start=register` -- the only discovery route; `/register` is not in the command menu by design) — `/register` is inert until `REGISTRATION_ADMIN_IDS` is set, and every id on
 it must have pressed /start.** The env var is a comma-separated list of positive
 Telegram **user** ids; a negative id is a channel id, is rejected, and is logged at
 boot as an unusable entry (a channel would have been DMed the applicant's real name,
@@ -526,7 +538,9 @@ specific, most actionable one):
    apostrophes) — can't look like a phone number.
 7. Letters, numbers, spaces, emoji/symbol characters and only `- ' .` as
    punctuation (parentheses are deliberately excluded — that's what makes the
-   " (2)" collision suffix unforgeable). Combining-mark stacks of 3+ are
+   " (2)" collision suffix unforgeable; brackets are also refused in the
+   NFKC-folded form, so a symbol that merely *renders* as "(2)", such as "⑵",
+   cannot forge it either). Combining-mark stacks of 3+ are
    rejected as Zalgo text.
 8. Not purely numeric (people pick from the list by typing a number).
 9. At least one letter.
@@ -773,11 +787,13 @@ git log --oneline 38673d9..HEAD
    Left as-is for this branch: changing it is a behavioural change to those
    three commands for people who currently get *some* response, and wasn't in
    this feature's scope.
-7. **`pk_s:<id>` callback data carries a supporter's Telegram id in plaintext**
-   (pre-existing, `CB_PICK_SELECT`, `src/bot/handlers.py`). Anyone who can read
-   a requester's Telegram client can see which internal id they tapped. Not
-   new to this branch, but the specific-supporter picker is the first feature
-   that puts a supporter id on a button a requester holds.
+7. **Fixed: pick buttons no longer carry a Telegram id.** They used to be
+   `pk_s:<telegram_id>`, readable by any modified client, which tied every
+   `/name` pseudonym to a real account. They are now `pk_s:<nonce>:<number>`:
+   a per-render nonce plus the on-screen number, resolved only against the
+   list the requester was last shown for that request (`picker_views`), the
+   same rule typed numbers follow. A button from an earlier render, an earlier
+   request or before a restart re-shows the current list and selects nobody.
 8. **Evan's dual HF/PSS membership** (§4) predates the "membership is
    exclusive" rule and hasn't been reconciled. Decide whether he stays HF-only,
    PSS-only, or genuinely both (which would need the exclusivity assumption
