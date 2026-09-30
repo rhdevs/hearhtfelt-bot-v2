@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import re
 import config
 from config import ServiceType, UserState
 from src.timeutil import UTC, utcnow
@@ -278,6 +279,37 @@ def text_update(user_id, text, rec, username=None, chat_type="private"):
     msg = SimpleNamespace(text=text, reply_text=reply_text, photo=[], sticker=None)
     return SimpleNamespace(effective_user=user, message=msg, callback_query=None,
                            effective_chat=SimpleNamespace(id=user_id, type=chat_type))
+
+
+def pick_data(user_id, member_id):
+    """The callback_data of `member_id`'s button on the list `user_id` was last shown.
+
+    Picker buttons carry an opaque per-render token, never an id, so a test cannot
+    hand-write one: it is read back from the view the bot recorded, exactly as the
+    bot will resolve it. With no view, or a member not on it, this returns a token
+    that cannot resolve -- which is what a stale or hand-crafted tap looks like.
+    """
+    view = config.picker_views.get(user_id)
+    if view is None or member_id not in (view.get('ids') or []):
+        return "pk_s:stale:0"
+    return "pk_s:%s:%d" % (view['nonce'], view['ids'].index(member_id) + 1)
+
+
+def button_members(user_id, markup):
+    """Member ids behind the pick buttons on `markup`, resolved through the view the
+    bot recorded for `user_id` -- the only place the id lives. Also asserts every
+    pick button is opaque: pk_s:<8 hex nonce>:<number>, with the view's nonce."""
+    view = config.picker_views.get(user_id) or {}
+    out = []
+    for row in markup.inline_keyboard:
+        for b in row:
+            if not b.callback_data.startswith("pk_s:"):
+                continue
+            m = re.fullmatch(r"pk_s:([0-9a-f]{8}):(\d+)", b.callback_data)
+            assert m, ("pick buttons must be opaque", b.callback_data)
+            assert m.group(1) == view.get('nonce'), (b.callback_data, view)
+            out.append(view['ids'][int(m.group(2)) - 1])
+    return out
 
 
 def cb_update(user_id, data, rec, username="mem", first="Mem"):
@@ -563,7 +595,7 @@ async def case_h_a_tap_sends_one_dm_and_one_contentless_note():
 
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
 
     assert stub.count('direct_session') == 1, stub.calls
     dms = [s for s in bot.sent if s[0] == str(supporter_id(0))]
@@ -628,7 +660,7 @@ async def case_i_a_double_tap_sends_exactly_one_dm():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
 
-    tap = "pk_s:%d" % supporter_id(0)
+    tap = pick_data(REQUESTER, supporter_id(0))
     await asyncio.gather(
         handlers.handle_callback_query(cb_update(REQUESTER, tap, rec), ctx),
         handlers.handle_callback_query(cb_update(REQUESTER, tap, rec), ctx),
@@ -674,7 +706,7 @@ async def case_j_a_failed_dm_rolls_everything_back():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
 
     entry = config.queue_entries[queue_id]
     assert entry['routing'] == 'choosing', (
@@ -693,8 +725,7 @@ async def case_j_a_failed_dm_rolls_everything_back():
         "an unreachable chat reads EXACTLY like busy, so the reason never shows", text)
     assert "1. Sup 00 (busy)" in text and "2. Sup 01" in text, text
     assert "2. Sup 01 (busy)" not in text, text
-    datas = [b.callback_data for row in markup.inline_keyboard for b in row]
-    assert "pk_s:%d" % supporter_id(0) not in datas, datas
+    assert supporter_id(0) not in button_members(REQUESTER, markup), markup
 
     # THE REQUESTER MUST BE PUT BACK TOO. send_directed_request moves them to
     # IN_QUEUE before the await; a rollback that returns the ROW to 'choosing' but
@@ -738,7 +769,7 @@ async def case_k_accept_by_a_non_target_is_refused():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
 
     before_claims = stub.count('claim_session')
     outcome, requester_id = await qm.accept_directed(queue_id, supporter_id(1), "Nope")
@@ -764,7 +795,7 @@ async def case_l_accept_by_the_target_starts_the_conversation():
     anon = config.queue_entries[queue_id]['anonymous_id']
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     dm_message_id = config.queue_entries[queue_id]['directed_message_id']
 
     await handlers.handle_callback_query(
@@ -796,7 +827,7 @@ async def case_m_a_channel_claim_button_cannot_take_a_directed_request():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
 
     before = stub.count('claim_session')
     await handlers.handle_callback_query(
@@ -815,7 +846,7 @@ async def case_n_a_decline_hands_the_choice_back_exactly_once():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     before_to_requester = len(bot.texts_to(REQUESTER))
 
     await handlers.handle_callback_query(
@@ -847,12 +878,12 @@ async def case_o_nothing_the_requester_reads_mentions_a_decline():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     await handlers.handle_callback_query(
         cb_update(supporter_id(0), "dr_d:%s" % queue_id, rec), ctx)
     # ... and a lapse on the next one, so both outcomes are in the scan.
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(1), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(1)), rec), ctx)
     config.queue_entries[queue_id]['directed_at'] = (
         utcnow() - datetime.timedelta(minutes=1441))
     await qm.sweep_directed_requests()
@@ -879,7 +910,7 @@ async def case_p_a_repick_never_offers_the_decliner_again():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     await handlers.handle_callback_query(
         cb_update(supporter_id(0), "dr_d:%s" % queue_id, rec), ctx)
 
@@ -889,15 +920,14 @@ async def case_p_a_repick_never_offers_the_decliner_again():
     assert "2. Sup 01\n" in text and "3. Sup 02\n" in text, text
     assert config.picker_views[REQUESTER]['ids'] == [
         supporter_id(0), supporter_id(1), supporter_id(2)]
-    selects = [b.callback_data for row in markup.inline_keyboard for b in row
-               if b.callback_data.startswith("pk_s:")]
-    assert selects == ["pk_s:%d" % supporter_id(1), "pk_s:%d" % supporter_id(2)], selects
+    selects = button_members(REQUESTER, markup)
+    assert selects == [supporter_id(1), supporter_id(2)], selects
 
     # A stale (or forged) button for the decliner, through the real handler.
     before_direct = stub.count('direct_session')
     before_dms = len(bot.texts_to(supporter_id(0)))
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     assert stub.count('direct_session') == before_direct, stub.calls
     assert len(bot.texts_to(supporter_id(0))) == before_dms, "no second DM to them"
     note = config.MESSAGES["picker_busy"].format(name="Sup 00")
@@ -922,7 +952,7 @@ async def case_q_a_lapsed_request_comes_back_after_the_window():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
 
     # Still inside the window: nothing happens.
     config.queue_entries[queue_id]['directed_at'] = (
@@ -953,7 +983,7 @@ async def case_r_a_second_sweep_sends_nothing():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     config.queue_entries[queue_id]['directed_at'] = (
         utcnow() - datetime.timedelta(minutes=1441))
     await qm.sweep_directed_requests()
@@ -976,7 +1006,7 @@ async def case_s_a_bot_that_was_down_for_days_messages_nobody():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
 
     # Three days pass with the container down.
     config.queue_entries[queue_id]['directed_at'] = (
@@ -1049,7 +1079,7 @@ async def case_v_ask_anyone_from_directed_tidies_up_before_it_posts():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     dm_message_id = config.queue_entries[queue_id]['directed_message_id']
     sent_before = len(bot.sent)
 
@@ -1077,7 +1107,7 @@ async def case_w_cancelling_a_directed_request_tidies_the_supporter_up():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     dm_message_id = config.queue_entries[queue_id]['directed_message_id']
 
     await handlers.cancel_command(text_update(REQUESTER, "/cancel", rec), ctx)
@@ -1105,7 +1135,7 @@ async def case_x_expiry_skips_directed_and_uses_the_right_words_for_choosing():
     directed_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     config.queue_entries[directed_id]['waiting_since'] = (
         utcnow() - datetime.timedelta(minutes=5000))
 
@@ -1202,7 +1232,7 @@ async def case_z_availability_hides_the_busy_and_the_already_asked():
     queue_id = config.user_to_queue_map[REQUESTER]
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
 
     remaining = [p.telegram_id for p in config.available_supporters("pss")]
     assert remaining == [supporter_id(1)], remaining
@@ -1370,8 +1400,9 @@ async def case_ac_an_unusable_directed_clock_waits_instead_of_vanishing():
     ctx = ctx_for(bot)
     await ask_for_help(handlers, rec, ctx)
     queue_id = config.user_to_queue_map[REQUESTER]
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     entry = config.queue_entries[queue_id]
     assert entry['routing'] == 'directed'
 
@@ -1472,7 +1503,7 @@ async def case_ad_directed_off_means_no_fork_and_no_list():
 
     before = stub.count('direct_session')
     await handlers.handle_callback_query(
-        cb_update(other, "pk_s:%d" % supporter_id(0), rec2), ctx)
+        cb_update(other, pick_data(other, supporter_id(0)), rec2), ctx)
     assert stub.count('direct_session') == before, stub.calls
     assert not bot.texts_to(supporter_id(0)), "the kill switch DMs nobody"
     assert "Sup" not in rec2.replies[-1][0], rec2.replies[-1][0]
@@ -1502,7 +1533,7 @@ async def case_ae_the_requesters_own_entry_never_counts_or_shows():
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     text, markup = rec.replies[-1]
     assert "Sup 00" in text and "Rae" not in text, text
-    assert "pk_s:%d" % REQUESTER not in callback_datas(markup)
+    assert REQUESTER not in button_members(REQUESTER, markup)
     assert config.picker_views[REQUESTER]['ids'] == [supporter_id(0)]
     print("OK  ae. the requester never counts towards the fork and never sees themselves")
 
@@ -1567,14 +1598,14 @@ async def case_ag_every_busy_reason_looks_the_same():
         "%d. Sup %02d (busy)" % (k + 1, k) for k in range(1, 7)], list_lines(text)
     for word in REASON_WORDS:
         assert word not in text.lower(), (word, text)
-    selects = [d for d in callback_datas(markup) if d.startswith("pk_s:")]
-    assert selects == ["pk_s:%d" % supporter_id(0)], selects
+    selects = button_members(REQUESTER, markup)
+    assert selects == [supporter_id(0)], selects
 
     for k in range(1, 7):
         member = supporter_id(k)
         before_direct = stub.count('direct_session')
         await handlers.handle_callback_query(
-            cb_update(REQUESTER, "pk_s:%d" % member, rec), ctx)
+            cb_update(REQUESTER, pick_data(REQUESTER, member), rec), ctx)
         assert stub.count('direct_session') == before_direct, (k, stub.calls)
         assert not bot.texts_to(member), (k, bot.texts_to(member))
         reply = rec.replies[-1][0]
@@ -1586,7 +1617,7 @@ async def case_ag_every_busy_reason_looks_the_same():
     # A DM that fails is one more reason, and it reads EXACTLY like the others.
     bot.fail_for[str(supporter_id(0))] = "Forbidden: bot was blocked by the user"
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     reply = rec.replies[-1][0]
     assert reply.split("\n\n")[0] == config.MESSAGES["picker_busy"].format(
         name="Sup 00"), reply
@@ -1629,7 +1660,7 @@ async def case_ah_names_come_from_telegram_collide_visibly_and_are_escaped():
     labels = [b.text for row in markup.inline_keyboard for b in row]
     assert "4. O'Brien" in labels, labels
 
-    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_s:3004", rec), ctx)
+    await handlers.handle_callback_query(cb_update(REQUESTER, pick_data(REQUESTER, 3004), rec), ctx)
     sent = rec.replies[-1][0]
     assert sent.startswith(config.MESSAGES["directed_sent"].split("{")[0]), sent
     assert "O&#x27;Brien" in sent, sent
@@ -1748,7 +1779,7 @@ async def case_ak_a_restart_at_the_list_never_guesses_and_keeps_busy_honest():
     assert "3. Sup 02 (busy)" in reply, reply
 
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     assert stub.count('direct_session') == before + 1, stub.calls
     assert len(bot.texts_to(supporter_id(0))) == 1, bot.texts_to(supporter_id(0))
     print("OK  ak. a restart at the list never guesses, and the restored busy stay busy")
@@ -1808,7 +1839,7 @@ async def case_am_a_stale_specific_tap_after_anyone_shows_status_not_the_list():
     assert status in requester_texts(bot, rec), requester_texts(bot, rec)
 
     await handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx)
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     assert stub.count('direct_session') == n, stub.calls
     assert len(bot.texts_to(supporter_id(0))) == dm_before, bot.texts_to(supporter_id(0))
     assert config.queue_entries[queue_id]['routing'] == 'open'
@@ -1830,7 +1861,7 @@ async def _start_pick_in_a_window(gate_chat, match=None, fail_dm=False):
         bot.fail_for[str(supporter_id(0))] = "Forbidden: bot was blocked by the user"
     reached, release = hold_next_send(bot, gate_chat, match)
     pick = asyncio.create_task(handlers.handle_callback_query(
-        cb_update(REQUESTER, "pk_s:%d" % supporter_id(0), rec), ctx))
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx))
     await asyncio.wait_for(reached.wait(), 5)
     assert config.queue_entries[queue_id]['routing'] == 'directed', \
         "the interleaved update must land INSIDE the directed window"
@@ -1991,6 +2022,63 @@ async def case_aq_a_note_posted_during_an_accept_or_anyone_is_closed_with_the_ri
     print("OK  aq. a note posted during an Accept or a reroute closes with the right words")
 
 
+async def case_ar_a_pick_button_only_works_on_the_list_it_came_from():
+    """Pick buttons are opaque and bound to ONE render of ONE request.
+
+    They used to carry pk_s:<telegram_id>. Any modified client can read
+    callback_data, so every listed pseudonym came with its real account id; and
+    because the id resolved against whatever request the student had NOW, a button
+    kept from an old list -- before a supporter renamed themselves with /name --
+    answered with the new name and tied the two together. A token from anything
+    but the list on screen must select nobody and name nobody.
+    """
+    bot, sm, qm, handlers, stub = setup(supporters=2)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    _text, markup = rec.replies[-1]
+    # button_members also asserts the pk_s:<8-hex nonce>:<n> shape of every button.
+    assert button_members(REQUESTER, markup) == [supporter_id(0), supporter_id(1)]
+    old_token = pick_data(REQUESTER, supporter_id(0))
+
+    # A re-render issues a new nonce: the old button is dead.
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    nonce = config.picker_views[REQUESTER]['nonce']
+    assert pick_data(REQUESTER, supporter_id(0)) != old_token
+
+    for data in (old_token,                        # an earlier render
+                 "pk_s:%d" % supporter_id(0),       # the old id format
+                 "pk_s:%s:99" % nonce,              # off the list
+                 "pk_s:%s:0" % nonce,
+                 "pk_s:"):
+        before = stub.count('direct_session')
+        await handlers.handle_callback_query(cb_update(REQUESTER, data, rec), ctx)
+        assert stub.count('direct_session') == before, (data, stub.calls)
+        assert config.queue_entries[queue_id]['routing'] == 'choosing', data
+        text = rec.replies[-1][0]
+        assert text.startswith(config.MESSAGES["picker_lost_view"]), (data, text)
+        assert not bot.texts_to(supporter_id(0)), data
+
+    # A button kept from a CANCELLED request does nothing on the next one.
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_x", rec), ctx)
+    await ask_for_help(handlers, rec, ctx)
+    new_queue = config.user_to_queue_map[REQUESTER]
+    assert new_queue != queue_id
+    await handlers.handle_callback_query(cb_update(REQUESTER, old_token, rec), ctx)
+    assert config.queue_entries[new_queue]['routing'] == 'choosing'
+    assert not bot.texts_to(supporter_id(0))
+
+    # And the live token still works.
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(1)), rec), ctx)
+    assert config.queue_entries[new_queue]['routing'] == 'directed'
+    assert config.queue_entries[new_queue]['target_member_id'] == supporter_id(1)
+    print("OK  ar. a pick button is opaque and only works on the list it came from")
+
+
 # --------------------------------------------------------------------------- runner
 CASES = [
     case_a_fork_appears_and_nothing_reaches_the_channel,
@@ -2035,6 +2123,7 @@ CASES = [
     case_ao_cancel_during_a_failing_dm_stays_cancelled,
     case_ap_anyone_during_a_landed_dm_retires_it_and_posts_no_note,
     case_aq_a_note_posted_during_an_accept_or_anyone_is_closed_with_the_right_words,
+    case_ar_a_pick_button_only_works_on_the_list_it_came_from,
 ]
 
 
@@ -2052,8 +2141,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 42, (
-        "expected at least 42 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 43, (
+        "expected at least 43 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

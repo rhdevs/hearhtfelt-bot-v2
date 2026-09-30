@@ -1126,9 +1126,12 @@ async def case_ah_the_list_after_a_restart_marks_the_busy_without_saying_why():
         for name in ("Ann", "Ben", "Dee"):
             assert "%s (busy)" % name in text, (name, text)
         assert "Cat" in text and "Cat (busy)" not in text, text
-        selects = [b.callback_data for row in markup.inline_keyboard for b in row
-                   if b.callback_data.startswith("pk_s:")]
-        assert selects == ["pk_s:2103"], selects
+        # Pick buttons are opaque (pk_s:<nonce>:<n>); the id lives only in the view.
+        view = config.picker_views[fu.id]
+        selects = [view['ids'][int(b.callback_data.rsplit(":", 1)[1]) - 1]
+                   for row in markup.inline_keyboard for b in row
+                   if b.callback_data.startswith("pk_s:%s:" % view['nonce'])]
+        assert selects == [2103], selects
         lines = [l for l in text.split("\n") if l[:1].isdigit()]
         assert len(lines) == 4, lines
         for line in lines:

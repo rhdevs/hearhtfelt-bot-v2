@@ -2,6 +2,7 @@ import datetime
 import html
 import logging
 import re
+import secrets
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CallbackContext
@@ -1741,10 +1742,16 @@ class BotHandlers:
             # Nobody can be picked, so the way forward goes first, where it is seen.
             rows.append(anyone_row)
         # Buttons for the FREE only. Button text is plain -- no parse mode applies.
+        # callback_data is OPAQUE: a per-render nonce plus the on-screen number, never
+        # a Telegram id. callback_data is readable by any modified client, and an id
+        # there would tie every /name pseudonym to a real account. The nonce also
+        # makes a button from an earlier render (or an earlier request) dead: it can
+        # only ever resolve against the list the requester is looking at now.
+        nonce = secrets.token_hex(4)
         rows.extend(
             [InlineKeyboardButton(f"{number}. {label}"[:60],
-                                  callback_data=f"{CB_PICK_SELECT}:{profile.telegram_id}")]
-            for number, (profile, label, free) in enumerate(chunk, start=1) if free)
+                                  callback_data=f"{CB_PICK_SELECT}:{nonce}:{number}")]
+            for number, (_profile, label, free) in enumerate(chunk, start=1) if free)
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton(MESSAGES["picker_back_button"],
@@ -1765,6 +1772,7 @@ class BotHandlers:
             'queue_id': queue_id,
             'page': page,
             'ids': [profile.telegram_id for profile, _label, _free in chunk],
+            'nonce': nonce,
             'rendered_at': utcnow(),
         }
 
@@ -1809,7 +1817,7 @@ class BotHandlers:
         await self._choose_supporter(None, context, user_id, queue_id, ids[number - 1])
 
     async def _handle_picker_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """pk_o / pk_l:<page> / pk_s:<member_id> / pk_x, all from the requester."""
+        """pk_o / pk_l:<page> / pk_s:<nonce>:<number> / pk_x, all from the requester."""
         query = update.callback_query
         user_id = query.from_user.id
         data = query.data or ""
@@ -1882,13 +1890,29 @@ class BotHandlers:
             await self._render_picker(query, context, user_id, queue_id, page)
             return
 
-        # CB_PICK_SELECT
+        # CB_PICK_SELECT: pk_s:<nonce>:<number>. Resolved ONLY against the view this
+        # requester was last shown for THIS request -- the same rule a typed number
+        # follows. Anything else (a button from an older render, an older request,
+        # a restart, or hand-crafted data) re-renders the current list: it never
+        # selects anybody, and it never names anybody the requester cannot see.
         await query.answer()
+        view = picker_views.get(user_id)
+        member_id = None
         try:
-            member_id = int(data.split(":", 1)[1])
-        except (IndexError, TypeError, ValueError):
-            await self._render_picker(query, context, user_id, queue_id, 0,
-                                      MESSAGES["picker_not_a_number"])
+            _prefix, nonce, number = data.split(":", 2)
+            number = int(number)
+        except (TypeError, ValueError):
+            nonce, number = None, 0
+        if (view is not None and view.get('queue_id') == queue_id
+                and nonce and view.get('nonce') == nonce):
+            ids = view.get('ids') or []
+            if 1 <= number <= len(ids):
+                member_id = ids[number - 1]
+        if member_id is None:
+            page = (view.get('page', 0)
+                    if view is not None and view.get('queue_id') == queue_id else 0)
+            await self._render_picker(query, context, user_id, queue_id, page,
+                                      MESSAGES["picker_lost_view"])
             return
         await self._choose_supporter(query, context, user_id, queue_id, member_id)
 

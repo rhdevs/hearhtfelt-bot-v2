@@ -658,7 +658,7 @@ AUTHORIZED_MEMBER_REFRESH_SECONDS = 300  # Interval for refreshing Heartfelt mem
 # user_to_queue_map[user_id] and then validates that the entry is theirs.
 CB_PICK_OPEN = "pk_o"      # "ask anyone who's free"
 CB_PICK_LIST = "pk_l"      # pk_l:<page>
-CB_PICK_SELECT = "pk_s"    # pk_s:<member_id>
+CB_PICK_SELECT = "pk_s"    # pk_s:<nonce>:<number> -- opaque, never an id
 CB_PICK_CANCEL = "pk_x"    # cancel my request
 CB_DIRECT_ACCEPT = "dr_a"  # dr_a:<session_id>, targeted supporter only
 CB_DIRECT_DECLINE = "dr_d" # dr_d:<session_id>, targeted supporter only
