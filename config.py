@@ -1,4 +1,5 @@
 import dataclasses
+import unicodedata
 import os
 import threading
 from dataclasses import dataclass, field
@@ -536,6 +537,13 @@ class Service:
     # only; HF MUST stay False, which is what keeps HF byte-identical. Last, and
     # defaulted, for the same reason as everything above.
     supporter_names: bool = False
+    # True => this track is NOT anonymous. The requester's Telegram name and
+    # @username stand in for the "RHesident #1234" id everywhere that id is shown
+    # (channel post, directed DM, claim notice, every relayed message), and the
+    # requester sees their supporter's name. PSS only (2026-11-01: "for PSS, don't
+    # need to hide identities ... so the support people know who they are helping").
+    # HF MUST stay False -- that is what keeps HF anonymous and byte-identical.
+    identified: bool = False
 
     @property
     def runnable(self) -> bool:
@@ -578,6 +586,21 @@ PSS_DIRECTED_ENABLED_DEFAULT = False
 # did not agree to their words going to the whole team.
 PSS_DIRECTED_RESPONSE_MINUTES_DEFAULT = 60
 
+# PSS is NOT anonymous (2026-11-01): supporters see who they are helping, and the
+# requester is told so BEFORE they describe anything (the sharing clause below).
+# PSS_IDENTIFIED=false puts NEW PSS requests back on anonymous ids without a code
+# change. Requests already made while it was true keep the name they were made with
+# (their requesters were told it would be shared). Read at import, so the container
+# must be RECREATED for a change to take effect.
+PSS_IDENTIFIED = _env_bool("PSS_IDENTIFIED", True)
+
+# What the requester is told their description goes with. The identified wording is
+# the consent: it is shown before they type a word.
+PSS_SHARING_CLAUSE = (
+    "shared with our peer student supporters, together with your Telegram name and "
+    "username, so they know who they're supporting"
+    if PSS_IDENTIFIED else "shared with our peer student supporters")
+
 SERVICES: Dict[str, Service] = {
     ServiceType.HF.value: Service(
         key=ServiceType.HF.value,
@@ -607,7 +630,7 @@ SERVICES: Dict[str, Service] = {
         default_members=DEFAULT_PSS_MEMBERS,
         roster=AuthorizedMembersStore(DEFAULT_PSS_MEMBERS),
         enabled=_env_bool("PSS_ENABLED", False),  # False in Phase 1
-        sharing_clause="shared with our peer student supporters",
+        sharing_clause=PSS_SHARING_CLAUSE,
         privacy_policy_url=PSS_PRIVACY_POLICY_URL,
         queue_expire_minutes=1440,     # 24h: peer supporters answer on a student timetable
         session_timeout_minutes=1440,  # 24h
@@ -622,6 +645,7 @@ SERVICES: Dict[str, Service] = {
         closing_extra=PSS_CLOSING_NOTE,
         closing_extra_member=PSS_FOLLOWUP_NOTE,
         supporter_names=True,
+        identified=PSS_IDENTIFIED,
     ),
 }
 
@@ -786,6 +810,12 @@ MESSAGES = {
     ),
     "queue_added": "Thank you. You've been added to the queue. A support member will be with you shortly.",
     "conversation_started": "A support member has joined the conversation. You can now chat anonymously.",
+    # Identified tracks only (PSS). {name} is the supporter's listed name. Plain text.
+    "conversation_started_named": "{name} from the peer support team has joined the conversation. You can now chat.",
+    "conversation_started_identified": "A peer supporter has joined the conversation. You can now chat.",
+    # Prefixed to directed_request on identified tracks only. HTML: {who} is escaped by
+    # the caller.
+    "directed_request_from": "From: {who}\n\n",
     "conversation_ended": "The conversation has ended. Thank you for using the Care Network. Take care! 💚",
     "conversation_ended_heartfelt": "This conversation has ended. Thank you for helping someone today! 💚",
     "no_active_conversation": "You don't have an active conversation to end.",
@@ -1024,8 +1054,10 @@ MESSAGES = {
         "free at any time."
     ),
     # Sent to the TARGETED SUPPORTER. HTML parse mode: {description} is escaped by the
-    # caller. Carries NO requester name, username, Telegram id or anonymous id -- the
-    # anonymous id is withheld until the conversation actually starts.
+    # caller. On an anonymous track it carries NO requester name, username, Telegram
+    # id or anonymous id -- the anonymous id is withheld until the conversation
+    # actually starts. On an identified track (PSS) directed_request_from is
+    # prefixed, naming the requester.
     "directed_request": (
         "Someone has asked to talk to you.\n\n"
         "\"{description}\"\n\n"
@@ -1471,6 +1503,62 @@ def directed_fork_offered(service_key: str, requester_id) -> bool:
         return False
     return any(p.telegram_id != requester_id
                for p, _label in listable_supporters(svc.key))
+
+
+REQUESTER_IDENTITY_MAX = 80
+
+
+def requester_identity(first_name, last_name=None, username=None) -> str:
+    """How a requester is shown on an identified track: "First Last (@username)".
+
+    ONE LINE, always: control characters (newlines included) become spaces, so a
+    Telegram name cannot forge extra lines such as "Description: ..." in the
+    channel post. Capped, so a 64-character first + last name cannot crowd out the
+    request. "" when there is nothing usable -- the caller then falls back to an
+    anonymous id rather than posting a blank "From:".
+    """
+    def clean(value) -> str:
+        # NFKC folds fullwidth "＠" / "＃" onto "@" / "#" so the strip below
+        # catches look-alikes; strip_invisible drops blank-rendering characters
+        # (Hangul filler and friends) so an all-blank name falls back to an id
+        # instead of a "From:" with nothing after it.
+        text = unicodedata.normalize("NFKC", str(value or ""))
+        text = "".join(ch if ch.isprintable() else " " for ch in strip_invisible(text))
+        return " ".join(text.split())
+
+    name = " ".join(part for part in (clean(first_name), clean(last_name)) if part)
+    # "@" and "#" belong to the handle and the anonymous ids. In the NAME they could
+    # forge one -- "Ren (@someoneelse)" with no username reads exactly like a real
+    # handle -- so they are dropped from it.
+    name = " ".join(name.replace("@", " ").replace("#", " ").split())
+    if len(name) > REQUESTER_IDENTITY_MAX:
+        name = name[:REQUESTER_IDENTITY_MAX - 1].rstrip() + "\u2026"
+    handle = clean(username).lstrip("@")
+    if handle and " " not in handle:
+        return f"{name} (@{handle})" if name else f"@{handle}"
+    return name
+
+
+def identified_services() -> List["Service"]:
+    """Runnable tracks that are NOT anonymous."""
+    return [s for s in SERVICES.values() if s.runnable and s.identified]
+
+
+def welcome_text() -> str:
+    """The /start text. Byte-identical to MESSAGES["welcome"] unless a runnable track
+    is identified -- then its blanket anonymity promises would be false for that
+    track, so they are narrowed to the tracks that keep them."""
+    text = MESSAGES["welcome"]
+    if not identified_services():
+        return text
+    text = text.replace("This is a safe, anonymous space", "This is a safe space")
+    text = text.replace("will connect with you anonymously", "will connect with you")
+    text = text.replace(
+        "🔒 Complete anonymity guaranteed",
+        "🔒 HeaRHtfelt chats are anonymous. With PSS, your Telegram name and "
+        "username are shared with the peer supporters so they know who they're "
+        "helping")
+    return text
 
 
 def help_request_text(service_key: Optional[str]) -> str:

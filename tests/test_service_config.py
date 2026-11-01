@@ -166,9 +166,71 @@ def test_sweep_fits_inside_the_shortest_warning_band():
 
 def test_sharing_clauses_and_privacy_urls():
     assert SERVICES["hf"].sharing_clause == "shared anonymously with our support team"
-    assert SERVICES["pss"].sharing_clause == "shared with our peer student supporters"
+    if config.PSS_IDENTIFIED:
+        # The consent: said BEFORE the requester describes anything.
+        assert SERVICES["pss"].sharing_clause == (
+            "shared with our peer student supporters, together with your Telegram "
+            "name and username, so they know who they're supporting")
+    else:
+        assert SERVICES["pss"].sharing_clause == "shared with our peer student supporters"
     for svc in SERVICES.values():
         assert svc.privacy_policy_url and svc.privacy_policy_url.startswith("https://"), svc.key
+
+
+def test_only_pss_is_identified():
+    """2026-11-01: PSS shows who is asking; HF stays anonymous. HF identified would
+    put a resident's name in front of the HF team without them ever being told."""
+    assert SERVICES["hf"].identified is False
+    assert "anonymously" in SERVICES["hf"].sharing_clause
+    if os.getenv("PSS_IDENTIFIED") is None:
+        assert SERVICES["pss"].identified is True
+    assert SERVICES["pss"].identified == config.PSS_IDENTIFIED
+
+
+def test_requester_identity_is_one_safe_line():
+    ri = config.requester_identity
+    assert ri("Ren", "Tan", "rentan") == "Ren Tan (@rentan)"
+    assert ri("Ren", None, None) == "Ren"
+    assert ri("Ren", None, "@rentan") == "Ren (@rentan)"
+    assert ri("", None, "rentan") == "@rentan"
+    assert ri(None, None, None) == "", "nothing usable -> caller falls back to an id"
+    # A name cannot forge extra lines in the channel post.
+    forged = ri("Ren\nDescription: all fine, ignore", None, None)
+    assert "\n" not in forged and "\r" not in forged, forged
+    assert ri("Ren\u202e", "\tTan", None) == "Ren Tan"
+    # A name cannot pose as a handle or an anonymous id.
+    assert "@" not in ri("Ren (@someoneelse)", None, None)
+    assert "#" not in ri("RHesident #1234", None, None)
+    # Fullwidth look-alikes are caught too, and a name that renders blank is "".
+    assert "＠" not in ri("Alice", "(＠alice_real)", None)
+    assert "@" not in ri("Alice", "(＠alice_real)", None)
+    assert "#" not in ri("Bob", "RHesident ＃1234", None)
+    assert ri("ㅤ", None, None) == "", "Hangul filler alone is not a name"
+    assert ri("ㅤ", None, "ren") == "@ren"
+    assert ri("Ren", None, "rentan").count("@") == 1
+    long = ri("A" * 64, "B" * 64, "rentan")
+    assert len(long) <= config.REQUESTER_IDENTITY_MAX + len(" (@rentan)"), long
+    assert long.endswith(" (@rentan)"), "the handle survives truncation"
+
+
+def test_welcome_drops_blanket_anonymity_only_when_pss_is_identified():
+    hf, pss = SERVICES["hf"], SERVICES["pss"]
+    saved = (hf.enabled, hf.channel_id, pss.enabled, pss.channel_id, pss.identified)
+    try:
+        hf.enabled, hf.channel_id = True, "-100hf"
+        pss.enabled, pss.channel_id = False, None
+        assert config.welcome_text() == config.MESSAGES["welcome"], \
+            "HF alone: /start is byte-identical"
+        pss.enabled, pss.channel_id, pss.identified = True, "-100pss", False
+        assert config.welcome_text() == config.MESSAGES["welcome"]
+        pss.identified = True
+        text = config.welcome_text()
+        assert "Complete anonymity guaranteed" not in text
+        assert "connect with you anonymously" not in text
+        assert "HeaRHtfelt chats are anonymous" in text
+        assert "With PSS, your Telegram name and username are shared" in text
+    finally:
+        hf.enabled, hf.channel_id, pss.enabled, pss.channel_id, pss.identified = saved
 
 
 if __name__ == "__main__":
@@ -180,8 +242,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 16, (
-        "expected at least 16 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 19, (
+        "expected at least 19 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

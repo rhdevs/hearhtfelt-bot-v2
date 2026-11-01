@@ -80,7 +80,8 @@ class QueueManager:
         return fallback_id
 
     def add_to_queue(self, user_id: int, description: str, user_telehandle: str = None,
-                     service_key: str = ServiceType.HF.value, routing: str = "open") -> str:
+                     service_key: str = ServiceType.HF.value, routing: str = "open",
+                     identity: Optional[str] = None) -> str:
         """Add user to the help queue for the given service.
 
         routing='open' is today's behaviour exactly: the request goes into
@@ -91,7 +92,16 @@ class QueueManager:
         this conversation can see.
         """
         queue_id = str(uuid.uuid4())
-        anonymous_id = self._generate_anonymous_id(get_service(service_key).anon_prefix)
+        svc = get_service(service_key)
+        # On an identified track (PSS) the requester's name stands in for the
+        # anonymous id, so every place that shows the id -- channel post, claim
+        # notice, relayed messages, and a restart (it is persisted as
+        # anonymous_user_id) -- shows who it is. An anonymous track never reads
+        # `identity`, and neither does an identified one handed nothing usable.
+        if svc.identified and identity:
+            anonymous_id = identity
+        else:
+            anonymous_id = self._generate_anonymous_id(svc.anon_prefix)
 
         # ONE `now` for both clocks, so a freshly created request cannot look like it
         # has already been waiting.
@@ -269,7 +279,7 @@ class QueueManager:
 
         claimed_message_text = (
             f"✅ <b>CLAIMED</b> - Help Request\n\n"
-            f"From: {queue_entry['anonymous_id']}\n"
+            f"From: {html.escape(str(queue_entry['anonymous_id']))}\n"
             f"Requested: {format_hhmm(queue_entry['created_at'])}\n"
             f"Claimed by: {safe_member_name}\n"
             f"Claimed at: {format_hhmm(claimed_time)}\n\n"
@@ -434,7 +444,7 @@ class QueueManager:
         suffix = '...' if len(description) > 200 else ''
         text = (
             f"⌛ <b>EXPIRED</b> - Help Request\n\n"
-            f"From: {entry.get('anonymous_id', 'Unknown')}\n"
+            f"From: {html.escape(str(entry.get('anonymous_id', 'Unknown')))}\n"
             f"Requested: {format_hhmm(entry.get('created_at'))}\n"
             f"Expired at: {format_hhmm(utcnow())}\n\n"
             f"Description: {safe_description}{suffix}"
@@ -657,6 +667,9 @@ class QueueManager:
             description=html.escape(description[:500]),
             window=format_duration_minutes(svc.directed_response_minutes),
         )
+        if svc.identified and entry.get('anonymous_id'):
+            text = MESSAGES["directed_request_from"].format(
+                who=html.escape(entry['anonymous_id'])) + text
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(MESSAGES["directed_accept_button"],
                                  callback_data=f"{CB_DIRECT_ACCEPT}:{queue_id}"),

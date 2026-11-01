@@ -48,6 +48,8 @@ from config import (
     omitted_supporters,
     picker_entries,
     supporter_label,
+    requester_identity,
+    welcome_text,
     supporter_name_problem,
 )
 from src.bot.managers.session import SessionManager
@@ -378,7 +380,7 @@ class BotHandlers:
             await self.register_command(update, context)
             return
 
-        text = MESSAGES["welcome"]
+        text = welcome_text()
         # /available, /unavailable and /release are member-only, so they are
         # deliberately NOT in set_my_commands -- that menu is the requester's
         # surface. This addendum is how a supporter discovers them instead.
@@ -1465,6 +1467,10 @@ class BotHandlers:
         service_key = user_to_service_map.pop(user_id, default_service_key())
 
         user_telehandle = f"@{update.effective_user.username}" if update.effective_user.username else None
+        # Read only by an identified track (PSS); HF ignores it and stays anonymous.
+        identity = requester_identity(update.effective_user.first_name,
+                                      update.effective_user.last_name,
+                                      update.effective_user.username)
 
         # THE FORK: "a specific peer supporter" or "any available peer supporter".
         # Shown iff directed mode is on for the track AND at least one listable
@@ -1479,7 +1485,8 @@ class BotHandlers:
             # The Mongo row is created BEFORE the question, so a restart mid-question
             # is recoverable rather than a request that quietly never existed.
             queue_id = self.queue_manager.add_to_queue(
-                user_id, description, user_telehandle, service_key, routing='choosing')
+                user_id, description, user_telehandle, service_key, routing='choosing',
+                identity=identity)
             user_states[user_id] = UserState.CHOOSING_SUPPORTER
             await update.message.reply_text(
                 MESSAGES["comfort_question"],
@@ -1494,7 +1501,8 @@ class BotHandlers:
             return
 
         # Add to queue
-        queue_id = self.queue_manager.add_to_queue(user_id, description, user_telehandle, service_key)
+        queue_id = self.queue_manager.add_to_queue(user_id, description, user_telehandle,
+                                                   service_key, identity=identity)
         
         # Post to admin channel
         success, error_type = await self.queue_manager.post_queue_to_channel(queue_id)
@@ -1633,11 +1641,13 @@ class BotHandlers:
             return
 
         await self._start_claimed_conversation(context, queue_id, claimed_user_id,
-                                               user_id, service_key)
+                                               user_id, service_key,
+                                               label=entry.get('anonymous_id'))
         await query.answer("Conversation claimed successfully!")
 
     async def _start_claimed_conversation(self, context, queue_id: str, requester_id: int,
-                                          member_id: int, service_key: str) -> str:
+                                          member_id: int, service_key: str,
+                                          label=None) -> str:
         """Create the session and greet both parties.
 
         Shared by the channel Claim path and the directed Accept path. Two copies of a
@@ -1645,17 +1655,26 @@ class BotHandlers:
         somebody in one lane never gets told their conversation started.
         """
         # Create session using the queue_id as session_id to maintain database consistency
-        session_id = self.session_manager.create_session(requester_id, member_id, queue_id, service=service_key)
+        session_id = self.session_manager.create_session(requester_id, member_id, queue_id,
+                                                         service=service_key, label=label)
 
         # Update states
         user_states[requester_id] = UserState.IN_CONVERSATION
         user_states[member_id] = UserState.IN_CONVERSATION
 
         # Notify both parties
+        started = MESSAGES["conversation_started"]
+        svc = get_service(service_key)
+        if svc.identified:
+            # Never "anonymously" here: the requester's name is on the supporter's
+            # screen. A supporter with no listed name still gets a truthful line.
+            supporter = supporter_label(svc.key, member_id)
+            started = (MESSAGES["conversation_started_named"].format(name=supporter)
+                       if supporter else MESSAGES["conversation_started_identified"])
         try:
             await context.bot.send_message(
                 chat_id=requester_id,
-                text=MESSAGES["conversation_started"]
+                text=started
             )
         except:
             pass
@@ -2101,8 +2120,9 @@ class BotHandlers:
                 await query.answer(MESSAGES["directed_gone"], show_alert=True)
                 return
 
-            await self._start_claimed_conversation(context, queue_id, requester_id,
-                                                   user_id, service_key)
+            await self._start_claimed_conversation(
+                context, queue_id, requester_id, user_id, service_key,
+                label=(entry or {}).get('anonymous_id'))
             await query.answer("Conversation claimed successfully!")
             return
 

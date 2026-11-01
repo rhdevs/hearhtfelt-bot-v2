@@ -108,6 +108,8 @@ full enable/rollback runbook.
 
 ```bash
 PSS_DIRECTED_RESPONSE_MINUTES=60  # optional; default 60
+PSS_IDENTIFIED=true  # optional; default true. PSS shows the requester's Telegram name + @username to supporters (HF is always anonymous). false = new PSS requests anonymous again
+PSS_PRIVACY_POLICY_URL=https://...  # PSS policy link shown before the requester describes anything
 ```
 
 How long a chosen peer supporter has to tap **Accept** before the request goes

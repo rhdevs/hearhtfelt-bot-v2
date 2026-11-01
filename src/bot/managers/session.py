@@ -10,6 +10,7 @@ from config import (
     user_to_session_map,
     session_warnings,
     get_service,
+    supporter_label,
     used_anonymous_ids,
 )
 from src.timeutil import utcnow
@@ -39,7 +40,8 @@ class SessionManager:
         self.used_anonymous_ids.add(fallback_id)
         return fallback_id
 
-    def create_session(self, user_id: int, heartfelt_member_id: int, session_id: str = None, service: str = None) -> str:
+    def create_session(self, user_id: int, heartfelt_member_id: int, session_id: str = None, service: str = None,
+                       label: Optional[str] = None) -> str:
         """Create a new anonymous session between user and heartfelt member"""
         # Use provided session_id (from queue_id) or generate new one
         if session_id is None:
@@ -56,6 +58,12 @@ class SessionManager:
 
         # Default to HF for legacy/missing service so labels stay correct
         service = service or "hf"
+
+        # The request's own label (its anonymous id -- or, on an identified track, the
+        # requester's name) when Mongo could not supply it, so a DB outage cannot
+        # swap the name the supporter was shown for a fresh "RHesident #NNNN".
+        if not anonymous_user_id and label:
+            anonymous_user_id = label
 
         # Generate new anonymous ID only if we don't have one from database
         if not anonymous_user_id:
@@ -159,7 +167,12 @@ class SessionManager:
             return "Unknown"
         
         if session['user_id'] == for_user_id:
-            return get_service(session.get('service')).member_label
+            svc = get_service(session.get('service'))
+            if svc.identified:
+                # Not anonymous: the requester sees who they are talking to.
+                return (supporter_label(svc.key, session['heartfelt_member_id'])
+                        or svc.member_label)
+            return svc.member_label
         else:
             return session['anonymous_user_id']
     
