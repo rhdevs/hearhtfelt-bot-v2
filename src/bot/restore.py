@@ -259,7 +259,10 @@ def _restore_pending(docs, queue_manager, stats, dry_run) -> None:
         # the directed lane end to end and has its own, identical, silent horizon.
         stale_routing = doc.get('routing') or 'open'
         if stale_routing == 'directed':
-            budget = svc.directed_response_minutes
+            # The supporter's window PLUS the queue window the requester gets back
+            # when it lapses -- see Service.directed_stale_budget_minutes. The bare
+            # window here silently dropped requests after a three-hour outage.
+            budget = svc.directed_stale_budget_minutes
             directed_ref = ensure_aware_utc(doc.get('directed_at'))
             if directed_ref is not None and directed_ref <= now:
                 age_minutes = (now - directed_ref).total_seconds() / 60.0

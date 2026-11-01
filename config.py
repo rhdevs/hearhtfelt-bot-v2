@@ -384,6 +384,21 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    """_env_int, except that a value below 1 falls back to the default as well.
+
+    For durations a zero or negative value would break silently: a directed window
+    of 0 lapses every request the instant it is sent, telling the requester "they're
+    not free" before the supporter's phone has even buzzed.
+    """
+    value = _env_int(name, default)
+    if value < 1:
+        print(f"WARNING: {name}={os.getenv(name)!r} is not a positive whole number; "
+              f"using the default ({default})")
+        return default
+    return value
+
+
 # --- Restart durability (see src/bot/restore.py) -------------------------------
 # RESTORE_DRY_RUN exists because the FIRST deploy of this feature runs against a
 # sessions collection that has been accumulating never-closed pending rows since
@@ -527,6 +542,21 @@ class Service:
         # A service is only offered/posted-to when enabled AND fully configured with a channel.
         return bool(self.enabled and self.channel_id)
 
+    @property
+    def directed_stale_budget_minutes(self) -> int:
+        """How long, from directed_at, a directed request stays LIVE had the bot
+        never stopped: the supporter's window, then -- once it lapses back to the
+        requester with a fresh waiting_since -- a whole queue window to choose again.
+
+        The boot restore and sweep_directed_requests add STALE_NOTIFY_GRACE_MINUTES
+        to this and close anything older SILENTLY. Using the bare directed window
+        instead made that cut-off 60 + 120 minutes once PSS moved to a one-hour
+        window: a three-hour outage silently dropped a request the requester had
+        been promised news of, while the same request sent to anyone survived 26
+        hours. Months-old rows are still closed in silence.
+        """
+        return self.directed_response_minutes + self.queue_expire_minutes
+
 
 # ROLLOUT SAFETY. Production's PSS roster holds a test account, and names now default
 # automatically to each supporter's Telegram first name -- so the old R11 lever ("no
@@ -535,6 +565,18 @@ class Service:
 # now the ONLY switch, and it is off unless deliberately set. Read at import, so the
 # container must be RECREATED (not restarted) for a change to take effect.
 PSS_DIRECTED_ENABLED_DEFAULT = False
+
+# How long a chosen peer supporter has to Accept before the request goes back to the
+# requester to choose again or send to anyone. Evan, 2026-11-01: "it will send a
+# notification to the selected PSS, who should reply within an hour". The requester
+# can send it to anyone at any point before an Accept, so this is the LONGEST anyone
+# waits on one person. Overridable with PSS_DIRECTED_RESPONSE_MINUTES; read at
+# import, so the container must be RECREATED for a change to take effect.
+#
+# When it runs out the request goes BACK TO THE REQUESTER and is never posted to the
+# channel automatically -- a settled call (2026-08-26): somebody who chose one person
+# did not agree to their words going to the whole team.
+PSS_DIRECTED_RESPONSE_MINUTES_DEFAULT = 60
 
 SERVICES: Dict[str, Service] = {
     ServiceType.HF.value: Service(
@@ -574,7 +616,8 @@ SERVICES: Dict[str, Service] = {
         # Directed support is a PSS feature. HF leaves every one of these at its
         # default, so HF's behaviour is provably unchanged.
         directed_enabled=_env_bool("PSS_DIRECTED_ENABLED", PSS_DIRECTED_ENABLED_DEFAULT),
-        directed_response_minutes=1440,
+        directed_response_minutes=_env_positive_int(
+            "PSS_DIRECTED_RESPONSE_MINUTES", PSS_DIRECTED_RESPONSE_MINUTES_DEFAULT),
         picker_page_size=8,
         closing_extra=PSS_CLOSING_NOTE,
         closing_extra_member=PSS_FOLLOWUP_NOTE,
@@ -660,6 +703,20 @@ CB_PICK_OPEN = "pk_o"      # "ask anyone who's free"
 CB_PICK_LIST = "pk_l"      # pk_l:<page>
 CB_PICK_SELECT = "pk_s"    # pk_s:<nonce>:<number> -- opaque, never an id
 CB_PICK_CANCEL = "pk_x"    # cancel my request
+
+
+def pick_cb(base: str, queue_id: Optional[str]) -> str:
+    """callback_data for a requester's "Send to anyone instead" / "Cancel" button,
+    SCOPED to the request it was shown for: "pk_o:<queue_id>" / "pk_x:<queue_id>".
+
+    A bare pk_o / pk_x acts on whatever request the requester has NOW, so a button
+    on an old message -- a /status from a request they have since cancelled -- would
+    post a NEW request's words to the whole channel, or cancel it. Scoped buttons
+    resolve only against their own request and are refused otherwise. The bare forms
+    stay accepted for buttons already on screen from before this change. The id is
+    the requester's own session id, which only their own client ever sees.
+    """
+    return f"{base}:{queue_id}" if queue_id else base
 CB_DIRECT_ACCEPT = "dr_a"  # dr_a:<session_id>, targeted supporter only
 CB_DIRECT_DECLINE = "dr_d" # dr_d:<session_id>, targeted supporter only
 
@@ -907,7 +964,7 @@ MESSAGES = {
 
     # --- Phase 5: choosing a specific supporter ------------------------------
     #
-    # WORDING RULE FOR EVERYTHING THE REQUESTER SEES: a decline and a 24-hour silence
+    # WORDING RULE FOR EVERYTHING THE REQUESTER SEES: a decline and a timed-out silence
     # are the SAME transition and get the SAME words. Never "declined", never
     # "rejected", never anything that distinguishes the two. The requester learns only
     # that the person they chose is not free. tests/test_directed_requests.py case (o)
@@ -957,9 +1014,14 @@ MESSAGES = {
         "request to anyone instead."
     ),
 
+    # {window} is directed_response_minutes, formatted ("1 hour"). It promises only
+    # that we will come back to them -- never why, so a decline and a silence still
+    # read the same.
     "directed_sent": (
         "✅ Sent to {name}. They'll be in touch if they're free.\n\n"
-        "If you'd rather not wait, you can ask anyone who's free instead."
+        "If they can't reply within {window}, I'll let you know so you can choose "
+        "again. If you'd rather not wait, you can send your request to anyone who's "
+        "free at any time."
     ),
     # Sent to the TARGETED SUPPORTER. HTML parse mode: {description} is escaped by the
     # caller. Carries NO requester name, username, Telegram id or anonymous id -- the
@@ -970,11 +1032,21 @@ MESSAGES = {
         "They chose you specifically, so this hasn't gone to the channel.\n"
         "If you're free, tap Accept. If not, tap Not right now - the request goes "
         "straight back to them and they can choose again. They are not told why.\n\n"
-        "If there's no answer within {window}, it goes back to them automatically.\n"
+        "If there's no answer within {window}, it goes back to them automatically. "
+        "They can also send it to the wider team before you reply.\n"
         "(You can use /unavailable any time to show as busy on the list.)"
     ),
     "directed_accept_button": "Accept",
     "directed_decline_button": "Not right now",
+    # Replaces the text of the TARGETED SUPPORTER's DM -- description and all -- when
+    # the requester sends the request to anyone or cancels it before an Accept. ONE
+    # wording for both, so the supporter cannot tell which happened, and it is an
+    # edit rather than a new message: nothing buzzes their phone over a request that
+    # no longer needs them.
+    "directed_withdrawn_member": (
+        "This request is no longer waiting for you, so nothing more is needed. "
+        "Thank you."
+    ),
     "directed_lapsed_member": (
         "That request has gone back to the person who sent it, because there was no "
         "answer. Nothing more is needed from you."
@@ -984,13 +1056,17 @@ MESSAGES = {
         "gone back to the person who sent it so they can choose again, and they "
         "haven't been told anything about who was asked."
     ),
-    # THE ONLY wording for both a decline and a 24-hour silence. {name} is the display
-    # name the requester already chose, so this carries no new information.
+    # THE ONLY wording for both a decline and a timed-out silence. {name} is the
+    # display name the requester already chose, so this carries no new information.
     "directed_unavailable": "{name} isn't free right now.",
     "next_step_question": "What would you like to do?",
+    # Sent with "Send to anyone instead" / "Cancel" buttons attached, so the way out
+    # is never more than a /status away -- not only on the message that said "Sent".
     "directed_status": (
-        "Your request is with {name}. We'll let you know as soon as they reply. "
-        "You can use /cancel if you've changed your mind."
+        "Your request is with {name}. I'll let you know as soon as they reply, or if "
+        "they can't get to it in time so you can choose again.\n\n"
+        "If you'd rather not wait, you can send your request to anyone who's free "
+        "instead. You can use /cancel if you've changed your mind."
     ),
     "choosing_status": (
         "Your request is open and you're choosing who to talk to. Tap a name on the "

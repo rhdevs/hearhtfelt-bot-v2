@@ -222,6 +222,7 @@ class FakeBot:
         self.edited = []        # (chat_id, message_id, text)
         self.markup_edits = []  # (chat_id, message_id)
         self.fail_for = {}      # chat_id (str) -> exception message
+        self.fail_edit_for = set()  # chat_id (str) whose edit_message_text raises
         self.gate = None  # one-shot: park the next matching send (hold_next_send)
         self._mid = 0
 
@@ -240,6 +241,8 @@ class FakeBot:
         return SimpleNamespace(message_id=self._mid)
 
     async def edit_message_text(self, chat_id=None, message_id=None, text=None, **kw):
+        if str(chat_id) in self.fail_edit_for:
+            raise RuntimeError("Bad Request: message can't be edited")
         self.edited.append((str(chat_id), message_id, text))
         return None
 
@@ -417,6 +420,19 @@ def ctx_for(bot):
     return SimpleNamespace(bot=bot)
 
 
+def _window():
+    """PSS's directed window in minutes -- env-driven, one hour by default. Clocks in
+    these cases are set relative to it, never to a literal."""
+    return config.get_service("pss").directed_response_minutes
+
+
+def _withdrawn_edits(bot, member_id, message_id=None):
+    """Edits that replaced `member_id`'s DM with the neutral withdrawn line."""
+    return [(c, mid, t) for c, mid, t in bot.edited
+            if c == str(member_id) and t == config.MESSAGES["directed_withdrawn_member"]
+            and (message_id is None or mid == message_id)]
+
+
 def requester_texts(bot, rec, user_id=REQUESTER):
     """Everything the REQUESTER could have read: DMs, replies and message edits."""
     out = [t for c, t, _m in bot.sent if c == str(user_id)]
@@ -446,7 +462,9 @@ async def case_a_fork_appears_and_nothing_reaches_the_channel():
     text, markup = rec.replies[-1]
     assert text == config.MESSAGES["comfort_question"], text
     datas = sorted(b.callback_data for row in markup.inline_keyboard for b in row)
-    assert datas == ["pk_l:0", "pk_o"], datas
+    # Send-to-anyone is SCOPED to this request (pick_cb): a bare pk_o would act on
+    # whatever request the requester has by the time they tap it.
+    assert datas == ["pk_l:0", "pk_o:%s" % queue_id], datas
     texts = [b.text for row in markup.inline_keyboard for b in row]
     assert texts == [config.MESSAGES["comfort_specific_button"],
                      config.MESSAGES["comfort_anyone_button"]] == [
@@ -869,7 +887,7 @@ async def case_n_a_decline_hands_the_choice_back_exactly_once():
 
 
 async def case_o_nothing_the_requester_reads_mentions_a_decline():
-    """The forbidden-words scan. A decline and a 24-hour silence must be
+    """The forbidden-words scan. A decline and a timed-out silence must be
     indistinguishable to the person who asked for help."""
     bot, sm, qm, handlers, stub = setup(supporters=3)
     rec = Rec()
@@ -881,11 +899,17 @@ async def case_o_nothing_the_requester_reads_mentions_a_decline():
         cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     await handlers.handle_callback_query(
         cb_update(supporter_id(0), "dr_d:%s" % queue_id, rec), ctx)
-    # ... and a lapse on the next one, so both outcomes are in the scan.
+    # ... and a lapse on the next one, so both outcomes are in the scan. The list
+    # has to be re-shown first ("Choose someone else"): the previous view was spent
+    # on the first pick, so without this the pick is stale, nothing is sent, nothing
+    # lapses, and the scan silently covers a decline only.
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
     await handlers.handle_callback_query(
         cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(1)), rec), ctx)
+    assert config.queue_entries[queue_id]['target_member_id'] == supporter_id(1), \
+        "the second pick must actually land, or the lapse half of this scan is vacuous"
     config.queue_entries[queue_id]['directed_at'] = (
-        utcnow() - datetime.timedelta(minutes=1441))
+        utcnow() - datetime.timedelta(minutes=_window() + 1))
     await qm.sweep_directed_requests()
 
     scanned = requester_texts(bot, rec)
@@ -956,13 +980,13 @@ async def case_q_a_lapsed_request_comes_back_after_the_window():
 
     # Still inside the window: nothing happens.
     config.queue_entries[queue_id]['directed_at'] = (
-        utcnow() - datetime.timedelta(minutes=1439))
+        utcnow() - datetime.timedelta(minutes=_window() - 1))
     assert await qm.sweep_directed_requests() == []
     assert config.queue_entries[queue_id]['routing'] == 'directed'
 
     before = len(bot.texts_to(REQUESTER))
     config.queue_entries[queue_id]['directed_at'] = (
-        utcnow() - datetime.timedelta(minutes=1441))
+        utcnow() - datetime.timedelta(minutes=_window() + 1))
     acted = await qm.sweep_directed_requests()
     assert len(acted) == 1 and acted[0]['outcome'] == 'lapsed', acted
 
@@ -985,7 +1009,7 @@ async def case_r_a_second_sweep_sends_nothing():
     await handlers.handle_callback_query(
         cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
     config.queue_entries[queue_id]['directed_at'] = (
-        utcnow() - datetime.timedelta(minutes=1441))
+        utcnow() - datetime.timedelta(minutes=_window() + 1))
     await qm.sweep_directed_requests()
 
     sent_after_first = list(bot.sent)
@@ -1086,7 +1110,9 @@ async def case_v_ask_anyone_from_directed_tidies_up_before_it_posts():
     await handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
 
     assert stub.count('undirect_session') == 1, stub.calls
-    assert (str(supporter_id(0)), dm_message_id) in bot.markup_edits
+    assert _withdrawn_edits(bot, supporter_id(0), dm_message_id), (
+        "the supporter's DM must be replaced with the neutral line, not left showing "
+        "the description with its buttons gone", bot.edited)
     closed = [t for c, _mid, t in bot.edited if c == PSS_CHANNEL]
     assert closed and "no longer waiting" in closed[-1], closed
     assert "declin" not in " ".join(closed).lower(), \
@@ -1096,7 +1122,7 @@ async def case_v_ask_anyone_from_directed_tidies_up_before_it_posts():
     assert posts and posts[-1] >= sent_before
     assert config.queue_entries[queue_id]['routing'] == 'open'
     assert supporter_id(0) not in config.directed_by_member
-    print("OK  v. rerouting from 'directed' strips the DM and closes the note first")
+    print("OK  v. rerouting from 'directed' retires the DM and closes the note first")
 
 
 async def case_w_cancelling_a_directed_request_tidies_the_supporter_up():
@@ -1117,7 +1143,7 @@ async def case_w_cancelling_a_directed_request_tidies_the_supporter_up():
     assert supporter_id(0) not in config.directed_by_member
     assert REQUESTER not in config.picker_views
     assert stub.ended.get(queue_id) == 'user_cancelled', stub.ended
-    assert (str(supporter_id(0)), dm_message_id) in bot.markup_edits
+    assert _withdrawn_edits(bot, supporter_id(0), dm_message_id), bot.edited
     closed = [t for c, _mid, t in bot.edited if c == PSS_CHANNEL]
     assert closed and "no longer waiting" in closed[-1], closed
     assert rec.replies[-1][0] == config.MESSAGES["queue_cancelled"]
@@ -1499,7 +1525,9 @@ async def case_ad_directed_off_means_no_fork_and_no_list():
     text, markup = rec2.replies[-1]
     assert text == config.MESSAGES["picker_nobody_free"], text
     assert "Sup" not in text, text
-    assert callback_datas(markup) == ["pk_o", "pk_x"], callback_datas(markup)
+    other_qid = config.user_to_queue_map[other]
+    assert callback_datas(markup) == ["pk_o:%s" % other_qid, "pk_x:%s" % other_qid], \
+        callback_datas(markup)
 
     before = stub.count('direct_session')
     await handlers.handle_callback_query(
@@ -1556,10 +1584,10 @@ async def case_af_everyone_busy_still_forks_and_the_list_says_so():
 
     rows = markup.inline_keyboard
     assert [(b.text, b.callback_data) for b in rows[0]] == [
-        (config.MESSAGES["picker_anyone_button"], "pk_o")], rows[0]
+        (config.MESSAGES["picker_anyone_button"], "pk_o:%s" % config.user_to_queue_map[REQUESTER])], rows[0]
     assert not [d for d in callback_datas(markup) if d.startswith("pk_s:")]
     assert [(b.text, b.callback_data) for b in rows[-1]] == [
-        (config.MESSAGES["picker_cancel_button"], "pk_x")], rows[-1]
+        (config.MESSAGES["picker_cancel_button"], "pk_x:%s" % config.user_to_queue_map[REQUESTER])], rows[-1]
     assert config.picker_views[REQUESTER]['ids'] == [supporter_id(0), supporter_id(1)]
 
     before = stub.count('direct_session')
@@ -1880,7 +1908,9 @@ def _busy_sup0():
 
 
 def _sent_to_sup0():
-    return config.MESSAGES["directed_sent"].format(name="Sup 00")
+    from src.timeutil import format_duration_minutes
+    return config.MESSAGES["directed_sent"].format(
+        name="Sup 00", window=format_duration_minutes(_window()))
 
 
 async def case_an_anyone_during_a_failing_dm_keeps_the_request_claimable():
@@ -1959,8 +1989,8 @@ async def case_ap_anyone_during_a_landed_dm_retires_it_and_posts_no_note():
     assert stub.docs[queue_id]['routing'] == 'open', stub.docs[queue_id]
     assert config.user_states[REQUESTER] == UserState.IN_QUEUE
     assert len(bot.texts_to(supporter_id(0))) == 1, "the DM did land"
-    assert any(c == str(supporter_id(0)) for c, _mid in bot.markup_edits), \
-        ("its Accept / Not right now buttons must be retired", bot.markup_edits)
+    assert _withdrawn_edits(bot, supporter_id(0)), \
+        ("its Accept / Not right now DM must be retired", bot.edited, bot.markup_edits)
     assert not [s for s in bot.sent if s[0] == PSS_CHANNEL and s[2] is None], \
         "no directed note for a request already in the channel"
     posts = [s for s in bot.sent if s[0] == PSS_CHANNEL and s[2] is not None]
@@ -2080,6 +2110,281 @@ async def case_ar_a_pick_button_only_works_on_the_list_it_came_from():
 
 
 # --------------------------------------------------------------------------- runner
+async def _directed_at_sup0(supporters=2):
+    bot, sm, qm, handlers, stub = setup(supporters=supporters)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
+    assert config.queue_entries[queue_id]['routing'] == 'directed'
+    return bot, sm, qm, handlers, stub, rec, ctx, queue_id
+
+
+def _callbacks(markup):
+    return [b.callback_data for row in (markup.inline_keyboard if markup else [])
+            for b in row]
+
+
+async def case_as_status_while_directed_offers_anyone_and_it_works():
+    """Evan, 2026-11-01: the resident can send to the common pool "at any point as
+    long as the PSS who received the notification has not accepted it yet" -- so the
+    exit cannot live only on the "Sent to ..." message, which may be far up the
+    chat. /status and /chat carry it too, and a tap on it is the real reroute."""
+    bot, sm, qm, handlers, stub, rec, ctx, queue_id = await _directed_at_sup0()
+    dm_message_id = config.queue_entries[queue_id]['directed_message_id']
+
+    await handlers.status_command(text_update(REQUESTER, "/status", rec), ctx)
+    text, markup = rec.replies[-1]
+    assert "Sup 00" in text and "anyone" in text, text
+    scoped = ["pk_o:%s" % queue_id, "pk_x:%s" % queue_id]
+    assert _callbacks(markup) == scoped, _callbacks(markup)
+
+    # /chat while a request is open gives the same answer and the same buttons.
+    await handlers.chat_command(text_update(REQUESTER, "/chat", rec), ctx)
+    assert rec.replies[-1][0] == text, rec.replies[-1]
+    assert _callbacks(rec.replies[-1][1]) == scoped, rec.replies[-1]
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, scoped[0], rec), ctx)
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    assert config.user_states[REQUESTER] == UserState.IN_QUEUE
+    assert supporter_id(0) not in config.directed_by_member
+    assert _withdrawn_edits(bot, supporter_id(0), dm_message_id), bot.edited
+    posts = [x for x in bot.sent if x[0] == PSS_CHANNEL and x[2] is not None]
+    assert len(posts) == 1, posts
+    assert config.MESSAGES["queue_added"] in bot.texts_to(REQUESTER)
+
+    # Once it is with everyone there is nothing to leave: no buttons.
+    await handlers.status_command(text_update(REQUESTER, "/status", rec), ctx)
+    assert rec.replies[-1][1] is None, rec.replies[-1]
+    # And the stale Accept takes nothing.
+    n_claim = stub.count('claim_session')
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "dr_a:%s" % queue_id, rec), ctx)
+    assert stub.count('claim_session') == n_claim, stub.calls
+    print("OK  as. /status while waiting on one supporter offers 'anyone', and it reroutes")
+
+
+async def case_at_status_cancel_while_directed_retires_the_dm():
+    bot, sm, qm, handlers, stub, rec, ctx, queue_id = await _directed_at_sup0()
+    dm_message_id = config.queue_entries[queue_id]['directed_message_id']
+
+    await handlers.status_command(text_update(REQUESTER, "/status", rec), ctx)
+    cancel = _callbacks(rec.replies[-1][1])[1]
+    assert cancel == "pk_x:%s" % queue_id, cancel
+    await handlers.handle_callback_query(cb_update(REQUESTER, cancel, rec), ctx)
+
+    assert queue_id not in config.queue_entries
+    assert config.user_states[REQUESTER] == UserState.IDLE
+    assert stub.ended.get(queue_id) == 'user_cancelled', stub.ended
+    assert _withdrawn_edits(bot, supporter_id(0), dm_message_id), bot.edited
+    assert config.MESSAGES["queue_cancelled"] in bot.texts_to(REQUESTER)
+    print("OK  at. Cancel from /status closes the request and retires the supporter's DM")
+
+
+async def case_au_choosing_status_carries_no_buttons():
+    bot, sm, qm, handlers, stub = setup(supporters=2)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await ask_for_help(handlers, rec, ctx)
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    assert config.user_states[REQUESTER] == UserState.CHOOSING_SUPPORTER
+    await handlers.status_command(text_update(REQUESTER, "/status", rec), ctx)
+    assert rec.replies[-1] == (config.MESSAGES["choosing_status"], None), rec.replies[-1]
+    print("OK  au. only a request waiting on one supporter gets status buttons")
+
+
+async def case_av_sent_names_the_window_and_the_supporter_sees_it_too():
+    from src.timeutil import format_duration_minutes
+    bot, sm, qm, handlers, stub, rec, ctx, queue_id = await _directed_at_sup0()
+    window = format_duration_minutes(_window())
+    sent = [t for t, _m in rec.replies if t.startswith(
+        config.MESSAGES["directed_sent"].split("{")[0])]
+    assert sent and ("within %s" % window) in sent[-1], sent
+    assert sent[-1] == _sent_to_sup0(), (sent[-1], _sent_to_sup0())
+    dm = bot.texts_to(supporter_id(0))
+    assert len(dm) == 1 and ("within %s" % window) in dm[0], dm
+    print("OK  av. 'Sent to ...' and the supporter's DM both state the %s window" % window)
+
+
+async def case_aw_a_failed_dm_edit_still_takes_the_buttons_off():
+    """The neutral-line edit can fail (message too old, already edited). A live
+    Accept on a request that has gone is the thing that must not survive."""
+    bot, sm, qm, handlers, stub, rec, ctx, queue_id = await _directed_at_sup0()
+    dm_message_id = config.queue_entries[queue_id]['directed_message_id']
+    bot.fail_edit_for.add(str(supporter_id(0)))
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
+
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    assert not _withdrawn_edits(bot, supporter_id(0)), bot.edited
+    assert (str(supporter_id(0)), dm_message_id) in bot.markup_edits, bot.markup_edits
+    print("OK  aw. if the DM cannot be rewritten its buttons are still stripped")
+
+
+async def case_ax_decline_and_lapse_keep_their_own_supporter_messages():
+    """Only the requester's own moves rewrite the DM. A decline is the supporter's
+    tap (decline_ack follows) and a lapse sends directed_lapsed_member: neither must
+    also get the withdrawn line, or the supporter hears two different stories."""
+    bot, sm, qm, handlers, stub, rec, ctx, queue_id = await _directed_at_sup0(3)
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "dr_d:%s" % queue_id, rec), ctx)
+    assert config.MESSAGES["decline_ack"] in bot.texts_to(supporter_id(0))
+    assert not _withdrawn_edits(bot, supporter_id(0)), bot.edited
+
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(1)), rec), ctx)
+    assert config.queue_entries[queue_id]['target_member_id'] == supporter_id(1)
+    config.queue_entries[queue_id]['directed_at'] = (
+        utcnow() - datetime.timedelta(minutes=_window() + 1))
+    acted = await qm.sweep_directed_requests()
+    assert [a['outcome'] for a in acted] == ['lapsed'], acted
+    assert config.MESSAGES["directed_lapsed_member"] in bot.texts_to(supporter_id(1))
+    assert not _withdrawn_edits(bot, supporter_id(1)), bot.edited
+    print("OK  ax. a decline or a lapse never also gets the withdrawn line")
+
+
+async def case_ay_an_old_status_button_cannot_act_on_a_newer_request():
+    """Review finding, round 1. Scenario: /status while waiting on Sup 00 -> /cancel
+    -> a NEW request picked at Sup 01 -> tap "Send to anyone instead" on the OLD
+    /status message. A bare pk_o resolved through user_to_queue_map and posted the
+    new request's words to the whole channel, against the requester's choice of one
+    person. A scoped button must be refused, take nothing, and lose its keyboard;
+    an old Cancel likewise must not kill the new request."""
+    bot, sm, qm, handlers, stub, rec, ctx, old_qid = await _directed_at_sup0(3)
+    await handlers.status_command(text_update(REQUESTER, "/status", rec), ctx)
+    old_open, old_cancel = _callbacks(rec.replies[-1][1])
+    assert old_open == "pk_o:%s" % old_qid, old_open
+    await handlers.cancel_command(text_update(REQUESTER, "/cancel", rec), ctx)
+    assert old_qid not in config.queue_entries
+
+    await ask_for_help(handlers, rec, ctx, text="a second, different worry")
+    new_qid = config.user_to_queue_map[REQUESTER]
+    assert new_qid != old_qid
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(1)), rec), ctx)
+    assert config.queue_entries[new_qid]['target_member_id'] == supporter_id(1)
+
+    posts_before = [x for x in bot.sent if x[0] == PSS_CHANNEL and x[2] is not None]
+    for stale in (old_open, old_cancel):
+        n_strips = len(rec.markup_strips)
+        await handlers.handle_callback_query(cb_update(REQUESTER, stale, rec), ctx)
+        assert rec.answers[-1] == (config.MESSAGES["directed_gone"], True), rec.answers[-1]
+        assert len(rec.markup_strips) == n_strips + 1 and rec.markup_strips[-1] is None, \
+            "the dead button's keyboard must be taken away"
+        entry = config.queue_entries.get(new_qid)
+        assert entry is not None, "an OLD Cancel must not cancel the NEW request"
+        assert entry['routing'] == 'directed', entry['routing']
+        assert entry['target_member_id'] == supporter_id(1)
+    posts_after = [x for x in bot.sent if x[0] == PSS_CHANNEL and x[2] is not None]
+    assert posts_after == posts_before, \
+        "the new request's words must not reach the channel from an old button"
+    assert "a second, different worry" not in " ".join(
+        str(t) for c, t, _m in bot.sent if c == PSS_CHANNEL)
+
+    # Its OWN buttons still work.
+    await handlers.status_command(text_update(REQUESTER, "/status", rec), ctx)
+    assert _callbacks(rec.replies[-1][1])[0] == "pk_o:%s" % new_qid
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, "pk_o:%s" % new_qid, rec), ctx)
+    assert config.queue_entries[new_qid]['routing'] == 'open'
+    print("OK  ay. a button from an old request is refused on a newer one")
+
+
+async def case_az_bare_buttons_from_before_scoping_still_work():
+    """Buttons already on screen when this ships carry bare pk_o / pk_x. They keep
+    resolving to the requester's current request, exactly as before."""
+    bot, sm, qm, handlers, stub, rec, ctx, queue_id = await _directed_at_sup0()
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_o", rec), ctx)
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    print("OK  az. a bare pk_o from before scoping still sends to anyone")
+
+
+def _scoped_pair(markup, queue_id):
+    """The Send-to-anyone / Cancel callbacks on `markup`, asserted scoped to queue_id."""
+    datas = [b.callback_data for row in markup.inline_keyboard for b in row
+             if b.callback_data.startswith(("pk_o", "pk_x"))]
+    assert datas == ["pk_o:%s" % queue_id, "pk_x:%s" % queue_id], datas
+    return datas
+
+
+async def case_ba_sent_and_both_next_step_offers_are_scoped():
+    """Review round 2: these three keyboards could be put back to bare pk_o / pk_x
+    with every test still green. The "Sent to ..." message is the old button most
+    likely to be tapped later, so each is pinned here."""
+    bot, sm, qm, handlers, stub, rec, ctx, queue_id = await _directed_at_sup0(3)
+    sent = [(t, m) for t, m in rec.replies
+            if t.startswith(config.MESSAGES["directed_sent"].split("{")[0])]
+    assert sent, rec.replies
+    _scoped_pair(sent[-1][1], queue_id)
+
+    # Decline -> the next-step offer.
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "dr_d:%s" % queue_id, rec), ctx)
+    offers = [m for c, t, m in bot.sent if c == str(REQUESTER)
+              and config.MESSAGES["next_step_question"] in t]
+    assert len(offers) == 1, offers
+    _scoped_pair(offers[-1], queue_id)
+
+    # Lapse -> the next-step offer.
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(1)), rec), ctx)
+    config.queue_entries[queue_id]['directed_at'] = (
+        utcnow() - datetime.timedelta(minutes=_window() + 1))
+    assert [a['outcome'] for a in await qm.sweep_directed_requests()] == ['lapsed']
+    offers = [m for c, t, m in bot.sent if c == str(REQUESTER)
+              and config.MESSAGES["next_step_question"] in t]
+    assert len(offers) == 2, offers
+    _scoped_pair(offers[-1], queue_id)
+    print("OK  ba. 'Sent to ...' and the decline and lapse offers are all scoped")
+
+
+async def case_bb_anyone_during_a_lapse_gets_no_contradicting_offer():
+    """Review round 2. The sweep wins the lapse, then awaits its lapsed DM to the
+    supporter; a requester "Send to anyone" handled inside that await posts the
+    request to the channel. The sweep must then NOT also say "they're not free -
+    what next?" for a request that is already with everyone."""
+    bot, sm, qm, handlers, stub, rec, ctx, queue_id = await _directed_at_sup0()
+    config.queue_entries[queue_id]['directed_at'] = (
+        utcnow() - datetime.timedelta(minutes=_window() + 1))
+    reached, release = hold_next_send(
+        bot, supporter_id(0),
+        lambda t, _m: t == config.MESSAGES["directed_lapsed_member"])
+
+    sweep = asyncio.ensure_future(qm.sweep_directed_requests())
+    await asyncio.wait_for(reached.wait(), 5)
+    assert config.queue_entries[queue_id]['routing'] == 'choosing'
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, "pk_o:%s" % queue_id, rec), ctx)
+    assert config.queue_entries[queue_id]['routing'] == 'open'
+    release.set()
+    await asyncio.wait_for(sweep, 5)
+
+    to_requester = bot.texts_to(REQUESTER)
+    assert config.MESSAGES["queue_added"] in to_requester, to_requester
+    assert not [t for t in to_requester if "isn't free right now" in t], (
+        "a request already in the channel must not also be offered 'choose again'",
+        to_requester)
+    print("OK  bb. 'anyone' tapped during a lapse gets no contradicting 'not free'")
+
+
+async def case_bc_a_scoped_button_with_no_request_loses_its_keyboard():
+    bot, sm, qm, handlers, stub, rec, ctx, queue_id = await _directed_at_sup0()
+    await handlers.cancel_command(text_update(REQUESTER, "/cancel", rec), ctx)
+    assert REQUESTER not in config.user_to_queue_map
+    for stale in ("pk_o:%s" % queue_id, "pk_x:%s" % queue_id):
+        n = len(rec.markup_strips)
+        await handlers.handle_callback_query(cb_update(REQUESTER, stale, rec), ctx)
+        assert rec.answers[-1] == (config.MESSAGES["directed_gone"], True), rec.answers
+        assert len(rec.markup_strips) == n + 1 and rec.markup_strips[-1] is None
+    print("OK  bc. a scoped button whose request is gone is refused and disarmed")
+
+
 CASES = [
     case_a_fork_appears_and_nothing_reaches_the_channel,
     case_b_no_pickable_supporters_means_no_fork,
@@ -2124,6 +2429,17 @@ CASES = [
     case_ap_anyone_during_a_landed_dm_retires_it_and_posts_no_note,
     case_aq_a_note_posted_during_an_accept_or_anyone_is_closed_with_the_right_words,
     case_ar_a_pick_button_only_works_on_the_list_it_came_from,
+    case_as_status_while_directed_offers_anyone_and_it_works,
+    case_at_status_cancel_while_directed_retires_the_dm,
+    case_au_choosing_status_carries_no_buttons,
+    case_av_sent_names_the_window_and_the_supporter_sees_it_too,
+    case_aw_a_failed_dm_edit_still_takes_the_buttons_off,
+    case_ax_decline_and_lapse_keep_their_own_supporter_messages,
+    case_ay_an_old_status_button_cannot_act_on_a_newer_request,
+    case_az_bare_buttons_from_before_scoping_still_work,
+    case_ba_sent_and_both_next_step_offers_are_scoped,
+    case_bb_anyone_during_a_lapse_gets_no_contradicting_offer,
+    case_bc_a_scoped_button_with_no_request_loses_its_keyboard,
 ]
 
 
@@ -2141,8 +2457,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 43, (
-        "expected at least 43 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 54, (
+        "expected at least 54 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

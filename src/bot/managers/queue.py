@@ -12,6 +12,7 @@ from config import (
     CB_PICK_CANCEL,
     CB_PICK_LIST,
     CB_PICK_OPEN,
+    pick_cb,
     MESSAGES,
     used_anonymous_ids,
     ServiceType,
@@ -544,6 +545,34 @@ class QueueManager:
         except Exception as exc:
             logger.warning("Could not strip the directed request buttons: %s", exc)
 
+    async def _retire_directed_dm(self, message_id: Optional[int],
+                                  member_id: Optional[int]) -> None:
+        """Replace the supporter's DM -- description and buttons -- with the one
+        neutral directed_withdrawn_member line. NEVER raises.
+
+        For a request the REQUESTER moved on (sent to anyone, or cancelled) before an
+        Accept. Stripping only the buttons left the description sitting there with no
+        explanation, reading like a request still waiting on them. One wording for
+        both moves, so the supporter cannot tell which happened. An edit, not a send,
+        so nothing buzzes.
+
+        If the edit fails (message too old, already edited) the buttons still go:
+        a live-looking Accept on a request that is gone is the one thing that must
+        not survive.
+        """
+        if not message_id or member_id is None:
+            return
+        try:
+            await self.bot.edit_message_text(
+                chat_id=member_id, message_id=message_id,
+                text=MESSAGES["directed_withdrawn_member"], reply_markup=None)
+            return
+        except Exception as exc:
+            logger.warning("Could not replace the withdrawn directed DM; stripping "
+                           "its buttons instead: %s", exc)
+        await self._strip_directed_buttons({'directed_message_id': message_id},
+                                           member_id)
+
     @staticmethod
     def _still_directed_at(queue_id: str, entry: dict, member_int: int) -> bool:
         """True iff `entry` is still THE live entry for queue_id AND still waits on
@@ -716,8 +745,7 @@ class QueueManager:
             # a note would tell the channel it was sent to this person.
             logger.info("Directed request %s moved on while its DM to member %s was "
                         "in flight; retiring that DM's buttons", queue_id, member_int)
-            await self._strip_directed_buttons({'directed_message_id': message_id},
-                                               member_int)
+            await self._retire_directed_dm(message_id, member_int)
             return 'gone'
 
         entry['directed_message_id'] = message_id
@@ -836,8 +864,15 @@ class QueueManager:
         if requester:
             user_states[requester] = UserState.CHOOSING_SUPPORTER
 
-        await self._strip_directed_buttons({'directed_message_id': message_id},
-                                           member_int)
+        if reason == 'rerouted':
+            # The requester's own move, so the supporter's DM is retired with the
+            # neutral line. A decline is the supporter's own tap (decline_ack follows)
+            # and a timeout sends directed_lapsed_member below, so both only lose
+            # their buttons here.
+            await self._retire_directed_dm(message_id, member_int)
+        else:
+            await self._strip_directed_buttons({'directed_message_id': message_id},
+                                               member_int)
         entry['directed_message_id'] = None
         await self._update_directed_notice(entry, 'closed')
 
@@ -851,11 +886,32 @@ class QueueManager:
                                member_int, exc)
         return True
 
-    async def _offer_next_step(self, entry: dict, note_key: str, name: str = "") -> None:
-        """DM the requester the "what next?" prompt. NEVER raises."""
+    async def _offer_next_step(self, entry: dict, note_key: str, name: str = "",
+                               queue_id: Optional[str] = None) -> None:
+        """DM the requester the "what next?" prompt. NEVER raises.
+
+        Skipped when the request has already moved on. undirect() sets 'choosing'
+        before its awaits (button strip, channel note, the lapsed DM), and a
+        requester's "Send to anyone" handled inside those awaits posts the request
+        to the channel. Offering "they're not free - what next?" after that
+        contradicts the "you're in the queue" they were just sent. The same check
+        covers a requester who re-picks someone else ('directed') or cancels (entry
+        gone) inside those awaits.
+
+        Known gap: the open-queue post itself flips routing to 'open' before ITS
+        await and back to 'choosing' if it fails, so a lapse resuming mid-post and
+        a post that then fails leaves no offer. The requester got channel_error and
+        their Send-to-anyone / Cancel buttons stay live, so they are not stranded.
+        """
         user_id = entry.get('user_id')
         if not user_id:
             return
+        if queue_id is not None:
+            live = queue_entries.get(queue_id)
+            if live is None or (live.get('routing') or 'open') != 'choosing':
+                logger.info("Request %s moved on before its next-step offer; not "
+                            "sending it", queue_id)
+                return
         note = MESSAGES[note_key]
         if "{name}" in note:
             note = note.format(name=name or "They")
@@ -864,9 +920,9 @@ class QueueManager:
             [InlineKeyboardButton(MESSAGES["picker_choose_else_button"],
                                   callback_data=f"{CB_PICK_LIST}:0")],
             [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
-                                  callback_data=CB_PICK_OPEN)],
+                                  callback_data=pick_cb(CB_PICK_OPEN, queue_id))],
             [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
-                                  callback_data=CB_PICK_CANCEL)],
+                                  callback_data=pick_cb(CB_PICK_CANCEL, queue_id))],
         ])
         try:
             await self.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
@@ -921,7 +977,10 @@ class QueueManager:
             if idle < svc.directed_response_minutes:
                 continue
 
-            stale = idle > (svc.directed_response_minutes
+            # Same horizon as restore._restore_pending: the window plus the queue
+            # window a lapse hands back, plus the grace. See
+            # Service.directed_stale_budget_minutes.
+            stale = idle > (svc.directed_stale_budget_minutes
                             + config.STALE_NOTIFY_GRACE_MINUTES)
 
             if stale:
@@ -954,7 +1013,7 @@ class QueueManager:
                 # AND MESSAGE NOBODY.
                 logger.info("Directed request %s was %.0f min old (> %d min horizon); "
                             "closed silently", queue_id, idle,
-                            svc.directed_response_minutes
+                            svc.directed_stale_budget_minutes
                             + config.STALE_NOTIFY_GRACE_MINUTES)
                 acted.append({**entry, 'queue_id': queue_id, 'outcome': 'stale'})
                 continue
@@ -966,7 +1025,8 @@ class QueueManager:
 
             if await self.undirect(queue_id, target, reason='timeout'):
                 # Only the winner speaks to the requester.
-                await self._offer_next_step(entry, "directed_unavailable", name)
+                await self._offer_next_step(entry, "directed_unavailable", name,
+                                            queue_id=queue_id)
                 acted.append({**entry, 'queue_id': queue_id, 'outcome': 'lapsed'})
 
         return acted
@@ -1146,7 +1206,7 @@ class QueueManager:
             target = queue_entry.get('target_member_id')
             if target is not None:
                 directed_by_member.pop(target, None)
-            await self._strip_directed_buttons(queue_entry, target)
+            await self._retire_directed_dm(queue_entry.get('directed_message_id'), target)
             await self._update_directed_notice(queue_entry, 'closed')
 
         picker_views.pop(user_id, None)
