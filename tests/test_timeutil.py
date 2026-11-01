@@ -69,11 +69,15 @@ def test_format_duration_minutes():
 def test_format_hhmm():
     assert format_hhmm(None) == "--:--"
     assert format_hhmm("not a datetime") == "--:--"
-    assert format_hhmm(datetime.datetime(2026, 3, 1, 9, 5, tzinfo=UTC)) == "09:05"
-    # Naive is read as UTC, so the wall clock is preserved.
-    assert format_hhmm(datetime.datetime(2026, 3, 1, 9, 5)) == "09:05"
+    # Displayed in Singapore time (UTC+8): what the people reading it live by.
+    assert format_hhmm(datetime.datetime(2026, 3, 1, 9, 5, tzinfo=UTC)) == "17:05"
+    # Naive is read as UTC, then shown in Singapore time.
+    assert format_hhmm(datetime.datetime(2026, 3, 1, 9, 5)) == "17:05"
     sgt = datetime.timezone(datetime.timedelta(hours=8))
-    assert format_hhmm(datetime.datetime(2026, 3, 1, 9, 5, tzinfo=sgt)) == "01:05"
+    assert format_hhmm(datetime.datetime(2026, 3, 1, 9, 5, tzinfo=sgt)) == "09:05"
+    # Wraps past midnight: 15:10 UTC on 1 Nov is 23:10 SGT; 16:30 UTC is 00:30.
+    assert format_hhmm(datetime.datetime(2026, 11, 1, 15, 10, tzinfo=UTC)) == "23:10"
+    assert format_hhmm(datetime.datetime(2026, 11, 1, 16, 30, tzinfo=UTC)) == "00:30"
 
 
 def test_aware_and_naive_are_not_comparable():
