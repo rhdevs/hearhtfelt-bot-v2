@@ -169,7 +169,9 @@ async def run():
     assert sm.get_session_info(session_id)["service"] == "pss"
     print("OK  5. PSS member claims; session tagged service=pss")
 
-    # 6. Relay labels: requester sees "Peer Supporter", member sees "RHesident #NNNN"
+    # 6. Relay labels. PSS is identified (2026-11-01): the member sees the
+    # requester's Telegram name. This member has no listed name, so the requester
+    # still sees the generic "Peer Supporter".
     rec.sent.clear()
     await handlers.handle_message(make_text_update(PSS_MEMBER, "Hi, I'm here for you", rec), ctx)
     to_requester = [s for s in rec.sent if s[0] == str(REQUESTER_PSS)]
@@ -177,8 +179,8 @@ async def run():
     rec.sent.clear()
     await handlers.handle_message(make_text_update(REQUESTER_PSS, "thank you", rec), ctx)
     to_member = [s for s in rec.sent if s[0] == str(PSS_MEMBER)]
-    assert to_member and "RHesident #" in to_member[-1][1], "PSS member should see the anonymous RHesident id"
-    print("OK  6. Anonymous labels correct (requester->'Peer Supporter', member->'RHesident')")
+    assert to_member and to_member[-1][1] == "💬 User: thank you",         ("PSS member should see the requester's name", to_member)
+    print("OK  6. Anonymous labels correct (requester->'Peer Supporter', member->requester's name)")
 
     # 7. HF track still works in parallel with the HF label
     rec2 = Rec()

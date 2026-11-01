@@ -274,10 +274,11 @@ class Rec:
         self.markup_strips = []   # reply_markup values passed to query.edit_message_reply_markup
 
 
-def text_update(user_id, text, rec, username=None, chat_type="private"):
+def text_update(user_id, text, rec, username=None, chat_type="private",
+                first_name="User"):
     async def reply_text(t, reply_markup=None, **kw):
         rec.replies.append((t, reply_markup))
-    user = SimpleNamespace(id=user_id, username=username, first_name="User",
+    user = SimpleNamespace(id=user_id, username=username, first_name=first_name,
                            last_name=None)
     msg = SimpleNamespace(text=text, reply_text=reply_text, photo=[], sticker=None)
     return SimpleNamespace(effective_user=user, message=msg, callback_query=None,
@@ -604,7 +605,20 @@ async def case_g_garbage_numbers_re_render_the_same_page():
 
 
 async def case_h_a_tap_sends_one_dm_and_one_contentless_note():
+    pss = config.get_service("pss")
+    saved = pss.identified
+    try:
+        await _case_h_body(identified=True)
+        await _case_h_body(identified=False)
+    finally:
+        pss.identified = saved
+    print("OK  h. a tap sends one DM (named on PSS, anonymous when switched off) "
+          "and one contentless channel note")
+
+
+async def _case_h_body(identified):
     bot, sm, qm, handlers, stub = setup(supporters=2)
+    config.get_service("pss").identified = identified
     rec = Rec()
     ctx = ctx_for(bot)
     await ask_for_help(handlers, rec, ctx, text="my flatmate situation is awful")
@@ -619,9 +633,15 @@ async def case_h_a_tap_sends_one_dm_and_one_contentless_note():
     dms = [s for s in bot.sent if s[0] == str(supporter_id(0))]
     assert len(dms) == 1, dms
     assert "my flatmate situation is awful" in dms[0][1]
-    assert anon not in dms[0][1], \
-        "the anonymous id is withheld until the conversation actually starts"
-    assert str(REQUESTER) not in dms[0][1]
+    if identified:
+        # PSS is not anonymous: the supporter sees who chose them.
+        assert anon == "User", anon
+        assert dms[0][1].startswith("From: User\n\n"), dms[0][1]
+    else:
+        assert anon.startswith("RHesident #"), anon
+        assert anon not in dms[0][1], \
+            "the anonymous id is withheld until the conversation actually starts"
+    assert str(REQUESTER) not in dms[0][1], "never the raw Telegram id"
     accept_datas = sorted(b.callback_data for row in dms[0][2].inline_keyboard
                           for b in row)
     assert accept_datas == ["dr_a:%s" % queue_id, "dr_d:%s" % queue_id], accept_datas
@@ -637,6 +657,10 @@ async def case_h_a_tap_sends_one_dm_and_one_contentless_note():
         "correlate this note against a later open-queue post of the same request "
         "and read off that a named supporter said no")
     assert note_markup is None, "the channel note carries NO claim button"
+    if identified:
+        assert "User" not in note_text, (
+            "on an identified track the note still names NO requester: the same "
+            "decline correlation applies to a name", note_text)
 
     entry = config.queue_entries[queue_id]
     assert entry['routing'] == 'directed'
@@ -833,7 +857,9 @@ async def case_l_accept_by_the_target_starts_the_conversation():
         "the Accept / Not right now buttons must be stripped"
     accepted = [t for c, _mid, t in bot.edited if c == PSS_CHANNEL]
     assert accepted and "accepted" in accepted[-1], accepted
-    assert config.MESSAGES["conversation_started"] in bot.texts_to(REQUESTER)
+    # PSS is identified: the requester is told WHO joined.
+    assert config.MESSAGES["conversation_started_named"].format(name="Sup 00") \
+        in bot.texts_to(REQUESTER), bot.texts_to(REQUESTER)
     print("OK  l. the targeted supporter accepts: session, stripped buttons, note updated")
 
 
@@ -2385,6 +2411,199 @@ async def case_bc_a_scoped_button_with_no_request_loses_its_keyboard():
     print("OK  bc. a scoped button whose request is gone is refused and disarmed")
 
 
+async def case_bd_pss_names_the_requester_everywhere_and_the_supporter_back():
+    """2026-11-01: on PSS the supporters know who they are helping. The name rides
+    the one per-request label, so it reaches the channel post, the claim notice,
+    every relayed message -- and the requester sees their supporter's name."""
+    bot, sm, qm, handlers, stub = setup(supporters=1)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await handlers.chat_command(text_update(REQUESTER, "/chat", rec, username="ren"), ctx)
+    await handlers.handle_message(
+        text_update(REQUESTER, "rough week", rec, username="ren"), ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    assert config.queue_entries[queue_id]['anonymous_id'] == "User (@ren)"
+
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, "pk_o:%s" % queue_id, rec), ctx)
+    posts = [t for c, t, m in bot.sent if c == PSS_CHANNEL and m is not None]
+    assert posts and "From: User (@ren)" in posts[-1], posts
+
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "claim_%s" % queue_id, rec), ctx)
+    assert sm.get_session_by_user(REQUESTER) == queue_id
+    to_member = bot.texts_to(supporter_id(0))
+    assert any("User (@ren)" in t for t in to_member), to_member
+    to_requester = bot.texts_to(REQUESTER)
+    assert config.MESSAGES["conversation_started_named"].format(name="Sup 00") \
+        in to_requester, to_requester
+
+    await handlers.handle_message(text_update(REQUESTER, "hi", rec, username="ren"), ctx)
+    assert "💬 User (@ren): hi" in bot.texts_to(supporter_id(0))
+    await handlers.handle_message(text_update(supporter_id(0), "hey", rec), ctx)
+    assert "💬 Sup 00: hey" in bot.texts_to(REQUESTER)
+    print("OK  bd. PSS names the requester in post, claim and relay, and the supporter back")
+
+
+async def case_be_hf_stays_anonymous_whatever_pss_does():
+    """HF is never identified: a name in front of the HF team was never consented to."""
+    bot, sm, qm, handlers, stub = setup(supporters=1, service="hf")
+    assert config.get_service("pss").identified is True
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await handlers.chat_command(text_update(REQUESTER, "/chat", rec, username="ren"), ctx)
+    await handlers.handle_message(
+        text_update(REQUESTER, "rough week", rec, username="ren"), ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    anon = config.queue_entries[queue_id]['anonymous_id']
+    assert anon.startswith("RHesident #"), anon
+    hf_posts = [t for c, t, _m in bot.sent if c == HF_CHANNEL]
+    assert hf_posts and "From: %s" % anon in hf_posts[-1], hf_posts
+    every = " ".join(str(t) for _c, t, _m in bot.sent)
+    assert "@ren" not in every and "User" not in every.replace("Unknown User", ""), every
+
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "claim_%s" % queue_id, rec), ctx)
+    assert config.MESSAGES["conversation_started"] in bot.texts_to(REQUESTER)
+    await handlers.handle_message(text_update(REQUESTER, "hi", rec, username="ren"), ctx)
+    assert "💬 %s: hi" % anon in bot.texts_to(supporter_id(0))
+    await handlers.handle_message(text_update(supporter_id(0), "hey", rec), ctx)
+    member_label = config.get_service("hf").member_label
+    assert "💬 %s: hey" % member_label in bot.texts_to(REQUESTER)
+    print("OK  be. HF stays anonymous in post, claim and relay")
+
+
+async def _open_pss_request(handlers, rec, ctx, first_name="User", username="ren"):
+    await handlers.chat_command(
+        text_update(REQUESTER, "/chat", rec, username=username, first_name=first_name), ctx)
+    await handlers.handle_message(
+        text_update(REQUESTER, "rough week", rec, username=username,
+                    first_name=first_name), ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    if config.queue_entries[queue_id]['routing'] == 'choosing':
+        await handlers.handle_callback_query(
+            cb_update(REQUESTER, "pk_o:%s" % queue_id, rec), ctx)
+    return queue_id
+
+
+async def case_bf_a_name_with_html_cannot_break_the_claimed_or_expired_card():
+    """Review round 1: the label went raw into two parse_mode='HTML' edits. "Ren <3"
+    made Telegram reject the CLAIMED edit, leaving a live Claim button on a claimed
+    request; a tag rendered as a link in front of the whole PSS team."""
+    bot, sm, qm, handlers, stub = setup(supporters=1)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    queue_id = await _open_pss_request(handlers, rec, ctx,
+                                       first_name='Ren <3 & <a href="x">co</a>')
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "claim_%s" % queue_id, rec), ctx)
+    claimed = [t for c, _mid, t in bot.edited if c == PSS_CHANNEL]
+    assert claimed, bot.edited
+    assert "From: Ren &lt;3 &amp; &lt;a href=&quot;x&quot;&gt;co&lt;/a&gt; (@ren)" \
+        in claimed[-1], claimed[-1]
+
+    # The EXPIRED card goes through the same escaping.
+    bot2, sm2, qm2, handlers2, stub2 = setup(supporters=1)
+    rec2 = Rec()
+    queue_id2 = await _open_pss_request(handlers2, rec2, ctx_for(bot2),
+                                        first_name="Ren <3")
+    entry = dict(config.queue_entries[queue_id2], queue_id=queue_id2)
+    await qm2._retire_channel_post(entry, config.get_service("pss"))
+    expired = [t for c, _mid, t in bot2.edited if c == PSS_CHANNEL]
+    assert expired and "From: Ren &lt;3 (@ren)" in expired[-1], bot2.edited
+    print("OK  bf. a name with HTML is escaped on the CLAIMED and EXPIRED cards")
+
+
+async def case_bg_a_claim_with_the_database_down_keeps_the_name():
+    """Review round 1: with Mongo unavailable the session minted a fresh
+    "RHesident #NNNN", so a requester told their name would be shared was shown to
+    the supporter under a random id."""
+    bot, sm, qm, handlers, stub = setup(supporters=1, db_available=False)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    queue_id = await _open_pss_request(handlers, rec, ctx)
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "claim_%s" % queue_id, rec), ctx)
+    assert sm.get_session_info(queue_id)['anonymous_user_id'] == "User (@ren)"
+    assert any("User (@ren)" in t for t in bot.texts_to(supporter_id(0)))
+    await handlers.handle_message(text_update(REQUESTER, "hi", rec, username="ren"), ctx)
+    assert "💬 User (@ren): hi" in bot.texts_to(supporter_id(0))
+    print("OK  bg. the DB-down claim keeps the requester's name")
+
+
+async def case_bh_an_unlisted_supporter_never_makes_pss_say_anonymously():
+    """Review round 1: a PSS member with no listed name claimed, and the requester --
+    whose name was on that member's screen -- was told "chat anonymously"."""
+    bot, sm, qm, handlers, stub = setup(supporters=1, display_name="",
+                                        telegram_first_name="")
+    assert not config.supporter_label("pss", supporter_id(0))
+    rec = Rec()
+    ctx = ctx_for(bot)
+    queue_id = await _open_pss_request(handlers, rec, ctx)
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "claim_%s" % queue_id, rec), ctx)
+    to_requester = bot.texts_to(REQUESTER)
+    assert config.MESSAGES["conversation_started_identified"] in to_requester, to_requester
+    assert not [t for t in to_requester if "anonymous" in t.lower()], to_requester
+    print("OK  bh. an unlisted supporter's claim never tells the requester 'anonymously'")
+
+
+async def case_bi_start_drops_anonymity_promise_while_pss_shares_names():
+    """Review round 3: /start's switch to welcome_text() had no test -- reverting it
+    to MESSAGES["welcome"] kept every suite green while PSS shared names under
+    "Complete anonymity guaranteed"."""
+    bot, sm, qm, handlers, stub = setup(supporters=1)
+    rec = Rec()
+    await handlers.start_command(text_update(REQUESTER, "/start", rec), ctx_for(bot))
+    shown = " ".join(str(t) for t, _m in rec.replies) + " ".join(bot.texts_to(REQUESTER))
+    assert "With PSS, your Telegram name and username are shared" in shown, shown
+    assert "Complete anonymity guaranteed" not in shown, shown
+    print("OK  bi. /start drops the anonymity promise while PSS shares names")
+
+
+async def case_bj_a_directed_accept_with_the_database_down_keeps_the_name():
+    """Review round 3: the Accept path's label hand-off had no test (label=None kept
+    everything green)."""
+    bot, sm, qm, handlers, stub = setup(supporters=2, db_available=False)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await handlers.chat_command(text_update(REQUESTER, "/chat", rec, username="ren"), ctx)
+    await handlers.handle_message(text_update(REQUESTER, "rough week", rec, username="ren"), ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
+    assert config.queue_entries[queue_id]['routing'] == 'directed'
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "dr_a:%s" % queue_id, rec), ctx)
+    assert sm.get_session_info(queue_id)['anonymous_user_id'] == "User (@ren)"
+    await handlers.handle_message(text_update(REQUESTER, "hi", rec, username="ren"), ctx)
+    assert "💬 User (@ren): hi" in bot.texts_to(supporter_id(0))
+    print("OK  bj. a DB-down directed Accept keeps the requester's name")
+
+
+async def case_bk_a_long_pss_message_is_not_lost_to_the_name_header():
+    """Review round 3: a ~120-char header pushed a 4,000-char message past
+    Telegram's 4096 limit, so the requester got an error instead of a relay."""
+    bot, sm, qm, handlers, stub = setup(supporters=1)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    queue_id = await _open_pss_request(handlers, rec, ctx, first_name="A" * 64)
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "claim_%s" % queue_id, rec), ctx)
+    body = "x" * 4090
+    await handlers.handle_message(text_update(REQUESTER, body, rec, username="ren",
+                                              first_name="A" * 64), ctx)
+    to_member = bot.texts_to(supporter_id(0))
+    assert all(len(t) <= 4096 for t in to_member), [len(t) for t in to_member]
+    assert to_member[-1] == body and to_member[-2].startswith("💬 "), to_member[-2:]
+    # Short messages still go as one.
+    await handlers.handle_message(text_update(REQUESTER, "hi", rec, username="ren",
+                                              first_name="A" * 64), ctx)
+    assert bot.texts_to(supporter_id(0))[-1].endswith(": hi")
+    print("OK  bk. a near-limit PSS message is relayed, header sent separately")
+
+
 CASES = [
     case_a_fork_appears_and_nothing_reaches_the_channel,
     case_b_no_pickable_supporters_means_no_fork,
@@ -2440,6 +2659,14 @@ CASES = [
     case_ba_sent_and_both_next_step_offers_are_scoped,
     case_bb_anyone_during_a_lapse_gets_no_contradicting_offer,
     case_bc_a_scoped_button_with_no_request_loses_its_keyboard,
+    case_bd_pss_names_the_requester_everywhere_and_the_supporter_back,
+    case_be_hf_stays_anonymous_whatever_pss_does,
+    case_bf_a_name_with_html_cannot_break_the_claimed_or_expired_card,
+    case_bg_a_claim_with_the_database_down_keeps_the_name,
+    case_bh_an_unlisted_supporter_never_makes_pss_say_anonymously,
+    case_bi_start_drops_anonymity_promise_while_pss_shares_names,
+    case_bj_a_directed_accept_with_the_database_down_keeps_the_name,
+    case_bk_a_long_pss_message_is_not_lost_to_the_name_header,
 ]
 
 
@@ -2457,8 +2684,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 54, (
-        "expected at least 54 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 62, (
+        "expected at least 62 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )
