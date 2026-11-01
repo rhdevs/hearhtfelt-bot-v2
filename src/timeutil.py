@@ -16,6 +16,11 @@ from typing import Any, Optional
 
 UTC = datetime.timezone.utc
 
+# What people READ. Everything is stored and compared in UTC; only the displayed
+# clock is local. Raffles Hall is in Singapore, which has had no daylight saving
+# since 1982, so a fixed +08:00 is exact -- and needs no tzdata in the container.
+DISPLAY_TZ = datetime.timezone(datetime.timedelta(hours=8), "SGT")
+
 
 def utcnow() -> datetime.datetime:
     """The single source of 'now': timezone-aware UTC."""
@@ -40,7 +45,10 @@ def ensure_aware_utc(value: Any) -> Optional[datetime.datetime]:
 
 
 def format_hhmm(value: Any) -> str:
-    """Render a timestamp as HH:MM for channel posts, never raising.
+    """Render a timestamp as HH:MM Singapore time for channel posts, never raising.
+
+    Singapore, not UTC: the droplet runs on UTC, so a request made at 11:10 PM
+    used to read "Time: 15:10" -- eight hours behind the people reading it.
 
     A missing or unusable timestamp renders as "--:--" rather than blowing up
     mid-post and leaving a request unannounced.
@@ -48,7 +56,7 @@ def format_hhmm(value: Any) -> str:
     aware = ensure_aware_utc(value)
     if aware is None:
         return "--:--"
-    return aware.strftime("%H:%M")
+    return aware.astimezone(DISPLAY_TZ).strftime("%H:%M")
 
 
 def format_duration_minutes(minutes: int) -> str:
