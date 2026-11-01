@@ -88,7 +88,9 @@ def test_directed_support_is_a_pss_feature_only():
     # Env-driven, and OFF unless deliberately opted in: see the next test.
     assert pss.directed_enabled == config._env_bool(
         'PSS_DIRECTED_ENABLED', config.PSS_DIRECTED_ENABLED_DEFAULT)
-    assert pss.directed_response_minutes == 1440
+    # Env-driven, defaulting to Evan's one hour: see the next-but-one test.
+    assert pss.directed_response_minutes == config._env_positive_int(
+        'PSS_DIRECTED_RESPONSE_MINUTES', config.PSS_DIRECTED_RESPONSE_MINUTES_DEFAULT)
     assert pss.picker_page_size == 8
     for svc in SERVICES.values():
         # A page size of 0 renders an empty picker -- a dead end with no way out
@@ -108,6 +110,37 @@ def test_pss_directed_is_off_by_default():
     if os.getenv('PSS_DIRECTED_ENABLED') is None:
         # Live in CI, where nothing sets it.
         assert SERVICES["pss"].directed_enabled is False
+
+
+def test_pss_directed_window_is_one_hour_unless_overridden():
+    """Evan, 2026-11-01: the chosen supporter "should reply within an hour". The
+    requester can send to anyone at any time before an Accept, so this caps the
+    longest wait on one person."""
+    assert config.PSS_DIRECTED_RESPONSE_MINUTES_DEFAULT == 60
+    if os.getenv('PSS_DIRECTED_RESPONSE_MINUTES') is None:
+        assert SERVICES["pss"].directed_response_minutes == 60
+    # HF never directs, but its (unused) window must still be a sane value.
+    assert SERVICES["hf"].directed_response_minutes == 1440
+
+
+def test_env_positive_int_refuses_zero_negative_and_garbage():
+    """A window of 0 would lapse every directed request the instant it was sent --
+    "they're not free" before the supporter's phone had even buzzed. A negative or
+    unparseable value is the same mistake. All fall back to the default."""
+    key = "TEST_ENV_POSITIVE_INT_PROBE"
+    saved = os.environ.pop(key, None)
+    try:
+        assert config._env_positive_int(key, 60) == 60          # unset
+        for bad in ("0", "-5", "", "abc", "1.5", " "):
+            os.environ[key] = bad
+            assert config._env_positive_int(key, 60) == 60, bad
+        for good, want in (("1", 1), ("30", 30), ("120", 120), (" 45 ", 45)):
+            os.environ[key] = good
+            assert config._env_positive_int(key, 60) == want, good
+    finally:
+        os.environ.pop(key, None)
+        if saved is not None:
+            os.environ[key] = saved
 
 
 def test_supporter_names_is_a_pss_feature_only():
@@ -147,8 +180,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 14, (
-        "expected at least 14 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 16, (
+        "expected at least 16 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )

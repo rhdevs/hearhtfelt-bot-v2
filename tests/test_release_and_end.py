@@ -506,7 +506,7 @@ async def case_e_release_on_directed_provenance_never_touches_the_channel():
     prompt = [s for s in bot.sent
               if s[0] == str(REQUESTER) and config.MESSAGES["next_step_question"] in s[1]]
     datas = sorted(b.callback_data for row in prompt[-1][2].inline_keyboard for b in row)
-    assert datas == ["pk_l:0", "pk_o", "pk_x"], datas
+    assert datas == ["pk_l:0", "pk_o:%s" % queue_id, "pk_x:%s" % queue_id], datas
     assert_no_blame(to_requester, "the requester")
 
     # And the picker really does refuse the person who just released: listed, but

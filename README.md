@@ -106,6 +106,17 @@ in. Read once at import like the other `PSS_*` variables, so flipping it also
 needs a container **recreate**, not a restart. See `HANDOFF.md` R11 for the
 full enable/rollback runbook.
 
+```bash
+PSS_DIRECTED_RESPONSE_MINUTES=60  # optional; default 60
+```
+
+How long a chosen peer supporter has to tap **Accept** before the request goes
+back to the requester to choose someone else, send it to anyone, or cancel. It
+is never posted to the channel automatically. The requester can send it to anyone
+at any point before an Accept, from the "Sent to …" message or from `/status`
+and `/chat`. A value of 0, a negative number or anything unparseable falls back
+to 60. Read at import: **recreate** the container to change it.
+
 **config.py:**
 ```python
 DEFAULT_HEARTFELT_MEMBERS = [1522275008, 9876543210]

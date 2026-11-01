@@ -16,6 +16,7 @@ from config import (
     REGISTRATION_REAPPLY_HOURS,
     CB_PICK_LIST,
     CB_PICK_OPEN,
+    pick_cb,
     CB_PICK_SELECT,
     SERVICES,
     UserState,
@@ -38,6 +39,7 @@ from config import (
     REGISTER_DEEP_LINK_PAYLOAD,
     enabled_services,
     default_service_key,
+    ServiceType,
     get_service,
     help_request_text,
     directed_fork_offered,
@@ -57,7 +59,7 @@ from src.supporter_names import (
     RESET_KEYWORD,
     clean_name,
 )
-from src.timeutil import ensure_aware_utc, format_hhmm, utcnow
+from src.timeutil import ensure_aware_utc, format_duration_minutes, format_hhmm, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -460,7 +462,16 @@ class BotHandlers:
         
         # Check if user is already in queue or conversation
         if current_state == UserState.IN_QUEUE:
-            await update.message.reply_text(MESSAGES["already_in_queue"])
+            # A request waiting on ONE chosen supporter is IN_QUEUE too, but "please
+            # wait for a support member" hides its way out. It gets the /status answer
+            # and its "Send to anyone instead" / "Cancel" buttons. The open lane (all
+            # of HF) keeps already_in_queue word for word.
+            markup = self._open_request_status_markup(user_id)
+            if markup is not None:
+                await update.message.reply_text(
+                    self._open_request_status_text(user_id), reply_markup=markup)
+            else:
+                await update.message.reply_text(MESSAGES["already_in_queue"])
             return
         
         if current_state == UserState.IN_CONVERSATION:
@@ -478,7 +489,9 @@ class BotHandlers:
         # does not catch) can start a SECOND request -- two pending rows for one user,
         # which rehydration then treats as duplicate_pending and silently closes one.
         if self.queue_manager.is_user_in_queue(user_id):
-            await update.message.reply_text(self._open_request_status_text(user_id))
+            await update.message.reply_text(
+                self._open_request_status_text(user_id),
+                reply_markup=self._open_request_status_markup(user_id))
             return
         
         # Landing page: if more than one support track is available, let the user
@@ -678,9 +691,11 @@ class BotHandlers:
                         [InlineKeyboardButton(MESSAGES["picker_choose_else_button"],
                                               callback_data=f"{CB_PICK_LIST}:0")],
                         [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
-                                              callback_data=CB_PICK_OPEN)],
+                                              callback_data=pick_cb(CB_PICK_OPEN,
+                                                                    queue_id))],
                         [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
-                                              callback_data=CB_PICK_CANCEL)],
+                                              callback_data=pick_cb(CB_PICK_CANCEL,
+                                                                    queue_id))],
                     ]),
                 )
             except Exception as exc:
@@ -1287,6 +1302,28 @@ class BotHandlers:
             return MESSAGES["directed_status"].format(name=name)
         return MESSAGES["queue_status"].format(member=svc.member_label)
 
+    def _open_request_status_markup(self, user_id: int):
+        """The buttons that go with _open_request_status_text, or None.
+
+        Only a request waiting on ONE chosen supporter gets any: "Send to anyone
+        instead" and "Cancel", the same callbacks as on the "Sent to ..." message, so
+        the requester can leave that person's queue whenever they like -- not only
+        from a message that may be far up the chat by now. route_to_open_queue
+        already settles a tap racing the supporter's Accept, so these are as safe as
+        the originals. An open or choosing request needs none: the first is already
+        with everyone, the second has the list in front of it.
+        """
+        queue_id = user_to_queue_map.get(user_id)
+        entry = self.queue_manager.get_queue_entry(queue_id) if queue_id else None
+        if entry is None or (entry.get('routing') or 'open') != 'directed':
+            return None
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
+                                  callback_data=pick_cb(CB_PICK_OPEN, queue_id))],
+            [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
+                                  callback_data=pick_cb(CB_PICK_CANCEL, queue_id))],
+        ])
+
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
         user_id = update.effective_user.id
@@ -1296,7 +1333,9 @@ class BotHandlers:
             await update.message.reply_text(MESSAGES["conversation_status"])
         elif current_state in (UserState.IN_QUEUE, UserState.CHOOSING_SUPPORTER):
             if self.queue_manager.is_user_in_queue(user_id):
-                await update.message.reply_text(self._open_request_status_text(user_id))
+                await update.message.reply_text(
+                    self._open_request_status_text(user_id),
+                    reply_markup=self._open_request_status_markup(user_id))
             else:
                 # State drift: reset local state to avoid confusing responses
                 user_states[user_id] = UserState.IDLE
@@ -1448,7 +1487,8 @@ class BotHandlers:
                     [InlineKeyboardButton(MESSAGES["comfort_specific_button"],
                                           callback_data=f"{CB_PICK_LIST}:0")],
                     [InlineKeyboardButton(MESSAGES["comfort_anyone_button"],
-                                          callback_data=CB_PICK_OPEN)],
+                                          callback_data=pick_cb(CB_PICK_OPEN,
+                                                                queue_id))],
                 ]),
             )
             return
@@ -1490,6 +1530,8 @@ class BotHandlers:
         # checks the entry belongs to them, so a member who is themselves a requester
         # still works and nobody can act on somebody else's request.
         if (data in (CB_PICK_OPEN, CB_PICK_CANCEL)
+                or data.startswith(CB_PICK_OPEN + ":")
+                or data.startswith(CB_PICK_CANCEL + ":")
                 or data.startswith(CB_PICK_LIST + ":")
                 or data.startswith(CB_PICK_SELECT + ":")):
             await self._handle_picker_callback(update, context)
@@ -1701,9 +1743,11 @@ class BotHandlers:
                 query, context, user_id, prefix + MESSAGES["picker_nobody_free"],
                 InlineKeyboardMarkup([
                     [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
-                                          callback_data=CB_PICK_OPEN)],
+                                          callback_data=pick_cb(CB_PICK_OPEN,
+                                                                queue_id))],
                     [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
-                                          callback_data=CB_PICK_CANCEL)],
+                                          callback_data=pick_cb(CB_PICK_CANCEL,
+                                                                queue_id))],
                 ]), parse_mode='HTML')
             return False
 
@@ -1736,7 +1780,8 @@ class BotHandlers:
             text += "\n" + MESSAGES["picker_page"].format(page=page + 1, pages=pages)
 
         anyone_row = [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
-                                           callback_data=CB_PICK_OPEN)]
+                                           callback_data=pick_cb(CB_PICK_OPEN,
+                                                                 queue_id))]
         rows = []
         if not anyone_free:
             # Nobody can be picked, so the way forward goes first, where it is seen.
@@ -1764,7 +1809,8 @@ class BotHandlers:
         if anyone_free:
             rows.append(anyone_row)
         rows.append([InlineKeyboardButton(MESSAGES["picker_cancel_button"],
-                                          callback_data=CB_PICK_CANCEL)])
+                                          callback_data=pick_cb(CB_PICK_CANCEL,
+                                                                queue_id))])
 
         # RECORD BEFORE SENDING. Busy ids included, so a typed number lines up with
         # the numbered list on screen.
@@ -1828,7 +1874,31 @@ class BotHandlers:
         # so this can only ever be their own request -- assert it anyway.
         if entry is None or entry.get('user_id') != user_id:
             await query.answer(MESSAGES["directed_gone"], show_alert=True)
+            if data.startswith((CB_PICK_OPEN + ":", CB_PICK_CANCEL + ":")):
+                # A scoped button whose request is gone can never work again, so
+                # take its keyboard away too, as the mismatch branch below does.
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
             return
+
+        # A SCOPED pk_o / pk_x names the request it was shown for (see pick_cb). On
+        # any other request it is refused, and its keyboard taken away: otherwise a
+        # button on a message from a request since cancelled would send the CURRENT
+        # request's words to the whole channel, or cancel it. Bare pk_o / pk_x --
+        # buttons already on screen from before scoping -- still resolve as before.
+        for base in (CB_PICK_OPEN, CB_PICK_CANCEL):
+            if data.startswith(base + ":"):
+                if data[len(base) + 1:] != queue_id:
+                    await query.answer(MESSAGES["directed_gone"], show_alert=True)
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    return
+                data = base
+                break
 
         if data == CB_PICK_CANCEL:
             await query.answer()
@@ -1867,10 +1937,13 @@ class BotHandlers:
             # 'already_open' / 'gone': a repeat or stale tap. Tell them where their
             # request actually stands -- "the system is down" would send somebody
             # whose request is live in the channel off to retype it or give up.
-            text = (self._open_request_status_text(user_id)
-                    if self.queue_manager.get_queue_entry(queue_id) is not None
-                    else MESSAGES["directed_gone"])
-            await self._send_or_edit(query, context, user_id, text)
+            if self.queue_manager.get_queue_entry(queue_id) is not None:
+                await self._send_or_edit(query, context, user_id,
+                                         self._open_request_status_text(user_id),
+                                         self._open_request_status_markup(user_id))
+            else:
+                await self._send_or_edit(query, context, user_id,
+                                         MESSAGES["directed_gone"])
             return
 
         if data.startswith(CB_PICK_LIST + ":"):
@@ -1881,7 +1954,8 @@ class BotHandlers:
                 # invite a choice that can no longer happen.
                 picker_views.pop(user_id, None)
                 await self._send_or_edit(query, context, user_id,
-                                         self._open_request_status_text(user_id))
+                                         self._open_request_status_text(user_id),
+                                         self._open_request_status_markup(user_id))
                 return
             try:
                 page = int(data.split(":", 1)[1])
@@ -1924,15 +1998,22 @@ class BotHandlers:
         if outcome == 'ok':
             entry = self.queue_manager.get_queue_entry(queue_id)
             name = supporter_label(entry.get('service'), member_id) if entry else ""
+            # Only PSS directs, so PSS's window is the honest fallback if the entry
+            # vanished between the send and here (get_service(None) would be HF's).
+            svc = get_service(entry.get('service') if entry else ServiceType.PSS.value)
             picker_views.pop(user_id, None)
             await self._send_or_edit(
                 query, context, user_id,
-                MESSAGES["directed_sent"].format(name=html.escape(name) or "them"),
+                MESSAGES["directed_sent"].format(
+                    name=html.escape(name) or "them",
+                    window=format_duration_minutes(svc.directed_response_minutes)),
                 InlineKeyboardMarkup([
                     [InlineKeyboardButton(MESSAGES["picker_anyone_button"],
-                                          callback_data=CB_PICK_OPEN)],
+                                          callback_data=pick_cb(CB_PICK_OPEN,
+                                                                queue_id))],
                     [InlineKeyboardButton(MESSAGES["picker_cancel_button"],
-                                          callback_data=CB_PICK_CANCEL)],
+                                          callback_data=pick_cb(CB_PICK_CANCEL,
+                                                                queue_id))],
                 ]), parse_mode='HTML')
             return
 
@@ -1972,7 +2053,8 @@ class BotHandlers:
             return
         if self.queue_manager.get_queue_entry(queue_id) is not None:
             await self._send_or_edit(query, context, user_id,
-                                     self._open_request_status_text(user_id))
+                                     self._open_request_status_text(user_id),
+                                     self._open_request_status_markup(user_id))
             return
         await self._send_or_edit(query, context, user_id, MESSAGES["directed_gone"])
 
@@ -2048,7 +2130,8 @@ class BotHandlers:
 
         entry = self.queue_manager.get_queue_entry(queue_id)
         if entry is not None:
-            await self.queue_manager._offer_next_step(entry, "directed_unavailable", name)
+            await self.queue_manager._offer_next_step(entry, "directed_unavailable", name,
+                                                      queue_id=queue_id)
 
     async def _handle_service_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the requester's landing-page service selection (Phase 2 chooser)."""

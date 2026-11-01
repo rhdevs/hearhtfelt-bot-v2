@@ -107,6 +107,18 @@ class StubDB:
         doc['claimed_at'] = utcnow()
         return True
 
+    def undirect_session(self, session_id, member_id, reason=None):
+        # directed -> choosing, atomically and only for the member it is with.
+        self.calls.append(('undirect_session', session_id, member_id, reason))
+        doc = self.docs.get(session_id)
+        if (doc is None or doc.get('status') != 'pending'
+                or doc.get('routing') != 'directed'
+                or doc.get('target_member_id') != member_id):
+            return False
+        doc['routing'] = 'choosing'
+        doc['target_member_id'] = None
+        return True
+
     def set_queue_message(self, session_id, channel_id, message_id):
         self.calls.append(('set_queue_message', session_id, channel_id, message_id))
         self.queue_messages[session_id] = (channel_id, message_id)
@@ -997,6 +1009,55 @@ def case_ae_an_old_request_repicked_recently_survives_boot():
 
 
 async def case_af_a_directed_request_is_judged_on_its_own_clock():
+    """(af) needs a directed window LONGER than the queue horizon to be meaningful.
+    PSS's live window is one hour, shorter than its 24-hour queue window, so the
+    case pins a long window for its own duration: the bug it guards -- judging a
+    directed row on the queue clock -- returns the moment anyone lengthens it."""
+    svc = config.get_service("pss")
+    saved = svc.directed_response_minutes
+    svc.directed_response_minutes = (svc.queue_expire_minutes
+                                     + config.STALE_NOTIFY_GRACE_MINUTES + 600)
+    try:
+        await _case_af_body()
+    finally:
+        svc.directed_response_minutes = saved
+
+
+async def case_ai_a_short_outage_past_the_hour_hands_back_rather_than_closes():
+    """The other side of the one-hour window. A directed request whose hour ran out
+    while the bot was briefly down is INSIDE the notify horizon (window + grace), so
+    boot restores it and the sweep hands it back to the requester -- "not free right
+    now, what next?" -- with the supporter told. It must not be closed silently: the
+    requester would be left waiting on a person the bot has quietly given up on."""
+    reset_state()
+    svc = config.get_service("pss")
+    idle = svc.directed_response_minutes + 30
+    assert idle < svc.directed_response_minutes + config.STALE_NOTIFY_GRACE_MINUTES, \
+        "the fixture must sit inside the notify horizon, or this case proves nothing"
+
+    doc = pending_doc("p-ai", 7606, idle + 10, service="pss", routing="directed",
+                      target_member_id=PSS_MEMBER,
+                      directed_at=utcnow() - datetime.timedelta(minutes=idle))
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+
+    stats = restore_state(qm, sm)
+    assert stats['pending_stale_closed'] == 0, stats
+    assert stats['pending_directed'] == 1, stats
+    assert bot.sent == [], ("rehydration itself sends nothing", bot.sent)
+
+    acted = await qm.sweep_directed_requests()
+    assert [a['outcome'] for a in acted] == ['lapsed'], acted
+    to_requester = [t for c, t, *_ in bot.sent if str(c) == "7606"]
+    assert to_requester and "isn't free right now" in to_requester[-1], bot.sent
+    assert config.queue_entries["p-ai"]['routing'] == 'choosing'
+    to_member = [t_ for c, t_, *_ in bot.sent if str(c) == str(PSS_MEMBER)]
+    assert config.MESSAGES["directed_lapsed_member"] in to_member, bot.sent
+    print("OK  ai. a directed request whose hour ran out during a short outage is "
+          "handed back, not dropped")
+
+
+async def _case_af_body():
     """A directed row is on a DIFFERENT CLOCK from the queue lane, and the boot
     horizon must use it.
 
@@ -1050,12 +1111,12 @@ async def case_af_a_directed_request_is_judged_on_its_own_clock():
 
 async def case_ag_a_truly_stale_directed_request_still_closes_silently():
     """The other side of (af): judging directed rows on their own clock must NOT
-    disarm the horizon. Past directed_response_minutes + the grace, the row is closed
+    disarm the horizon. Past directed_stale_budget_minutes + the grace, the row is closed
     and NOBODY is messaged -- the "bot was down for days" case, for the directed lane.
     """
     reset_state()
     svc = config.get_service("pss")
-    idle = svc.directed_response_minutes + config.STALE_NOTIFY_GRACE_MINUTES + 60
+    idle = svc.directed_stale_budget_minutes + config.STALE_NOTIFY_GRACE_MINUTES + 60
 
     doc = pending_doc("p-ag", 7605, idle + 30, service="pss", routing="directed",
                       target_member_id=PSS_MEMBER,
@@ -1147,7 +1208,44 @@ async def case_ah_the_list_after_a_restart_marks_the_busy_without_saying_why():
 
 
 # --------------------------------------------------------------------------- runner
+async def case_aj_a_few_hours_outage_never_silently_drops_a_directed_request():
+    """Review finding, round 1. With a one-hour window the silent horizon was
+    60 + 120 minutes: a request picked at T0 with the bot down from T0+30m to
+    T0+3h20m was closed at boot and NOBODY told -- after "If they can't reply within
+    1 hour, I'll let you know". Had the bot stayed up it would have lapsed back to
+    the requester with a fresh 24-hour queue window, and the same request sent to
+    anyone survives the same outage. The horizon is now the window plus the queue
+    window it hands back, plus the grace."""
+    reset_state()
+    svc = config.get_service("pss")
+    idle = svc.directed_response_minutes + 140      # the 200-minute review scenario
+    assert idle > svc.directed_response_minutes + config.STALE_NOTIFY_GRACE_MINUTES, \
+        "the fixture must sit past the OLD horizon, or this case proves nothing"
+    assert idle < svc.directed_stale_budget_minutes + config.STALE_NOTIFY_GRACE_MINUTES
+
+    doc = pending_doc("p-aj", 7607, idle + 5, service="pss", routing="directed",
+                      target_member_id=PSS_MEMBER,
+                      directed_at=utcnow() - datetime.timedelta(minutes=idle))
+    stub = StubDB([doc])
+    bot, sm, qm, em, _ = build(stub)
+
+    stats = restore_state(qm, sm)
+    assert stats['pending_stale_closed'] == 0, stats
+    assert stub.end_reason_for("p-aj") is None, stub.ended
+
+    acted = await qm.sweep_directed_requests()
+    assert [a['outcome'] for a in acted] == ['lapsed'], acted
+    to_requester = [t_ for c, t_, *_ in bot.sent if str(c) == "7607"]
+    assert to_requester and "isn't free right now" in to_requester[-1], bot.sent
+    # And the hand-back is not immediately expired by the queue sweep.
+    assert qm.cleanup_expired_queues() == []
+    assert "p-aj" in config.queue_entries
+    print("OK  aj. a few hours' outage hands a directed request back, never drops it")
+
+
 CASES = [
+    case_aj_a_few_hours_outage_never_silently_drops_a_directed_request,
+    case_ai_a_short_outage_past_the_hour_hands_back_rather_than_closes,
     case_a_happy_pending,
     case_b_fifo,
     case_c_legacy_doc_without_message_id,
@@ -1202,8 +1300,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 34, (
-        "expected at least 34 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 36, (
+        "expected at least 36 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

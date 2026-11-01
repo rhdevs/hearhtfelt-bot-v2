@@ -180,11 +180,12 @@ def test_phase_five_and_six_templates_render():
     rendered = {
         "directed_unavailable": MESSAGES["directed_unavailable"].format(name="Alex"),
         "directed_status": MESSAGES["directed_status"].format(name="Alex"),
-        "directed_sent": MESSAGES["directed_sent"].format(name="Alex"),
+        "directed_sent": MESSAGES["directed_sent"].format(name="Alex",
+                                                          window="1 hour"),
         "picker_page": MESSAGES["picker_page"].format(page=2, pages=3),
         "picker_busy": MESSAGES["picker_busy"].format(name="Alex"),
         "directed_request": MESSAGES["directed_request"].format(
-            description="a thing", window="24 hours"),
+            description="a thing", window="1 hour"),
     }
     for key, text in rendered.items():
         assert "{" not in text and "}" not in text, (key, text)
@@ -192,6 +193,34 @@ def test_phase_five_and_six_templates_render():
     assert "Alex" in rendered["directed_unavailable"]
     assert "Page 2 of 3" == rendered["picker_page"]
     assert "Alex" in rendered["picker_busy"]
+
+
+def test_the_requester_is_told_the_window_and_the_way_out():
+    """Evan, 2026-11-01: the chosen supporter has an hour, and the resident can send
+    the request to the common pool at any point before an Accept. Both halves must
+    be in what the resident reads, or they sit waiting on one person with no idea
+    for how long or that they may leave."""
+    sent = MESSAGES["directed_sent"].format(name="Alex", window="1 hour")
+    assert "within 1 hour" in sent, sent
+    assert "anyone" in sent and "any time" in sent, sent
+    status = MESSAGES["directed_status"].format(name="Alex")
+    assert "anyone" in status and "/cancel" in status, status
+    # The supporter hears about the same exit, so a dead Accept is no surprise.
+    request = MESSAGES["directed_request"].format(description="x", window="1 hour")
+    assert "within 1 hour" in request and "wider team" in request, request
+
+
+def test_the_withdrawn_dm_says_nothing_about_the_requester_or_why():
+    """Replaces the supporter's DM when the requester sends to anyone OR cancels.
+    One wording for both, no slot to leak through, and nothing that names a move."""
+    text = MESSAGES["directed_withdrawn_member"]
+    assert "{" not in text and "}" not in text, text
+    lowered = text.lower()
+    for tell in ("cancel", "anyone", "channel", "team", "someone else", "chose",
+                 "declin", "rhesident", "#"):
+        assert tell not in lowered, (tell, text)
+    for ch in "<>&":
+        assert ch not in text, (ch, text)
 
 
 def test_picker_labels_are_the_approved_wording():
@@ -366,8 +395,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 19, (
-        "expected at least 19 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 21, (
+        "expected at least 21 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )
