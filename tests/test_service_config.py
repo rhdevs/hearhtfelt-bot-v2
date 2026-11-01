@@ -207,6 +207,9 @@ def test_requester_identity_is_one_safe_line():
     assert "#" not in ri("Bob", "RHesident ＃1234", None)
     assert ri("ㅤ", None, None) == "", "Hangul filler alone is not a name"
     assert ri("ㅤ", None, "ren") == "@ren"
+    assert ri("́" * 80, None, None) == "", "stacked accents alone are not a name"
+    assert ri("́" * 80, None, "ren") == "@ren"
+    assert ri("Zöe", None, None) == "Zöe", "real accents survive (composed)"
     assert ri("Ren", None, "rentan").count("@") == 1
     long = ri("A" * 64, "B" * 64, "rentan")
     assert len(long) <= config.REQUESTER_IDENTITY_MAX + len(" (@rentan)"), long

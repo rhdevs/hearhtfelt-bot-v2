@@ -2548,6 +2548,62 @@ async def case_bh_an_unlisted_supporter_never_makes_pss_say_anonymously():
     print("OK  bh. an unlisted supporter's claim never tells the requester 'anonymously'")
 
 
+async def case_bi_start_drops_anonymity_promise_while_pss_shares_names():
+    """Review round 3: /start's switch to welcome_text() had no test -- reverting it
+    to MESSAGES["welcome"] kept every suite green while PSS shared names under
+    "Complete anonymity guaranteed"."""
+    bot, sm, qm, handlers, stub = setup(supporters=1)
+    rec = Rec()
+    await handlers.start_command(text_update(REQUESTER, "/start", rec), ctx_for(bot))
+    shown = " ".join(str(t) for t, _m in rec.replies) + " ".join(bot.texts_to(REQUESTER))
+    assert "With PSS, your Telegram name and username are shared" in shown, shown
+    assert "Complete anonymity guaranteed" not in shown, shown
+    print("OK  bi. /start drops the anonymity promise while PSS shares names")
+
+
+async def case_bj_a_directed_accept_with_the_database_down_keeps_the_name():
+    """Review round 3: the Accept path's label hand-off had no test (label=None kept
+    everything green)."""
+    bot, sm, qm, handlers, stub = setup(supporters=2, db_available=False)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    await handlers.chat_command(text_update(REQUESTER, "/chat", rec, username="ren"), ctx)
+    await handlers.handle_message(text_update(REQUESTER, "rough week", rec, username="ren"), ctx)
+    queue_id = config.user_to_queue_map[REQUESTER]
+    await handlers.handle_callback_query(cb_update(REQUESTER, "pk_l:0", rec), ctx)
+    await handlers.handle_callback_query(
+        cb_update(REQUESTER, pick_data(REQUESTER, supporter_id(0)), rec), ctx)
+    assert config.queue_entries[queue_id]['routing'] == 'directed'
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "dr_a:%s" % queue_id, rec), ctx)
+    assert sm.get_session_info(queue_id)['anonymous_user_id'] == "User (@ren)"
+    await handlers.handle_message(text_update(REQUESTER, "hi", rec, username="ren"), ctx)
+    assert "💬 User (@ren): hi" in bot.texts_to(supporter_id(0))
+    print("OK  bj. a DB-down directed Accept keeps the requester's name")
+
+
+async def case_bk_a_long_pss_message_is_not_lost_to_the_name_header():
+    """Review round 3: a ~120-char header pushed a 4,000-char message past
+    Telegram's 4096 limit, so the requester got an error instead of a relay."""
+    bot, sm, qm, handlers, stub = setup(supporters=1)
+    rec = Rec()
+    ctx = ctx_for(bot)
+    queue_id = await _open_pss_request(handlers, rec, ctx, first_name="A" * 64)
+    await handlers.handle_callback_query(
+        cb_update(supporter_id(0), "claim_%s" % queue_id, rec), ctx)
+    body = "x" * 4090
+    await handlers.handle_message(text_update(REQUESTER, body, rec, username="ren",
+                                              first_name="A" * 64), ctx)
+    to_member = bot.texts_to(supporter_id(0))
+    assert all(len(t) <= 4096 for t in to_member), [len(t) for t in to_member]
+    assert to_member[-1] == body and to_member[-2].startswith("💬 "), to_member[-2:]
+    # Short messages still go as one.
+    await handlers.handle_message(text_update(REQUESTER, "hi", rec, username="ren",
+                                              first_name="A" * 64), ctx)
+    assert bot.texts_to(supporter_id(0))[-1].endswith(": hi")
+    print("OK  bk. a near-limit PSS message is relayed, header sent separately")
+
+
 CASES = [
     case_a_fork_appears_and_nothing_reaches_the_channel,
     case_b_no_pickable_supporters_means_no_fork,
@@ -2608,6 +2664,9 @@ CASES = [
     case_bf_a_name_with_html_cannot_break_the_claimed_or_expired_card,
     case_bg_a_claim_with_the_database_down_keeps_the_name,
     case_bh_an_unlisted_supporter_never_makes_pss_say_anonymously,
+    case_bi_start_drops_anonymity_promise_while_pss_shares_names,
+    case_bj_a_directed_accept_with_the_database_down_keeps_the_name,
+    case_bk_a_long_pss_message_is_not_lost_to_the_name_header,
 ]
 
 
@@ -2625,8 +2684,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 59, (
-        "expected at least 59 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 62, (
+        "expected at least 62 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )

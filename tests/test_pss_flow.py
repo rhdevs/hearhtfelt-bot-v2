@@ -180,7 +180,7 @@ async def run():
     await handlers.handle_message(make_text_update(REQUESTER_PSS, "thank you", rec), ctx)
     to_member = [s for s in rec.sent if s[0] == str(PSS_MEMBER)]
     assert to_member and to_member[-1][1] == "💬 User: thank you",         ("PSS member should see the requester's name", to_member)
-    print("OK  6. Anonymous labels correct (requester->'Peer Supporter', member->'RHesident')")
+    print("OK  6. Anonymous labels correct (requester->'Peer Supporter', member->requester's name)")
 
     # 7. HF track still works in parallel with the HF label
     rec2 = Rec()

@@ -1531,6 +1531,10 @@ def requester_identity(first_name, last_name=None, username=None) -> str:
     # forge one -- "Ren (@someoneelse)" with no username reads exactly like a real
     # handle -- so they are dropped from it.
     name = " ".join(name.replace("@", " ").replace("#", " ").split())
+    if not any(unicodedata.category(ch)[0] in "LN" for ch in name):
+        # Nothing a reader could call a name: only marks, symbols or punctuation
+        # (e.g. eighty stacked accents). Fall back like an empty name.
+        name = ""
     if len(name) > REQUESTER_IDENTITY_MAX:
         name = name[:REQUESTER_IDENTITY_MAX - 1].rstrip() + "\u2026"
     handle = clean(username).lstrip("@")

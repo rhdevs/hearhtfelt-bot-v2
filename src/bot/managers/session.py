@@ -18,6 +18,8 @@ from src.database.manager import db_mgr
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_MESSAGE_LIMIT = 4096
+
 class SessionManager:
     def __init__(self, bot: Bot):
         self.bot = bot
@@ -201,11 +203,19 @@ class SessionManager:
             
             anonymous_name = self.get_anonymous_name(session_id, other_party_id)
             formatted_message = f"💬 {anonymous_name}: {message_text}"
-            
-            await self.bot.send_message(
-                chat_id=other_party_id,
-                text=formatted_message
-            )
+
+            if len(formatted_message) <= TELEGRAM_MESSAGE_LIMIT:
+                await self.bot.send_message(
+                    chat_id=other_party_id,
+                    text=formatted_message
+                )
+            else:
+                # A name header (up to ~120 chars on an identified track) can push a
+                # message the sender was allowed to send past Telegram's limit. Send
+                # the header on its own; the body already fits, Telegram accepted it.
+                await self.bot.send_message(chat_id=other_party_id,
+                                            text=f"💬 {anonymous_name}:")
+                await self.bot.send_message(chat_id=other_party_id, text=message_text)
             
             # Update session activity
             self.update_session_activity(session_id)
