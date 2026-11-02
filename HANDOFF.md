@@ -177,11 +177,10 @@ session idle for longer than its own window plus `STALE_NOTIFY_GRACE_MINUTES`
 neither party is messaged. Count them first anyway, so you can check the number
 against the boot log afterwards.
 
-**R3 — PSS has no privacy policy of its own yet.**
-`PSS_PRIVACY_POLICY_URL` falls back to the umbrella HF document. No URL was
-invented. When a real PSS policy exists, set `PSS_PRIVACY_POLICY_URL` in the
-droplet `.env` — no code change and no redeploy of the image is needed, just a
-container recreate (see §5: `docker restart` does not reload `--env-file`).
+**R3 — PSS privacy policy.** RESOLVED 2026-11-03: `PSS_PRIVACY_POLICY_URL` now
+defaults in `config.py` to the PSS policy ("Peer Student Supporters Privacy
+Policy", doc `1lYHXBEtP5qPWEak8axRvGUNv4bi9lQBefm8PmQOM_-I`). A droplet `.env`
+value still overrides it — remove any stale override there.
 
 **R4 — the FIRST deploy of restart durability MUST be a dry run.**
 Rehydration reads every `pending` and `active` row at boot. On the first boot that

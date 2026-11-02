@@ -123,6 +123,13 @@ def test_help_request_text_is_per_service():
     assert PSS_PRIVACY_POLICY_URL in pss
 
 
+def test_pss_has_its_own_privacy_policy():
+    """PSS links its own policy, not the umbrella HeaRHtfelt document."""
+    assert PSS_PRIVACY_POLICY_URL != HF_PRIVACY_POLICY_URL
+    if "PSS_PRIVACY_POLICY_URL" not in os.environ:
+        assert "1lYHXBEtP5qPWEak8axRvGUNv4bi9lQBefm8PmQOM_-I" in PSS_PRIVACY_POLICY_URL
+
+
 def test_help_request_text_falls_back_to_hf():
     assert help_request_text(None) == help_request_text("hf")
     assert help_request_text("does-not-exist") == help_request_text("hf")
@@ -395,8 +402,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(tests) >= 21, (
-        "expected at least 21 tests, collected %d (%s). Test discovery has "
+    assert len(tests) >= 22, (
+        "expected at least 22 tests, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(tests), ", ".join(t.__name__ for t in tests) or "none")
     )
