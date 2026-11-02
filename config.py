@@ -32,14 +32,17 @@ ADMIN_CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID")
 PSS_CHANNEL_ID = os.getenv("PSS_CHANNEL_ID")   # unset in Phase 1 -> None (PSS not runnable)
 MONGODB_URI = os.getenv("MONGODB_URI")
 
-# Public document links, not secrets. Env-overridable so a real PSS policy can be
-# swapped in without a code deploy; both default to today's umbrella document.
+# Public document links, not secrets. Env-overridable without a code deploy.
+# HF defaults to the umbrella HeaRHtfelt document; PSS has its own policy.
 PRIVACY_POLICY_URL = os.getenv(
     "PRIVACY_POLICY_URL",
     "https://docs.google.com/document/d/1pWvutw151h_sypdttkwEH7hDiBwBdX-qF_xJypffn7Y/edit?usp=sharing",
 )
 HF_PRIVACY_POLICY_URL = os.getenv("HF_PRIVACY_POLICY_URL", PRIVACY_POLICY_URL)
-PSS_PRIVACY_POLICY_URL = os.getenv("PSS_PRIVACY_POLICY_URL", PRIVACY_POLICY_URL)
+PSS_PRIVACY_POLICY_URL = os.getenv(
+    "PSS_PRIVACY_POLICY_URL",
+    "https://docs.google.com/document/d/1lYHXBEtP5qPWEak8axRvGUNv4bi9lQBefm8PmQOM_-I/edit?usp=sharing",
+)
 
 # Per-track follow-up wording, appended to the CLOSING message of a PSS conversation.
 # Deliberately EMPTY by default and deliberately NOT written in this repo: inventing
