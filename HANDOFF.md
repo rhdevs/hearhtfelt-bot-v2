@@ -71,7 +71,11 @@ and PSS are two configured instances of the same machinery.
   templated with `{member}`.
 - **Landing-page chooser** is shown only when `len(enabled_services()) > 1`;
   with a single track it's skipped, so HF behaves exactly as before.
-- Membership is **admin-managed and exclusive** (a person is HF or PSS, not both).
+- Membership is **admin-managed**, and exclusive **unless an admin deliberately
+  approves somebody for both**: the registration card has an "Approve for both"
+  button (`rg_a:<id>:both`, `config.REG_APPROVE_ALL`) that writes both rosters in
+  one decision. A single-track Approve still refuses somebody already on the other
+  roster. `/available` / `/unavailable` update every roster the member is on.
   Collections: `heartfelt_members`, `peer_supporters`. Roster auto-refreshes from
   DB every 5 min (`AUTHORIZED_MEMBER_REFRESH_SECONDS`).
 

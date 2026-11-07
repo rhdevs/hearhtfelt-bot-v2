@@ -13,6 +13,7 @@ from config import (
     CB_PICK_CANCEL,
     CB_REG_APPROVE,
     CB_REG_REJECT,
+    REG_APPROVE_ALL,
     REGISTRATION_REAPPLY_HOURS,
     CB_PICK_LIST,
     CB_PICK_OPEN,
@@ -409,31 +410,42 @@ class BotHandlers:
     async def _set_availability(self, update: Update, available: bool) -> None:
         user_id = update.effective_user.id
 
-        svc = next((s for s in SERVICES.values() if user_id in s.roster), None)
-        if svc is None:
+        # EVERY roster they are on: somebody approved for both tracks has one
+        # document per track, and toggling only the first would leave them listed
+        # as free on the other. The reply describes the named track if any.
+        svcs = [s for s in SERVICES.values() if user_id in s.roster]
+        if not svcs:
             # The SAME neutral string handle_message sends for gibberish. Confirming
             # the command exists would tell a stranger who is on the roster.
             await update.message.reply_text(MESSAGES["unknown_command"])
             return
+        svc = next((s for s in svcs if s.supporter_names), svcs[0])
 
         suffix = ""
         if db_mgr.db_available:
-            written = False
-            try:
-                written = db_mgr.set_member_availability(
-                    user_id, available, collection=svc.members_collection)
-            except Exception as exc:
-                logger.warning("Could not persist availability for member %s: %s",
-                               user_id, exc)
-            if not written:
-                # Memory is deliberately NOT changed: a toggle the next roster
-                # refresh silently reverts is worse than a visible failure, because
-                # the supporter believes they are off the list and is not.
+            failed = False
+            for s in svcs:
+                written = False
+                try:
+                    written = db_mgr.set_member_availability(
+                        user_id, available, collection=s.members_collection)
+                except Exception as exc:
+                    logger.warning("Could not persist availability for member %s "
+                                   "(%s): %s", user_id, s.key, exc)
+                if written:
+                    s.roster.set_available(user_id, available)
+                else:
+                    # Memory is deliberately NOT changed: a toggle the next roster
+                    # refresh silently reverts is worse than a visible failure,
+                    # because the supporter believes they are off the list and is
+                    # not.
+                    failed = True
+            if failed:
                 await update.message.reply_text(MESSAGES["availability_failed"])
                 return
-            svc.roster.set_available(user_id, available)
         else:
-            svc.roster.set_available(user_id, available)
+            for s in svcs:
+                s.roster.set_available(user_id, available)
             suffix = "\n\n" + MESSAGES["availability_memory_only"]
 
         profile = svc.roster.profile(user_id)
@@ -969,6 +981,15 @@ class BotHandlers:
             rows.append([InlineKeyboardButton(
                 MESSAGES[label_key].format(member=svc.member_label),
                 callback_data=f"{CB_REG_APPROVE}:{registration_id}:{svc.key}")])
+        if len(SERVICES) > 1:
+            # One tap onto EVERY roster, for somebody who supports on both tracks.
+            # Marked the same way when any one of those tracks is switched off.
+            all_key = ("registration_approve_all_button"
+                       if all(s.runnable for s in SERVICES.values())
+                       else "registration_approve_all_button_offline")
+            rows.append([InlineKeyboardButton(
+                MESSAGES[all_key],
+                callback_data=f"{CB_REG_APPROVE}:{registration_id}:{REG_APPROVE_ALL}")])
         rows.append([InlineKeyboardButton(
             MESSAGES["registration_reject_button"],
             callback_data=f"{CB_REG_REJECT}:{registration_id}")])
@@ -1034,14 +1055,20 @@ class BotHandlers:
         # 3. Approve only: the service must EXIST. Deliberately NOT get_service(),
         #    which falls back to HF for an unknown key -- a mangled or truncated
         #    callback would then silently put somebody on the HF roster.
-        svc = None
+        #    REG_APPROVE_ALL is checked explicitly for the same reason, and is the
+        #    only non-service value accepted.
+        targets = []
         if approving:
-            if service_key not in SERVICES:
+            if service_key == REG_APPROVE_ALL and len(SERVICES) > 1:
+                # Sorted by key: the same deterministic order as the keyboard.
+                targets = sorted(SERVICES.values(), key=lambda s: s.key)
+            elif service_key in SERVICES:
+                targets = [SERVICES[service_key]]
+            else:
                 logger.warning("Registration callback named an unknown service %r",
                                service_key)
                 await query.answer(MESSAGES["registration_gone"], show_alert=True)
                 return
-            svc = SERVICES[service_key]
 
         # 4. Records offline: nothing is written, nothing is sent, and the buttons
         #    are deliberately LEFT LIVE so the very same tap works once Mongo is
@@ -1091,10 +1118,13 @@ class BotHandlers:
         #    invisible to the memory check alone. Synchronous, so it stays inside
         #    the pre-gate block. Nothing is decided and the buttons stay live --
         #    the fix is out-of-band, and the admin should be able to retry. D37.
+        #    Approve-for-both targets every roster, so there is no "other" one to
+        #    clash with: being on both is exactly what the admin asked for.
         if approving:
             clash = None
+            target_keys = {t.key for t in targets}
             for other in SERVICES.values():
-                if other.key == svc.key:
+                if other.key in target_keys:
                     continue
                 in_other = applicant in other.roster
                 if not in_other:
@@ -1135,81 +1165,22 @@ class BotHandlers:
 
         # --- WINNER. Roster first, then the ack, then the applicant. ----------
         write_failed = False
-        if approving:
-            try:
-                prior = db_mgr.get_member_profile_doc(
-                    applicant, collection=svc.members_collection)
-            except Exception as exc:
-                prior = None
-                logger.warning("Could not read the existing '%s' record for %s: %s",
-                               svc.key, applicant, exc)
-            if prior and prior.get('active') is False:
-                # A re-authorization is not the same event as a first approval and
-                # must be visible in the logs.
-                logger.warning("Registration %s RE-ACTIVATES %s on the '%s' roster; "
-                               "they had previously been deactivated",
-                               registration_id, applicant, svc.key)
-
-            # add_authorized_member is the existing idempotent upsert, so approving
-            # somebody a CLI add already created simply re-confirms them. It must
-            # come FIRST: mark_member_started does NOT upsert, and with no document
-            # there would be nothing for it to set.
-            if not db_mgr.add_authorized_member(
-                    applicant, username=reg.get('username'), active=True,
-                    collection=svc.members_collection):
+        for svc in targets:
+            if not self._write_approved_member(registration_id, reg, applicant, svc):
                 write_failed = True
-                logger.error("Registration %s: could not add %s to the '%s' roster",
-                             registration_id, applicant, svc.key)
-            elif not db_mgr.mark_member_started(
-                    applicant, True, collection=svc.members_collection):
-                # /register is BY CONSTRUCTION a private message from the
-                # applicant, which is exactly the claim has_started_bot encodes.
-                # D39.
-                write_failed = True
-                logger.error("Registration %s: could not record has_started_bot for "
-                             "%s on '%s'", registration_id, applicant, svc.key)
-
-            # In memory too, so they can claim immediately instead of waiting out
-            # the 300s roster refresh. The in-memory profile is LOADED FROM THE
-            # JUST-WRITTEN MONGO DOCUMENT, not built from nothing: a RE-activated
-            # supporter therefore keeps the /name override and /unavailable they
-            # had before deactivation, rather than being listed under the Telegram
-            # first name they chose to hide, as free (R15). A first-time applicant's
-            # doc has no name yet, so they become LISTABLE (once the fork is on for
-            # this track) from their next private message -- captured by
-            # note_private_contact, the same capture point that records
-            # has_started_bot -- or under a name they choose with /name. An admin
-            # override via `set-profile --display-name` still works too. The
-            # staged-rollout lever is PSS_DIRECTED_ENABLED (R11), not the absence
-            # of a name.
-            # Fallback when the write or the read-back failed: the bare id, as
-            # before. mark_started is then a no-op unless a profile already exists,
-            # where it keeps memory agreeing with Mongo until the next refresh; the
-            # next private message builds the profile from Mongo instead.
-            # Synchronous and before the first await: winner-only, pre-await.
-            installed = False
-            if not write_failed:
-                try:
-                    doc_after = db_mgr.get_member_profile_doc(
-                        applicant, collection=svc.members_collection)
-                except Exception as exc:
-                    doc_after = None
-                    logger.warning("Could not read back the '%s' record for %s: %s",
-                                   svc.key, applicant, exc)
-                installed = svc.roster.upsert_record(doc_after)
-            if not installed:
-                svc.roster.add(applicant)
-                svc.roster.mark_started(applicant, True)
 
         # The first await of the winning path: a plain ack.
         await query.answer()
 
         notified = True
+        approved_label = " and ".join(t.member_label for t in targets)
         if approving:
             # HF's copy is byte-identical: HF never sets supporter_names, so this
-            # always picks registration_approved for that track.
-            key = 'registration_approved_named' if svc.supporter_names else 'registration_approved'
-            text = MESSAGES[key].format(member=svc.member_label)
+            # always picks registration_approved for that track. Approve-for-both
+            # sends ONE message, the named one if any target lists names.
+            named = any(t.supporter_names for t in targets)
+            key = 'registration_approved_named' if named else 'registration_approved'
+            text = MESSAGES[key].format(member=approved_label)
         else:
             # VERBATIM from MESSAGES. No .format(), no concatenation, no
             # interpolation of any kind: nothing the applicant reads may name or
@@ -1226,20 +1197,96 @@ class BotHandlers:
                 # since blocked the bot must never be offered in the picker, and
                 # returns automatically the next time they message it. A block is
                 # not grounds to undo an approval, so the roster write STANDS.
-                try:
-                    db_mgr.mark_member_started(applicant, False,
-                                               collection=svc.members_collection)
-                except Exception as inner:
-                    logger.warning("Could not clear has_started_bot for %s: %s",
-                                   applicant, inner)
-                svc.roster.mark_started(applicant, False)
+                for svc in targets:
+                    try:
+                        db_mgr.mark_member_started(applicant, False,
+                                                   collection=svc.members_collection)
+                    except Exception as inner:
+                        logger.warning("Could not clear has_started_bot for %s: %s",
+                                       applicant, inner)
+                    svc.roster.mark_started(applicant, False)
 
         await self._settle_registration_cards(
-            context, decided, query.from_user, svc if approving else None,
+            context, decided, query.from_user,
+            approved_label if approving else None,
             notified, write_failed)
 
+    def _write_approved_member(self, registration_id: str, reg: dict,
+                               applicant: int, svc) -> bool:
+        """The winner's roster write for ONE track. False when a Mongo write failed.
+
+        Synchronous on purpose, and called only between the atomic gate and the
+        winner's first await, once per approved track."""
+        write_failed = False
+        try:
+            prior = db_mgr.get_member_profile_doc(
+                applicant, collection=svc.members_collection)
+        except Exception as exc:
+            prior = None
+            logger.warning("Could not read the existing '%s' record for %s: %s",
+                           svc.key, applicant, exc)
+        if prior and prior.get('active') is False:
+            # A re-authorization is not the same event as a first approval and
+            # must be visible in the logs.
+            logger.warning("Registration %s RE-ACTIVATES %s on the '%s' roster; "
+                           "they had previously been deactivated",
+                           registration_id, applicant, svc.key)
+
+        # add_authorized_member is the existing idempotent upsert, so approving
+        # somebody a CLI add already created simply re-confirms them. It must
+        # come FIRST: mark_member_started does NOT upsert, and with no document
+        # there would be nothing for it to set.
+        if not db_mgr.add_authorized_member(
+                applicant, username=reg.get('username'), active=True,
+                collection=svc.members_collection):
+            write_failed = True
+            logger.error("Registration %s: could not add %s to the '%s' roster",
+                         registration_id, applicant, svc.key)
+        elif not db_mgr.mark_member_started(
+                applicant, True, collection=svc.members_collection):
+            # /register is BY CONSTRUCTION a private message from the
+            # applicant, which is exactly the claim has_started_bot encodes.
+            # D39.
+            write_failed = True
+            logger.error("Registration %s: could not record has_started_bot for "
+                         "%s on '%s'", registration_id, applicant, svc.key)
+
+        # In memory too, so they can claim immediately instead of waiting out
+        # the 300s roster refresh. The in-memory profile is LOADED FROM THE
+        # JUST-WRITTEN MONGO DOCUMENT, not built from nothing: a RE-activated
+        # supporter therefore keeps the /name override and /unavailable they
+        # had before deactivation, rather than being listed under the Telegram
+        # first name they chose to hide, as free (R15). A first-time applicant's
+        # doc has no name yet, so they become LISTABLE (once the fork is on for
+        # this track) from their next private message -- captured by
+        # note_private_contact, the same capture point that records
+        # has_started_bot -- or under a name they choose with /name. An admin
+        # override via `set-profile --display-name` still works too. The
+        # staged-rollout lever is PSS_DIRECTED_ENABLED (R11), not the absence
+        # of a name.
+        # Fallback when the write or the read-back failed: the bare id, as
+        # before. mark_started is then a no-op unless a profile already exists,
+        # where it keeps memory agreeing with Mongo until the next refresh; the
+        # next private message builds the profile from Mongo instead.
+        # Synchronous and before the first await: winner-only, pre-await.
+        installed = False
+        if not write_failed:
+            try:
+                doc_after = db_mgr.get_member_profile_doc(
+                    applicant, collection=svc.members_collection)
+            except Exception as exc:
+                doc_after = None
+                logger.warning("Could not read back the '%s' record for %s: %s",
+                               svc.key, applicant, exc)
+            installed = svc.roster.upsert_record(doc_after)
+        if not installed:
+            svc.roster.add(applicant)
+            svc.roster.mark_started(applicant, True)
+        return not write_failed
+
     async def _settle_registration_cards(self, context, decided: dict, approver,
-                                         svc, notified: bool,
+                                         approved_label,
+                                         notified: bool,
                                          write_failed: bool) -> None:
         """Rewrite EVERY admin's card to a settled state and strip its buttons.
 
@@ -1260,9 +1307,9 @@ class BotHandlers:
                 or "admin %s" % getattr(approver, "id", "?"))
         approver_text = html.escape(str(name))
 
-        if svc is not None:
+        if approved_label is not None:
             footer = MESSAGES["registration_settled_approved"].format(
-                member=html.escape(svc.member_label), approver=approver_text)
+                member=html.escape(approved_label), approver=approver_text)
         else:
             footer = MESSAGES["registration_settled_rejected"].format(
                 approver=approver_text)
