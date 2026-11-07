@@ -758,6 +758,10 @@ REGISTER_DEEP_LINK_PAYLOAD = "register"
 
 CB_REG_APPROVE = "rg_a"    # rg_a:<registration_id>:<service_key>
 CB_REG_REJECT = "rg_r"     # rg_r:<registration_id>
+# The <service_key> slot of rg_a for "approve onto EVERY roster". Not a service key
+# (SERVICES must never gain one by this name), so a mangled callback can never be
+# mistaken for it by get_service()'s HF fallback -- the handler checks it first.
+REG_APPROVE_ALL = "both"
 
 # INVARIANT: SESSION_SWEEP_SECONDS must be < (min service_warning_minutes * 60),
 # or a session can expire without ever being warned. Currently 180 < 300 (HF).
@@ -1234,6 +1238,8 @@ MESSAGES = {
     # posted to its queue, so an approved supporter would have nothing to claim.
     # The approver needs to see that; the applicant's copy is deliberately untouched.
     "registration_approve_button_offline": "✅ Approve as {member} (track is off)",
+    "registration_approve_all_button": "✅ Approve for both",
+    "registration_approve_all_button_offline": "✅ Approve for both (a track is off)",
     "registration_reject_button": "🚫 Not now",
     "registration_already_handled": "Someone has already handled this one.",
     "registration_gone": "That request is no longer available.",

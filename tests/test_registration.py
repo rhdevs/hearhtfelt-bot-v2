@@ -621,6 +621,7 @@ async def case_d_the_card_and_its_buttons_are_well_formed():
     datas = [b.callback_data for row in markup.inline_keyboard for b in row]
     assert datas == [approve_data(doc['registration_id'], "hf"),
                      approve_data(doc['registration_id'], "pss"),
+                     approve_data(doc['registration_id'], config.REG_APPROVE_ALL),
                      reject_data(doc['registration_id'])], datas
     assert len(datas) == len(set(datas)), "a service must not appear twice: %r" % datas
     for data in datas:
@@ -1574,6 +1575,120 @@ async def case_ah_reapproval_keeps_the_chosen_name_and_availability():
           "and /unavailable")
 
 
+async def case_ai_approve_for_both_writes_both_rosters_and_tells_them_once():
+    bot, handlers, stub = setup()
+    await do_register(handlers, bot, username="hopeful")
+    doc = sole_registration(stub)
+    hf, pss = services()
+    assert config.REG_APPROVE_ALL not in config.SERVICES, (
+        "the approve-for-both marker must never collide with a real service key")
+
+    rec = await tap(handlers, bot, A1, approve_data(doc['registration_id'],
+                                                    config.REG_APPROVE_ALL))
+
+    assert rec.answers == [(None, False)], rec.answers
+    decisions = stub.called('decide_registration')
+    assert len(decisions) == 1 and decisions[0][3] == 'approved' \
+        and decisions[0][4] == config.REG_APPROVE_ALL, decisions
+    assert sorted(a[2] for a in stub.called('add_authorized_member')) == sorted(
+        [HF_COLL, PSS_COLL]), stub.called('add_authorized_member')
+    for coll in (HF_COLL, PSS_COLL):
+        assert stub.members[coll][APPLICANT]['has_started_bot'] is True, coll
+    assert APPLICANT in hf.roster and APPLICANT in pss.roster
+
+    both = "%s and %s" % (hf.member_label, pss.member_label)
+    assert bot.texts_to(APPLICANT) == [
+        MESSAGES["registration_approved_named"].format(member=both)], \
+        bot.texts_to(APPLICANT)
+    assert sorted(c for c, _mid, _t, _m in bot.edited) == [str(A1), str(A2)], bot.edited
+    for _c, _mid, text, markup in bot.edited:
+        assert markup is None
+        assert MESSAGES["registration_settled_approved"].format(
+            member=both, approver=APPROVER_FIRST) in text, text
+    assert_no_decider_leak(bot)
+    print("OK  ai. approve-for-both writes both rosters, tells the applicant once "
+          "and settles every card")
+
+
+async def case_aj_approve_for_both_racing_a_single_approve_decides_once():
+    """The atomic gate still decides exactly once when the two taps differ."""
+    bot, handlers, stub = setup()
+    await do_register(handlers, bot)
+    doc = sole_registration(stub)
+    rid = doc['registration_id']
+    stub.freeze_read(rid)
+
+    rec1, rec2 = Rec(), Rec()
+    await asyncio.gather(
+        handlers.handle_callback_query(
+            cb_update(A1, approve_data(rid, config.REG_APPROVE_ALL), rec1),
+            ctx_for(bot)),
+        handlers.handle_callback_query(
+            cb_update(A2, approve_data(rid, "pss"), rec2), ctx_for(bot)),
+    )
+    # The loser is refused either at the gate or, because the winner's HF write
+    # has already landed, by the cross-roster check before it. Both are correct;
+    # what matters is that exactly one decision took effect.
+    assert sum(1 for c in stub.called('decide_registration')) >= 1, stub.calls
+    assert sorted(a[2] for a in stub.called('add_authorized_member')) == sorted(
+        [HF_COLL, PSS_COLL]), "only the winner writes: %r" % (
+        stub.called('add_authorized_member'),)
+    assert len(bot.texts_to(APPLICANT)) == 1, bot.texts_to(APPLICANT)
+    answers = rec1.answer_texts() + rec2.answer_texts()
+    assert answers.count(None) == 1, answers
+    hf, _pss = services()
+    loser = [a for a in answers if a is not None]
+    assert len(loser) == 1 and loser[0] in (
+        MESSAGES["registration_already_handled"],
+        MESSAGES["registration_cross_roster"].format(member=hf.member_label)), answers
+    assert doc['decision_service'] == config.REG_APPROVE_ALL, doc
+    print("OK  aj. approve-for-both racing a single approve still decides once")
+
+
+async def case_ak_an_unknown_approve_target_is_refused():
+    """Only real service keys and REG_APPROVE_ALL are accepted; anything else
+    must never fall through to get_service()'s HF default."""
+    bot, handlers, stub = setup()
+    await do_register(handlers, bot)
+    doc = sole_registration(stub)
+    hf, pss = services()
+    for bogus in ("all", "BOTH", "hf,pss", ""):
+        rec = await tap(handlers, bot, A1, "%s:%s:%s" % (
+            config.CB_REG_APPROVE, doc['registration_id'], bogus))
+        assert rec.answer_texts() == [MESSAGES["registration_gone"]], (bogus, rec.answers)
+    assert stub.count('decide_registration') == 0, stub.calls
+    assert APPLICANT not in hf.roster and APPLICANT not in pss.roster
+    print("OK  ak. an unknown approve target is refused")
+
+
+async def case_al_availability_toggles_every_roster_a_member_is_on():
+    """Somebody on both rosters says /unavailable: BOTH records change, or the
+    PSS picker would still offer them as free."""
+    bot, handlers, stub = setup()
+    hf, pss = services()
+    for roster in (hf.roster, pss.roster):
+        roster.replace_records([{'telegram_id': APPLICANT, 'active': True,
+                                 'available': True, 'has_started_bot': True,
+                                 'telegram_first_name': 'Robin'}])
+    assert hf.roster.profile(APPLICANT) is not None
+    assert pss.roster.profile(APPLICANT) is not None
+
+    await handlers.unavailable_command(
+        text_update(APPLICANT, "/unavailable", Rec()), ctx_for(bot))
+
+    writes = sorted(c[3] for c in stub.called('set_member_availability')
+                    if c[1] == APPLICANT and c[2] is False)
+    assert writes == sorted([HF_COLL, PSS_COLL]), stub.called('set_member_availability')
+    assert hf.roster.profile(APPLICANT).available is False
+    assert pss.roster.profile(APPLICANT).available is False
+
+    await handlers.available_command(
+        text_update(APPLICANT, "/available", Rec()), ctx_for(bot))
+    assert hf.roster.profile(APPLICANT).available is True
+    assert pss.roster.profile(APPLICANT).available is True
+    print("OK  al. /available and /unavailable change every roster a member is on")
+
+
 CASES = [
     case_a_an_empty_allowlist_makes_register_indistinguishable_from_nothing,
     case_b_an_inert_bot_refuses_every_registration_tap,
@@ -1609,6 +1724,10 @@ CASES = [
     case_af_a_switched_off_track_says_so_on_its_button,
     case_ag_the_deep_link_starts_registration_only_when_it_is_on,
     case_ah_reapproval_keeps_the_chosen_name_and_availability,
+    case_ai_approve_for_both_writes_both_rosters_and_tells_them_once,
+    case_aj_approve_for_both_racing_a_single_approve_decides_once,
+    case_ak_an_unknown_approve_target_is_refused,
+    case_al_availability_toggles_every_roster_a_member_is_on,
 ]
 
 
@@ -1626,8 +1745,8 @@ if __name__ == "__main__":
     # deploy to a live helpline, having run zero assertions. A refactor into a
     # class, a rename, an import shadow or a bad merge all reach that state.
     # Coverage here may grow; it may not silently shrink.
-    assert len(CASES) >= 34, (
-        "expected at least 34 cases, collected %d (%s). Test discovery has "
+    assert len(CASES) >= 38, (
+        "expected at least 38 cases, collected %d (%s). Test discovery has "
         "regressed -- fix the discovery, do not lower this number."
         % (len(CASES), ", ".join(c.__name__ for c in CASES) or "none")
     )
